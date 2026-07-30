@@ -1,0 +1,43 @@
+{
+  "name": "pi-watchdog",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Root-agent loop and active-time watchdog for Pi.",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xz-dev/pi-watchdog.git"
+  },
+  "homepage": "https://github.com/xz-dev/pi-watchdog#readme",
+  "bugs": {
+    "url": "https://github.com/xz-dev/pi-watchdog/issues"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "watchdog",
+    "agent"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/extension.js"
+    ]
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
