@@ -14,9 +14,47 @@ function completionChunk(id, delta, finishReason = null) {
 	};
 }
 
+function defaultResponsePlan({ requestIndex, slowMs, holdAfterThresholdMs }) {
+	const delay =
+		requestIndex === 0 && slowMs > 0 ? slowMs + holdAfterThresholdMs : 20;
+	return {
+		delay,
+		halfway:
+			requestIndex === 0 && slowMs > 0 ? Math.min(30_000, delay - 10) : 5,
+		chunks: [{ content: "working " }, { content: "done" }],
+		finishReason: "stop",
+	};
+}
+
+function streamResponse(response, id, record, plan) {
+	const chunks = plan.chunks ?? [{ content: "working " }, { content: "done" }];
+	const delay = plan.delay ?? 20;
+	const halfway = plan.halfway ?? Math.min(5, Math.max(0, delay - 1));
+	const finishReason = plan.finishReason ?? "stop";
+	chunk(response, completionChunk(id, { role: "assistant", content: "" }));
+	const firstTimer = setTimeout(() => {
+		for (const delta of chunks.slice(0, -1))
+			chunk(response, completionChunk(id, delta));
+	}, halfway);
+	const finalTimer = setTimeout(() => {
+		const finalDelta = chunks.at(-1) ?? { content: "" };
+		chunk(response, completionChunk(id, finalDelta, finishReason));
+		response.write("data: [DONE]\n\n");
+		response.end();
+		record.finishedAt = performance.now();
+	}, delay);
+	response.on("close", () => {
+		if (!response.writableEnded) {
+			clearTimeout(firstTimer);
+			clearTimeout(finalTimer);
+		}
+	});
+}
+
 export async function startFakeProvider({
 	slowMs = 0,
 	holdAfterThresholdMs = 3_000,
+	responsePlan,
 } = {}) {
 	const requests = [];
 	const sockets = new Set();
@@ -48,45 +86,17 @@ export async function startFakeProvider({
 				connection: "keep-alive",
 			});
 			const id = `fixture-${requests.length}`;
-			chunk(response, completionChunk(id, { role: "assistant", content: "" }));
-			const watchdogContinuation = JSON.stringify(
-				parsed.messages ?? [],
-			).includes("Root active work has reached");
-			const delay =
-				requests.length === 1 && slowMs > 0
-					? slowMs + holdAfterThresholdMs
-					: 20;
-			const halfway =
-				requests.length === 1 && slowMs > 0 ? Math.min(30_000, delay - 10) : 5;
-			const firstTimer = setTimeout(
-				() =>
-					chunk(
-						response,
-						completionChunk(id, {
-							content: watchdogContinuation ? "reflected " : "working ",
-						}),
-					),
-				halfway,
-			);
-			const finalTimer = setTimeout(() => {
-				chunk(
-					response,
-					completionChunk(
-						id,
-						{ content: watchdogContinuation ? "after watchdog" : "done" },
-						"stop",
-					),
-				);
-				response.write("data: [DONE]\n\n");
-				response.end();
-				record.finishedAt = performance.now();
-			}, delay);
-			response.on("close", () => {
-				if (!response.writableEnded) {
-					clearTimeout(firstTimer);
-					clearTimeout(finalTimer);
-				}
-			});
+			const plan =
+				responsePlan?.({
+					requestIndex: requests.length - 1,
+					request: record,
+				}) ??
+				defaultResponsePlan({
+					requestIndex: requests.length - 1,
+					slowMs,
+					holdAfterThresholdMs,
+				});
+			streamResponse(response, id, record, plan);
 		});
 	});
 	server.on("connection", (socket) => {

@@ -5,6 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import { RELEASE_ALLOWLIST } from "../../scripts/distribution.mjs";
 import {
+	modelConfig,
+	startFakeProvider,
+} from "../../scripts/e2e/fake-provider.mjs";
+import {
 	assertStockPiDependencyShape,
 	createGitFixture,
 	installGitPackage,
@@ -57,6 +61,51 @@ function processExists(pid) {
 	}
 }
 
+async function waitForProviderRequests(provider, count, timeoutMs = 10_000) {
+	const deadline = performance.now() + timeoutMs;
+	while (performance.now() < deadline) {
+		if (provider.requests.length >= count) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(
+		`Provider received ${provider.requests.length}/${count} requests within ${timeoutMs}ms`,
+	);
+}
+
+async function waitForProviderResponse(record, timeoutMs = 10_000) {
+	const deadline = performance.now() + timeoutMs;
+	while (performance.now() < deadline) {
+		if (record.finishedAt !== undefined) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Provider response did not finish within ${timeoutMs}ms`);
+}
+
+function warningPlan({ requestIndex }) {
+	if (requestIndex === 0) {
+		return {
+			delay: 20,
+			chunks: [
+				{
+					tool_calls: [
+						{
+							index: 0,
+							id: "watchdog-status-1",
+							type: "function",
+							function: {
+								name: "watchdog_control",
+								arguments: '{"action":"status"}',
+							},
+						},
+					],
+				},
+			],
+			finishReason: "tool_calls",
+		};
+	}
+	return { delay: 20, chunks: [{ content: "fixture complete" }] };
+}
+
 test("the installed packed tarball loads dist and commands never start a model turn", async (t) => {
 	assertStockPi();
 	const resources = await createTestResources(t);
@@ -91,6 +140,104 @@ test("the installed packed tarball loads dist and commands never start a model t
 			false,
 		);
 	}
+});
+
+test("packed stock Pi sends a main-loop warning to its continuation provider request", {
+	timeout: 45_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-watchdog-provider-warning-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-watchdog.json"), {
+		mainLoopLimit: 2,
+		observedTotalLoopLimit: 500,
+		wallClockMinutes: 30,
+	});
+	const provider = await startFakeProvider({ responsePlan: warningPlan });
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		args: ["--provider", "watchdog-fixture", "--model", "watchdog-fixture"],
+		launcherArgs: ["--mode", "rpc", "--no-session"],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+
+	const accepted = await rpc.request({
+		type: "prompt",
+		message:
+			"Complete this ordinary fixture task without mentioning watchdogs.",
+	});
+	assert.equal(accepted.success, true);
+	await waitForProviderRequests(provider, 2);
+	const warningMarker = "[pi-watchdog: Main agent loop threshold reached]";
+	const initialRequests = provider.requests.slice(0, 2);
+	for (const request of initialRequests) {
+		const messages = JSON.stringify(request.body.messages);
+		assert.doesNotMatch(
+			messages,
+			new RegExp(warningMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+			"tool round requests contain no watchdog reminder before the threshold",
+		);
+	}
+	const toolResult = initialRequests[1].body.messages.find(
+		(message) =>
+			message.role === "tool" && message.tool_call_id === "watchdog-status-1",
+	);
+	assert.match(
+		toolResult?.content ?? "",
+		/^watchdog status\nmain\/root loops:/,
+		"the second provider request consumes the real watchdog_control status result",
+	);
+
+	const warning = await rpc.waitFor(
+		(message) =>
+			message.type === "extension_ui_request" &&
+			message.method === "notify" &&
+			/mainLoopLimitReached/.test(message.message ?? ""),
+	);
+	await waitForProviderRequests(provider, 3);
+	const continuation = provider.requests[2];
+	const continuationMessages = JSON.stringify(continuation.body.messages);
+	// This provider request is the authoritative agent-facing seam. The UI event
+	// above is only an ordering witness, not evidence of model delivery.
+	assert.match(
+		continuationMessages,
+		new RegExp(warningMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+	);
+	assert.match(
+		continuationMessages,
+		/The main agent has completed 2 loops in the current task, reaching the configured limit of 2\./,
+	);
+	assert.ok(
+		continuation.startedAt >= warning.at,
+		"the continuation provider request starts after watchdog notification",
+	);
+	await waitForProviderResponse(continuation);
+	await rpc.waitFor((message) => message.type === "agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(
+		provider.requests.length,
+		3,
+		"the reset cycle lets the one-loop reflection settle without another warning",
+	);
+	const last = await rpc.request({ type: "get_last_assistant_text" });
+	assert.match(last.data.text, /fixture complete/);
 });
 
 test("stock Pi honors global and trusted-project watchdog config precedence", async (t) => {
