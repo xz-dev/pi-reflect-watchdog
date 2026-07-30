@@ -384,6 +384,30 @@ test("UI promotion demotes fallback: clears status and timers, removes only watc
 	await assert.rejects(() => control(staleTool, "status"), /current root/);
 });
 
+test("root user message after root agent_start begins the active task window", async () => {
+	const { extension, clock } = fixture();
+	const pi = new FakePi();
+	const ctx = new FakeContext("root", true);
+	extension(pi.asAPI());
+	const tool = await rootReady(pi, ctx);
+
+	await pi.emit("agent_start", {}, ctx);
+	assert.equal(
+		clock.liveCount(),
+		0,
+		"start alone does not create a task timer",
+	);
+	clock.value = 10;
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	assert.equal((await control(tool, "status")).details.rootActive, true);
+	assert.equal((await control(tool, "status")).details.wallClockElapsedMs, 0);
+	assert.equal(
+		clock.liveCount(),
+		2,
+		"root task owns threshold plus RPC ticker",
+	);
+});
+
 test("actual Pi order starts timing after agent_start then root user message, resets while active, and settles", async () => {
 	const { extension, clock } = fixture();
 	const pi = new FakePi();

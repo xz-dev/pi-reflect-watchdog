@@ -5,7 +5,6 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { RootActivityTracker } from "./activity.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
 	controllerOptionsFromConfig,
@@ -92,7 +91,6 @@ interface Runtime {
 	state: AttachmentState;
 	root?: { generation: number };
 	controller?: TaskController;
-	activity?: RootActivityTracker;
 	ctx?: ExtensionContext;
 	sessionManager?: ExtensionContext["sessionManager"];
 	timer?: Timer;
@@ -123,14 +121,12 @@ function priority(ctx: ExtensionContext): RootPriority {
 function rootIsCurrent(runtime: Runtime): runtime is Runtime & {
 	root: { generation: number };
 	controller: TaskController;
-	activity: RootActivityTracker;
 	ctx: ExtensionContext;
 } {
 	return (
 		runtime.state === "root" &&
 		runtime.root !== undefined &&
 		runtime.controller !== undefined &&
-		runtime.activity !== undefined &&
 		runtime.ctx !== undefined &&
 		isCurrentRoot(getHub<Runtime>(), runtime.token, runtime.root.generation)
 	);
@@ -173,9 +169,8 @@ function deactivate(runtime: Runtime, services: RuntimeServices): void {
 	removeControlTool(runtime);
 	runtime.observerBinding = undefined;
 	runtime.root = undefined;
+	runtime.controller?.finalize();
 	runtime.controller = undefined;
-	runtime.activity?.finalize();
-	runtime.activity = undefined;
 	runtime.ctx = undefined;
 	runtime.sessionManager = undefined;
 	if (runtime.state !== "shutdown") runtime.state = "observer";
@@ -189,14 +184,13 @@ function widgetState(
 	runtime: Runtime & {
 		root: { generation: number };
 		controller: TaskController;
-		activity: RootActivityTracker;
 		ctx: ExtensionContext;
 	},
 	now: number,
 ): WidgetState {
 	const status = runtime.controller.status(now);
 	return {
-		activity: runtime.activity.status(now),
+		activity: status.activity,
 		taskElapsedMs: status.wallClockElapsedMs,
 		wallClockMinutes: status.limits.wallClockMinutes,
 		rootLoops: status.mainLoops,
@@ -346,9 +340,10 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 		runtime.ticker.unref?.();
 	};
 	// Refresh roles are deliberately mode-specific. The widget needs a
-	// second-level redraw; RPC keeps its established bounded footer refresh;
-	// print/json/headless have no changing UI surface to refresh.
-	if (!runtime.controller.status(services.now()).rootActive) return;
+	// second-level redraw while any current-epoch participant runs; RPC keeps
+	// its established bounded footer refresh; print/json/headless have no
+	// changing UI surface to refresh.
+	if (!runtime.controller.status(services.now()).activity.active) return;
 	if (runtime.ctx.mode === "tui")
 		scheduleRefreshTick("tui-refresh", WIDGET_TICK_MS, () => {
 			runtime.widgetRequestRender?.();
@@ -444,7 +439,6 @@ export function createWatchdogExtension(
 			runtime.controller = new TaskController(
 				controllerOptionsFromConfig(loaded.config),
 			);
-			runtime.activity = new RootActivityTracker();
 			runtime.state = "root";
 			for (const diagnostic of loaded.diagnostics.slice(0, 3))
 				ctx.ui.notify(
@@ -464,8 +458,7 @@ export function createWatchdogExtension(
 			if (rootIsCurrent(runtime)) {
 				// An interjecting/new root user message replaces a begun activity
 				// window; the finished window is announced exactly once.
-				const snapshot = runtime.activity.startRootTask(services.now());
-				runtime.controller.startRootTask(
+				const snapshot = runtime.controller.startRootTask(
 					services.now(),
 					runtime.controller.status(services.now()).rootActive,
 				);
@@ -486,25 +479,59 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("agent_start", () => {
-			if (!rootIsCurrent(runtime)) return;
-			// Pi emits this before the initial root user message; record activity independently.
-			runtime.controller.startRootActiveSegment(services.now());
-			runtime.activity.beginRun(services.now());
-			scheduleTimers(runtime, services);
-			updateStatus(runtime, services);
+			if (rootIsCurrent(runtime)) {
+				// Pi emits this before the initial root user message; it arms no task alone.
+				runtime.controller.startRootActiveSegment(services.now());
+				scheduleTimers(runtime, services);
+				updateStatus(runtime, services);
+				return;
+			}
+			const root = getHub<Runtime>().root?.value;
+			const binding = runtime.observerBinding;
+			if (
+				!root ||
+				!rootIsCurrent(root) ||
+				!binding ||
+				binding.observerAttachmentToken !== runtime.token ||
+				binding.rootGeneration !== root.root.generation
+			)
+				return;
+			root.controller.startObserverRun(runtime.token, services.now());
+			scheduleTimers(root, services);
+			updateStatus(root, services);
 		});
 		pi.on("agent_settled", () => {
-			if (!rootIsCurrent(runtime)) return;
-			runtime.controller.settleRootActiveSegment(services.now());
-			emitResetNotification(runtime, runtime.activity.settle(services.now()));
-			clearTimers(runtime, services);
-			updateStatus(runtime, services);
+			if (rootIsCurrent(runtime)) {
+				const snapshot = runtime.controller.settleRootActiveSegment(
+					services.now(),
+				);
+				emitResetNotification(runtime, snapshot);
+				scheduleTimers(runtime, services);
+				updateStatus(runtime, services);
+				return;
+			}
+			const root = getHub<Runtime>().root?.value;
+			const binding = runtime.observerBinding;
+			if (
+				!root ||
+				!rootIsCurrent(root) ||
+				!binding ||
+				binding.observerAttachmentToken !== runtime.token ||
+				binding.rootGeneration !== root.root.generation
+			)
+				return;
+			const snapshot = root.controller.settleObserverRun(
+				runtime.token,
+				binding.taskEpoch,
+				services.now(),
+			);
+			emitResetNotification(root, snapshot);
+			scheduleTimers(root, services);
+			updateStatus(root, services);
 		});
 		pi.on("turn_end", () => {
 			if (rootIsCurrent(runtime)) {
-				// One root turn counts exactly once in both the current cycle and
-				// the paired activity window; observer turns never reach this.
-				runtime.activity.completeRootTurn();
+				// Root turns count once in the root and observed aggregate cycles.
 				deliverWarnings(
 					runtime,
 					runtime.controller.completeRootTurn(services.now()).warnings,
@@ -554,8 +581,16 @@ export function createWatchdogExtension(
 					rootIsCurrent(root) &&
 					binding &&
 					binding.rootGeneration === root.root.generation
-				)
-					root.controller.unbindObserver(runtime.token, binding.taskEpoch);
+				) {
+					const snapshot = root.controller.unbindObserver(
+						runtime.token,
+						services.now(),
+						binding.taskEpoch,
+					);
+					emitResetNotification(root, snapshot);
+					scheduleTimers(root, services);
+					updateStatus(root, services);
+				}
 				clearTimers(runtime, services);
 				clearWidget(runtime);
 				runtime.observerBinding = undefined;
@@ -578,7 +613,6 @@ function commandIsCurrent(
 ): runtime is Runtime & {
 	root: { generation: number };
 	controller: TaskController;
-	activity: RootActivityTracker;
 	ctx: ExtensionContext;
 	sessionManager: ExtensionContext["sessionManager"];
 } {
@@ -595,8 +629,7 @@ function commandIsCurrent(
 
 function userStatusText(runtime: Runtime, services: RuntimeServices): string {
 	const status = runtime.controller?.status(services.now());
-	const activity = runtime.activity?.status(services.now());
-	if (!status || !activity) return "Watchdog is not active for this session.";
+	if (!status) return "Watchdog is not active for this session.";
 	return [
 		"Watchdog status",
 		`root/main loops: ${status.mainLoops}`,
@@ -608,7 +641,7 @@ function userStatusText(runtime: Runtime, services: RuntimeServices): string {
 		`configured defaults: main=${status.configuredLimits.mainLoopLimit}; observed-total=${status.configuredLimits.observedTotalLoopLimit}; wall-clock=${status.configuredLimits.wallClockMinutes}m`,
 		`latched warnings: ${status.latchedWarnings.join(", ") || "none"}`,
 		`coverage: ${status.coverage}`,
-		`active window: ${formatDuration(activity.elapsedMs)}/${activity.loops} root loops`,
+		`active window: ${formatDuration(status.activity.elapsedMs)}/${status.activity.loops} root loops`,
 	].join("\n");
 }
 

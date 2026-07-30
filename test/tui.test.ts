@@ -446,6 +446,193 @@ test("live widget shows the exact approved format from events", async () => {
 	);
 });
 
+test("a bound running child keeps the active window after root settle", async () => {
+	const { extension, clock } = fixture();
+	const rootPi = new FakePi();
+	const childPi = new FakePi();
+	const root = new FakeContext("root", true, "tui");
+	const child = new FakeContext("child", false, "tui");
+	extension(rootPi.asAPI());
+	extension(childPi.asAPI());
+	await rootReady(rootPi, root);
+	await childPi.emit("session_start", {}, child);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	clock.value = 1_000;
+	await childPi.emit("message_start", { message: { role: "user" } }, child);
+	await childPi.emit("agent_start", {}, child);
+	clock.value = 2_000;
+	await rootPi.emit("agent_settled", {}, root);
+	clock.value = 5_000;
+
+	assert.equal(
+		root.widgetLine(),
+		"Watchdog | active 5s/0 loops · task 2s/30m · root 0/100 · observed 0/500",
+	);
+	assert.deepEqual(root.resetNotifications(), []);
+	assert.equal(clock.liveTimers("threshold").length, 0);
+	assert.equal(clock.liveTimers("tui-refresh").length, 1);
+});
+
+test("the final bound child settle closes the window once", async () => {
+	const { extension, clock } = fixture();
+	const rootPi = new FakePi();
+	const childAPi = new FakePi();
+	const childBPi = new FakePi();
+	const root = new FakeContext("root", true, "tui");
+	const childA = new FakeContext("child-a", false, "tui");
+	const childB = new FakeContext("child-b", false, "tui");
+	extension(rootPi.asAPI());
+	extension(childAPi.asAPI());
+	extension(childBPi.asAPI());
+	await rootReady(rootPi, root);
+	await childAPi.emit("session_start", {}, childA);
+	await childBPi.emit("session_start", {}, childB);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	await childAPi.emit("message_start", { message: { role: "user" } }, childA);
+	await childBPi.emit("message_start", { message: { role: "user" } }, childB);
+	await childAPi.emit("agent_start", {}, childA);
+	await childBPi.emit("agent_start", {}, childB);
+	clock.value = 1_000;
+	await rootPi.emit("agent_settled", {}, root);
+	clock.value = 2_000;
+	await childAPi.emit("agent_settled", {}, childA);
+	assert.match(root.widgetLine(), /^Watchdog \| active 2s\/0 loops/);
+	assert.deepEqual(root.resetNotifications(), []);
+
+	clock.value = 3_000;
+	await childBPi.emit("agent_settled", {}, childB);
+	assert.equal(
+		root.widgetLine(),
+		"Watchdog | idle · active 0s/0 loops · task 1s/30m · root 0/100 · observed 0/500",
+	);
+	assert.deepEqual(root.resetNotifications(), [
+		"Watchdog reset | active 3s/0 loops",
+	]);
+	assert.equal(clock.pending(), 0);
+});
+
+test("a child settling before root leaves the window active", async () => {
+	const { extension, clock } = fixture();
+	const rootPi = new FakePi();
+	const childPi = new FakePi();
+	const root = new FakeContext("root", true, "tui");
+	const child = new FakeContext("child", false, "tui");
+	extension(rootPi.asAPI());
+	extension(childPi.asAPI());
+	await rootReady(rootPi, root);
+	await childPi.emit("session_start", {}, child);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	await childPi.emit("message_start", { message: { role: "user" } }, child);
+	await childPi.emit("agent_start", {}, child);
+	clock.value = 1_000;
+	await childPi.emit("agent_settled", {}, child);
+	clock.value = 2_000;
+	assert.match(root.widgetLine(), /^Watchdog \| active 2s\/0 loops/);
+	assert.deepEqual(root.resetNotifications(), []);
+	await rootPi.emit("agent_settled", {}, root);
+	assert.deepEqual(root.resetNotifications(), [
+		"Watchdog reset | active 2s/0 loops",
+	]);
+});
+
+test("observer shutdown closes a root-settled active window once", async () => {
+	const { extension, clock } = fixture();
+	const rootPi = new FakePi();
+	const childPi = new FakePi();
+	const root = new FakeContext("root", true, "tui");
+	const child = new FakeContext("child", false, "tui");
+	extension(rootPi.asAPI());
+	extension(childPi.asAPI());
+	await rootReady(rootPi, root);
+	await childPi.emit("session_start", {}, child);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	await childPi.emit("message_start", { message: { role: "user" } }, child);
+	await childPi.emit("agent_start", {}, child);
+	clock.value = 1_000;
+	await rootPi.emit("agent_settled", {}, root);
+	clock.value = 2_000;
+	await childPi.emit("session_shutdown", {}, child);
+	assert.equal(
+		root.widgetLine(),
+		"Watchdog | idle · active 0s/0 loops · task 1s/30m · root 0/100 · observed 0/500",
+	);
+	assert.deepEqual(root.resetNotifications(), [
+		"Watchdog reset | active 2s/0 loops",
+	]);
+});
+
+test("a root start after full quiescence stays idle until the next user task", async () => {
+	const { extension, clock } = fixture();
+	const pi = new FakePi();
+	const ctx = new FakeContext("root", true, "tui");
+	extension(pi.asAPI());
+	await rootReady(pi, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	clock.value = 1_000;
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(ctx.resetNotifications(), [
+		"Watchdog reset | active 1s/0 loops",
+	]);
+
+	clock.value = 2_000;
+	await pi.emit("agent_start", {}, ctx);
+	assert.equal(
+		ctx.widgetLine(),
+		"Watchdog | idle · active 0s/0 loops · task 1s/30m · root 0/100 · observed 0/500",
+	);
+	assert.equal(clock.pending(), 0, "admission alone owns no timers");
+	assert.deepEqual(ctx.resetNotifications(), [
+		"Watchdog reset | active 1s/0 loops",
+	]);
+
+	clock.value = 3_000;
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	assert.equal(
+		ctx.widgetLine(),
+		"Watchdog | active 0s/0 loops · task 0s/30m · root 0/100 · observed 0/500",
+	);
+	assert.equal(clock.liveTimers("tui-refresh").length, 1);
+	assert.equal(clock.liveTimers("threshold").length, 1);
+	assert.deepEqual(ctx.resetNotifications(), [
+		"Watchdog reset | active 1s/0 loops",
+	]);
+});
+
+test("a root continuation rejoins a child-held active task", async () => {
+	const { extension, clock } = fixture();
+	const rootPi = new FakePi();
+	const childPi = new FakePi();
+	const root = new FakeContext("root", true, "tui");
+	const child = new FakeContext("child", false, "tui");
+	extension(rootPi.asAPI());
+	extension(childPi.asAPI());
+	await rootReady(rootPi, root);
+	await childPi.emit("session_start", {}, child);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	await childPi.emit("message_start", { message: { role: "user" } }, child);
+	await childPi.emit("agent_start", {}, child);
+	clock.value = 40_000;
+	await rootPi.emit("agent_settled", {}, root);
+	clock.value = 100_000;
+	await rootPi.emit("agent_start", {}, root);
+	assert.match(root.widgetLine(), /^Watchdog \| active 1m40s\/0 loops/);
+	assert.equal(clock.liveTimers("threshold").length, 1);
+	assert.equal(clock.liveTimers("tui-refresh").length, 1);
+	clock.value = 120_000;
+	await rootPi.emit("turn_end", {}, root);
+	assert.equal(
+		root.widgetLine(),
+		"Watchdog | active 2m0s/1 loops · task 1m0s/30m · root 1/100 · observed 1/500",
+	);
+	assert.deepEqual(root.resetNotifications(), []);
+});
+
 test("active excludes settled idle and the next task starts at zero", async () => {
 	const { extension, clock } = fixture();
 	const pi = new FakePi();

@@ -73,6 +73,119 @@ test("rejects stale observer turns after a new root epoch and counts a new bindi
 	assert.equal(controller.status(12).observedChildSessions, 1);
 });
 
+test("duplicate root starts do not restart a current root wall-clock segment", () => {
+	const controller = new TaskController({ ...limits, wallClockMinutes: 1 });
+	controller.startRootActiveSegment(0);
+	controller.startRootTask(0);
+	controller.startRootActiveSegment(10_000);
+
+	assert.equal(controller.status(60_000).wallClockElapsedMs, 60_000);
+	assert.deepEqual(controller.evaluateWallClock(60_000).warnings, [
+		"wallClockLimitReached",
+	]);
+});
+
+test("root wall-clock accumulates root segments across a child-only gap", () => {
+	const controller = new TaskController({ ...limits, wallClockMinutes: 1 });
+	controller.startRootActiveSegment(0);
+	controller.startRootTask(0);
+	const childEpoch = controller.bindObserver("child");
+	controller.startObserverRun("child", 1);
+	controller.settleRootActiveSegment(40_000);
+
+	assert.equal(controller.status(100_000).wallClockElapsedMs, 40_000);
+	controller.startRootActiveSegment(100_000);
+	assert.equal(controller.status(120_000).wallClockElapsedMs, 60_000);
+	assert.deepEqual(controller.evaluateWallClock(120_000).warnings, [
+		"wallClockLimitReached",
+	]);
+	assert.equal(controller.status(120_000).activity.active, true);
+	assert.equal(controller.settleRootActiveSegment(120_000), undefined);
+	assert.equal(controller.status(180_000).wallClockElapsedMs, 60_000);
+	assert.equal(
+		controller.settleRootActiveSegment(180_000),
+		undefined,
+		"a duplicate root settle cannot add another segment",
+	);
+	assert.equal(controller.status(180_000).wallClockElapsedMs, 60_000);
+	assert.deepEqual(controller.settleObserverRun("child", childEpoch, 180_000), {
+		elapsedMs: 180_000,
+		loops: 0,
+	});
+	assert.equal(
+		controller.settleObserverRun("child", childEpoch, 180_000),
+		undefined,
+	);
+	assert.deepEqual(controller.status(180_000).activity, {
+		active: false,
+		elapsedMs: 0,
+		loops: 0,
+	});
+});
+
+test("bound running children keep activity open while root wall-clock freezes", () => {
+	const controller = new TaskController({ ...limits, wallClockMinutes: 1 });
+	controller.startRootActiveSegment(0);
+	controller.startRootTask(0);
+	const childEpoch = controller.bindObserver("child");
+	controller.startObserverRun("child", 1_000);
+	assert.equal(controller.settleRootActiveSegment(2_000), undefined);
+
+	const whileChildRuns = controller.status(5_000);
+	assert.deepEqual(whileChildRuns.activity, {
+		active: true,
+		elapsedMs: 5_000,
+		loops: 0,
+	});
+	assert.equal(whileChildRuns.rootActive, false);
+	assert.equal(whileChildRuns.wallClockElapsedMs, 2_000);
+	assert.deepEqual(controller.evaluateWallClock(5_000).warnings, []);
+	assert.deepEqual(controller.settleObserverRun("child", childEpoch, 6_000), {
+		elapsedMs: 6_000,
+		loops: 0,
+	});
+	assert.deepEqual(controller.status(6_000).activity, {
+		active: false,
+		elapsedMs: 0,
+		loops: 0,
+	});
+});
+
+test("old-epoch child starts and settles are inert after a new root task", () => {
+	const controller = new TaskController(limits);
+	controller.startRootActiveSegment(0);
+	controller.startRootTask(0);
+	const oldEpoch = controller.bindObserver("child");
+	controller.startObserverRun("child", 1);
+	assert.equal(controller.settleRootActiveSegment(2), undefined);
+
+	controller.startRootTask(3);
+	controller.startObserverRun("child", 4);
+	assert.equal(controller.status(4).activity.active, false);
+	assert.equal(controller.settleObserverRun("child", oldEpoch, 5), undefined);
+	assert.equal(controller.status(5).activity.active, false);
+});
+
+test("an observer must bind before its start can participate", () => {
+	const controller = new TaskController(limits);
+	controller.startRootActiveSegment(0);
+	controller.startRootTask(0);
+	controller.startObserverRun("child", 1);
+	assert.deepEqual(controller.settleRootActiveSegment(2), {
+		elapsedMs: 2,
+		loops: 0,
+	});
+	assert.equal(controller.status(3).activity.active, false);
+
+	const epoch = controller.bindObserver("child");
+	controller.startObserverRun("child", 4);
+	assert.equal(controller.status(5).activity.active, true);
+	assert.deepEqual(controller.settleObserverRun("child", epoch, 6), {
+		elapsedMs: 2,
+		loops: 0,
+	});
+});
+
 test("runtime reset retains limits and prompts but clears latches and restarts active wall time", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);
