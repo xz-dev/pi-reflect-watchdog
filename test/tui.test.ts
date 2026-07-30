@@ -722,6 +722,11 @@ test("threshold crossings and limit operations never print the reset line", asyn
 	clock.value = 60_000;
 	clock.fire(thresholdAt(clock, 60_000));
 	assert.equal(pi.messages.length, 1, "threshold warning still delivered");
+	assert.equal(
+		ctx.widgetLine(),
+		"Watchdog | active 1m0s/0 loops · task 0s/30m · root 0/100 · observed 0/500",
+		"threshold delivery restores configured defaults for the independent task cycle",
+	);
 	await control(tool, "set_limits", { wallClockMinutes: 2 });
 	await control(tool, "restore_defaults");
 	await control(tool, "reset");
@@ -1069,38 +1074,37 @@ test("TUI role-aware collision keeps a 1s threshold and redraw ticker independen
 		rendersBeforeThreshold,
 		"threshold never redraws",
 	);
-	assert.equal(
+	assert.notEqual(
 		clock.liveTimers("tui-refresh")[0].id,
 		refresh.id,
-		"threshold leaves redraw tick live",
+		"warning reset replaces the stale redraw lifecycle",
 	);
-	assert.equal(clock.pending(), 1, "latched threshold does not rearm");
+	assert.equal(clock.pending(), 2, "warning re-arms threshold and redraw tick");
 	clock.fireStale(threshold.id);
 	assert.equal(pi.messages.length, 1, "stale threshold copy is inert");
 	assert.equal(ctx.requestRenderCalls, rendersBeforeThreshold);
-	clock.fire(refresh.id);
+	clock.fireStale(refresh.id);
 	assert.equal(
 		pi.messages.length,
 		1,
-		"redraw tick cannot repeat a latched warning",
+		"stale redraw callback cannot repeat the delivered warning",
 	);
 	assert.equal(
 		ctx.requestRenderCalls,
-		rendersBeforeThreshold + 1,
-		"refresh requests exactly one render",
+		rendersBeforeThreshold,
+		"stale redraw callback remains inert",
 	);
-	assert.equal(clock.pending(), 1, "only the rearmed redraw timer remains");
 	const nextRefresh = clock.liveTimers("tui-refresh")[0];
-	assert.notEqual(
-		nextRefresh.id,
-		refresh.id,
-		"refresh tick alone rearms itself",
-	);
-	clock.fireStale(refresh.id);
+	clock.fire(nextRefresh.id);
 	assert.equal(
 		ctx.requestRenderCalls,
 		rendersBeforeThreshold + 1,
-		"stale redraw copy is inert",
+		"fresh redraw tick requests exactly one render",
 	);
-	assert.equal(clock.liveTimers("tui-refresh")[0].id, nextRefresh.id);
+	assert.equal(clock.pending(), 2, "fresh threshold and rearmed redraw remain");
+	assert.notEqual(
+		clock.liveTimers("tui-refresh")[0].id,
+		nextRefresh.id,
+		"fresh redraw tick alone rearms itself",
+	);
 });

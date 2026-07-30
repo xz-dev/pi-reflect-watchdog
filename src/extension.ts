@@ -7,6 +7,7 @@ import type {
 
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
+	type ControllerTransition,
 	controllerOptionsFromConfig,
 	TaskController,
 	type TaskStatus,
@@ -291,7 +292,7 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 			// evaluate exactly once instead of scheduling a zero-delay timer.
 			deliverWarnings(
 				runtime,
-				runtime.controller.evaluateWallClock(services.now()).warnings,
+				runtime.controller.evaluateWallClock(services.now()),
 				services,
 			);
 			return;
@@ -303,16 +304,14 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 			() => {
 				if (stale(fired)) return;
 				runtime.timer = undefined;
-				deliverWarnings(
+				const delivered = deliverWarnings(
 					runtime,
-					runtime.controller.evaluateWallClock(services.now()).warnings,
+					runtime.controller.evaluateWallClock(services.now()),
 					services,
 				);
-				// A host clock may deliver before its deadline, and a capped chunk
-				// fires before the boundary. Recompute rather than letting an early
-				// callback permanently lose the threshold warning; at or beyond the
-				// boundary no timer is rearmed, so only the status ticker remains.
-				scheduleWallClock();
+				// A warning reset creates a fresh timer lifecycle. Only an early or
+				// capped callback without a warning may rearm this lifecycle in place.
+				if (!delivered) scheduleWallClock();
 				updateStatus(runtime, services);
 			},
 			Math.min(remaining, MAX_TIMER_DELAY_MS),
@@ -372,27 +371,36 @@ function templateVariables(
 
 function deliverWarnings(
 	runtime: Runtime,
-	warnings: PromptKind[],
+	transition: ControllerTransition,
 	services: RuntimeServices,
-): void {
-	if (warnings.length === 0 || !rootIsCurrent(runtime)) return;
-	const status = runtime.controller.status(services.now());
-	const content = warnings
+): boolean {
+	if (transition.warnings.length === 0 || !rootIsCurrent(runtime)) return false;
+	const status = transition.triggerStatus;
+	if (status === undefined)
+		throw new Error("warning transition must include its pre-reset status");
+	const content = transition.warnings
 		.map((kind) =>
 			renderTemplate(status.prompts[kind], templateVariables(status)),
 		)
 		.join("\n\n");
-	runtime.ctx.ui.notify(`Watchdog warning: ${warnings.join(", ")}`, "warning");
+	runtime.ctx.ui.notify(
+		`Watchdog warning: ${transition.warnings.join(", ")}`,
+		"warning",
+	);
 	runtime.pi.sendMessage(
 		{
 			customType: WARNING_TYPE,
 			content,
 			display: true,
-			details: { warnings, status },
+			details: { warnings: transition.warnings, status },
 		},
 		{ deliverAs: status.rootActive ? "steer" : "nextTurn", triggerTurn: false },
 	);
+	// Recreate timers only from the reset state, so old callbacks are stale and
+	// a running root receives a full fresh wall-clock interval before another warning.
+	scheduleTimers(runtime, services);
 	updateStatus(runtime, services);
+	return true;
 }
 
 export function createWatchdogExtension(
@@ -534,7 +542,7 @@ export function createWatchdogExtension(
 				// Root turns count once in the root and observed aggregate cycles.
 				deliverWarnings(
 					runtime,
-					runtime.controller.completeRootTurn(services.now()).warnings,
+					runtime.controller.completeRootTurn(services.now()),
 					services,
 				);
 				updateStatus(runtime, services);
@@ -556,7 +564,7 @@ export function createWatchdogExtension(
 					runtime.token,
 					binding.taskEpoch,
 					services.now(),
-				).warnings,
+				),
 				services,
 			);
 		});
@@ -710,21 +718,21 @@ function registerWatchdogCommand(
 					notifyCommand(ctx, userStatusText(runtime, services));
 					return;
 				case "limits-set": {
-					const warnings = runtime.controller.setLimits(
+					const transition = runtime.controller.setLimits(
 						parsed.command,
 						current,
-					).warnings;
+					);
 					scheduleTimers(runtime, services);
-					notifyCommandWarnings(ctx, warnings);
+					notifyCommandWarnings(ctx, transition.warnings);
 					updateStatus(runtime, services);
 					notifyCommand(ctx, "Watchdog current-task limits updated.");
 					return;
 				}
 				case "limits-reset": {
-					const warnings =
-						runtime.controller.restoreConfiguredDefaults(current).warnings;
+					const transition =
+						runtime.controller.restoreConfiguredDefaults(current);
 					scheduleTimers(runtime, services);
-					notifyCommandWarnings(ctx, warnings);
+					notifyCommandWarnings(ctx, transition.warnings);
 					updateStatus(runtime, services);
 					notifyCommand(
 						ctx,
@@ -816,7 +824,7 @@ function registerControlTool(
 					"watchdog_control is available only to the current root session",
 				);
 			const current = services.now();
-			let warnings: PromptKind[] = [];
+			let transition: ControllerTransition = { warnings: [] };
 			if (params.action === "reset") runtime.controller.resetRuntime(current);
 			else if (params.action === "set_limits") {
 				const limits = {
@@ -835,12 +843,14 @@ function registerControlTool(
 					throw new Error(
 						"set_limits accepts only positive safe integer limits",
 					);
-				warnings = runtime.controller.setLimits(limits, current).warnings;
+				transition = runtime.controller.setLimits(limits, current, true);
 			} else if (params.action === "restore_defaults")
-				warnings =
-					runtime.controller.restoreConfiguredDefaults(current).warnings;
-			scheduleTimers(runtime, services);
-			deliverWarnings(runtime, warnings, services);
+				transition = runtime.controller.restoreConfiguredDefaults(
+					current,
+					true,
+				);
+			if (!deliverWarnings(runtime, transition, services))
+				scheduleTimers(runtime, services);
 			updateStatus(runtime, services);
 			const status = runtime.controller.status(current);
 			return {

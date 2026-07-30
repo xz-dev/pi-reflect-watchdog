@@ -53,10 +53,9 @@ when the root session completes its 99th turn,
 then no main-loop warning is delivered.
 
 When it completes its 100th turn,
-then exactly one main-loop warning is delivered to the root model and user.
+then the triggering 100-loop status is captured, the whole watchdog cycle resets, and exactly one main-loop warning based on that captured status is delivered to the root model and user.
 
-When it completes more turns in the same task,
-then the warning is not repeated.
+The warning-triggered continuation is root loop 1 of the fresh cycle; it does not repeat the warning.
 
 ### A2 — Observable total boundary
 
@@ -76,7 +75,7 @@ when 30 continuous minutes elapse before `agent_settled`,
 then the root receives exactly one wall-clock warning.
 
 Given only observer sessions remain active after the root settles,
-then no wall-clock timer continues and no observer is warned.
+then the root-only wall-clock timer freezes, no observer is warned, and the automatic active window continues until the final bound-running observer settles.
 
 ### A4 — Root user messages define task windows
 
@@ -106,10 +105,10 @@ Given it calls `reset`,
 then counters and warning latches reset without stopping any agent; if the root is active, its wall-clock restarts; the control-call turn subsequently counts as the first root turn in the reset window.
 
 Given it calls `set_limits`,
-then supplied limits must each be positive JavaScript safe integers; invalid or unsafe values reject the whole request without changing any limit. Valid limits change only for the current task, preserve counters and elapsed time, selectively rearm a latch only after its measurement is below its replacement limit, immediately warn when a replacement is already crossed, and never modify a configuration file.
+then supplied limits must each be positive JavaScript safe integers; invalid or unsafe values reject the whole request without changing any limit. Valid limits change only for the current task, preserve counters and elapsed time when no threshold is crossed, selectively rearm a threshold after its measurement is below its replacement limit, immediately evaluate the replacement limit, and never modify a configuration file. If that model-facing evaluation crosses one or more thresholds, one pre-reset status is captured, the full warning cycle resets to configured limits and prompts, and one combined reminder is delivered from the captured status.
 
 Given it calls `restore_defaults`,
-then configured limits become effective without resetting counters or elapsed time, with the same selective rearm and immediate evaluation rules.
+then configured limits become effective without resetting counters or elapsed time unless the immediate model-facing evaluation crosses a threshold, in which case the same capture/reset-before-delivery rule applies.
 
 The tool has no prompt-mutation action.
 
@@ -141,7 +140,7 @@ The next root task restores configured templates. Observer sessions expose no us
 Given the current watchdog root invokes `/watchdog`, `/watchdog status`, `/watchdog reset`, `/watchdog limits`, `/watchdog limits <main> <observed> <minutes>`, `/watchdog limits reset`, or the documented prompt subcommands,
 then the command is user-only: it reports through the command UI, never sends a user/custom model message, and never triggers an LLM turn.
 
-`/watchdog reset` resets only the current watchdog task cycle (counts, task wall-clock, and latches), retaining current limits and temporary prompts while leaving the A11 active window untouched and emitting no automatic active-reset notification. Limit changes and restores use the same current-task immediate-warning/rearm semantics as `watchdog_control`; malformed, incomplete, extra, zero, negative, fractional, unsafe, or unknown arguments report useful English usage and leave state unchanged.
+`/watchdog reset` resets only the current watchdog task cycle (counts, task wall-clock, and latches), retaining current limits and temporary prompts while leaving the A11 active window untouched and emitting no automatic active-reset notification. Limit changes and restores immediately evaluate current values but remain UI-only: they may notify the user, never send or steer a model message, and do not reset the cycle merely because the user changed a limit. Malformed, incomplete, extra, zero, negative, fractional, unsafe, or unknown arguments report useful English usage and leave state unchanged.
 
 The command is dynamically registered only after a session wins the root claim. Observer attachments expose no command. Pi has no public command unregistration, so a demoted attachment can retain an inert registered definition, whose handler validates current root generation and context before changing anything. A prompt editor is unavailable without a UI-capable root and leaves state unchanged; saving an empty template is rejected, and `/watchdog prompt reset` is the explicit removal path.
 
@@ -149,16 +148,16 @@ The command is dynamically registered only after a session wins the root claim. 
 
 Given a threshold is reached while the root is active,
 then a custom watchdog message is delivered for immediate reflection at Pi's next safe steering boundary with `triggerTurn: false`.
-The watchdog never aborts, cancels, or interrupts tool calls already running; Pi first lets the current assistant turn's tool calls finish, then consumes the steering message in a normal continuation assistant turn. The continuation counts normally as a loop and the warning latch prevents recursive warning delivery.
+The watchdog never aborts, cancels, or interrupts tool calls already running; Pi first lets the current assistant turn's tool calls finish, then consumes the steering message in a normal continuation assistant turn. Because the model-facing warning reset the cycle before delivery, the continuation counts as loop 1 under the restored configured limits rather than recursively retriggering the old crossing.
 
 Given a threshold is reached while the root is idle because of an observable observer turn,
 then the user is notified and the model message is queued for the next turn without waking the root.
 
-Watchdog warnings are custom messages, never user messages, and therefore do not reset the task. An active steering warning intentionally causes Pi to produce a normal continuation turn so the agent reflects immediately; an idle `nextTurn` warning does not wake the root.
+Watchdog warnings are custom messages, never user messages, so they do not create a new user task. Before delivery, the watchdog captures the triggering status and resets the full watchdog cycle; the reminder is rendered from the captured values while the live cycle already shows zero. An active steering warning intentionally causes Pi to produce a normal continuation turn as loop 1 of the fresh cycle; an idle `nextTurn` warning does not wake the root.
 
 ### A10 — Lifecycle cleanup
 
-On `agent_settled`, the root wall-clock timer and live ticker stop.
+On root `agent_settled`, the root-only wall-clock timer stops. The live ticker and automatic active window remain open while any current-epoch bound observer is still running; the final participant settle closes them.
 On root `session_shutdown`, root timers, statuses, and the root attachment are cleaned up. Observer cleanup is best-effort because current Pi embedders may directly dispose child sessions without emitting `session_shutdown`; counting correctness therefore relies on observer attachment tokens, root generation, and task-epoch validation rather than cleanup delivery.
 On `/reload`, the old context is never reused; the replacement root adapter can safely attach to the process-local hub.
 On `/new`, `/resume`, or `/fork`, the replacement root starts a fresh task state rather than joining the previous session's task.
@@ -170,9 +169,9 @@ then the dedicated below-editor widget shows the live one-line status, for examp
 
 `Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500`
 
-`active` pairs root-only elapsed active time with completed root turns for the current automatic activity window. It excludes every observer turn and all idle time. `task` is the current watchdog/manual-reset cycle root active elapsed time against the wall-clock limit. `root` and `observed` are the current-cycle root and root-plus-observable-child turn counts against their limits; `observed` never claims complete coverage.
+`active` pairs elapsed supervised-work time with completed root turns for the current automatic activity window. It excludes observer turns and fully idle time, but continues while any current-epoch watchdog-observable child runs after the root settles. `task` is the current watchdog/manual-reset cycle's accumulated root-running time against the wall-clock limit; child-only gaps do not increase it. `root` and `observed` are the current-cycle root and root-plus-observable-child turn counts against their limits; `observed` never claims complete coverage.
 
-An automatic activity reset occurs only when the root reaches `agent_settled`/stops, or when an interjecting/new root user message replaces a currently active window. Both active time and active loops clear together, stay zero while idle, and start from zero when the next root task actually starts. Session shutdown/demotion clears state and resources without reusing a stale UI context.
+An automatic activity reset occurs only when the final current-task participant reaches `agent_settled`/stops, or when an interjecting/new root user message replaces a currently active window. Root settle removes only root participation; bound-running observers keep the window open. Active time and active root-loop count clear together, stay zero while fully idle, and start from zero when the next root task actually starts. Session shutdown/demotion clears state and resources without reusing a stale UI context.
 
 When an automatic transition resets a begun window, the pre-reset snapshot is emitted exactly once as a user-only TUI info notification, for example:
 
@@ -180,7 +179,7 @@ When an automatic transition resets a begun window, the pre-reset snapshot is em
 
 The notification uses neutral wording only: Pi exposes no reliable public user-abort provenance, so the watchdog never labels a window completed or aborted and never displays token speed. The notification never enters the model context (`ctx.ui.notify` only, never `pi.sendMessage`) and never triggers a turn. After it, the widget may silently show the idle zero state until the next root task restores the live format.
 
-Reminder threshold crossings, AI `watchdog_control reset`, a future user `/watchdog reset`, and limit restore/set operations never reset `active` and never emit the reset notification; they reset only the current-cycle `task`, `root`, `observed`, and warning latches. An interjecting root user message that already reset the window causes no duplicate when the later `agent_settled` arrives, and no notification is emitted when no active window existed.
+Reminder threshold crossings, AI `watchdog_control reset`, user `/watchdog reset`, and limit restore/set operations never reset `active` and never emit the reset notification. A model-facing threshold crossing captures the old status and resets current-cycle `task`, `root`, `observed`, latches, runtime limits, and temporary prompts before delivery; manual resets retain current runtime limits and prompts; slash limit operations remain UI-only. An interjecting root user message that already reset the window causes no duplicate when the later `agent_settled` arrives, and no notification is emitted when no active window existed.
 
 Only the current root in `tui` mode renders the widget; RPC, print, and json modes and observer sessions get no widget and no widget ticker. The widget replaces the watchdog footer status in TUI so the status never appears twice. It renders at most one line, truncates to the terminal width through the real component, uses restrained theme color, refreshes at about one second while active, and stops refreshing while idle.
 

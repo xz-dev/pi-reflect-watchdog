@@ -16,6 +16,8 @@ export interface RuntimeLimits {
 
 export interface ControllerTransition {
 	warnings: WarningKind[];
+	/** Immutable status captured immediately before a warning resets its cycle. */
+	triggerStatus?: TaskStatus;
 }
 
 export interface TaskStatus {
@@ -45,8 +47,11 @@ export interface TaskControllerOptions
 const COVERAGE =
 	"Observable total includes the root and watchdog-enabled child sessions in this process; isolated, disabled, remote, and out-of-process sessions may be absent.";
 
-function transition(warnings: WarningKind[] = []): ControllerTransition {
-	return { warnings };
+function transition(
+	warnings: WarningKind[] = [],
+	triggerStatus?: TaskStatus,
+): ControllerTransition {
+	return { warnings, triggerStatus };
 }
 
 function positiveSafeInteger(
@@ -197,7 +202,18 @@ export class TaskController {
 		if (this.rootActiveSince !== undefined) this.rootActiveSince = now;
 	}
 
-	setLimits(limits: Partial<RuntimeLimits>, now: number): ControllerTransition {
+	private resetWarningCycle(now: number): void {
+		if (this.epoch === 0) return;
+		this.resetRuntime(now);
+		this.limits = { ...this.configuredLimits };
+		this.promptOverrides = {};
+	}
+
+	setLimits(
+		limits: Partial<RuntimeLimits>,
+		now: number,
+		resetWarningCycle = false,
+	): ControllerTransition {
 		if (limits.mainLoopLimit !== undefined)
 			this.limits.mainLoopLimit = positiveSafeInteger(
 				limits.mainLoopLimit,
@@ -214,13 +230,16 @@ export class TaskController {
 				this.limits.wallClockMinutes,
 			);
 		this.rearmBelowLimits(now);
-		return this.evaluate(now);
+		return this.evaluate(now, true, resetWarningCycle);
 	}
 
-	restoreConfiguredDefaults(now: number): ControllerTransition {
+	restoreConfiguredDefaults(
+		now: number,
+		resetWarningCycle = false,
+	): ControllerTransition {
 		this.limits = { ...this.configuredLimits };
 		this.rearmBelowLimits(now);
-		return this.evaluate(now);
+		return this.evaluate(now, true, resetWarningCycle);
 	}
 
 	setPromptOverride(kind: PromptKind, template: string): void {
@@ -335,7 +354,11 @@ export class TaskController {
 			this.latched.delete("wallClockLimitReached");
 	}
 
-	private evaluate(now: number, includeLoops = true): ControllerTransition {
+	private evaluate(
+		now: number,
+		includeLoops = true,
+		resetWarningCycle = true,
+	): ControllerTransition {
 		const warnings: WarningKind[] = [];
 		const total = this.mainLoops + this.observedChildLoops;
 		if (includeLoops && this.mainLoops >= this.limits.mainLoopLimit)
@@ -347,7 +370,10 @@ export class TaskController {
 			this.elapsed(now) >= this.wallClockLimitMs()
 		)
 			this.latch("wallClockLimitReached", warnings);
-		return transition(warnings);
+		if (warnings.length === 0) return transition();
+		const triggerStatus = this.status(now);
+		if (resetWarningCycle) this.resetWarningCycle(now);
+		return transition(warnings, triggerStatus);
 	}
 
 	private latch(kind: WarningKind, warnings: WarningKind[]): void {

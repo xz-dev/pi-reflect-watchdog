@@ -489,7 +489,42 @@ test("timer remaining duration is exact and stale generation callbacks are inert
 	assert.equal(pi.messages.length, 0);
 });
 
-test("warnings steer active work, queue idle observer warnings, never abort, and latch", async () => {
+test("warning delivery resets the cycle before steering its continuation", async () => {
+	const { extension } = fixture();
+	const rootPi = new FakePi();
+	const root = new FakeContext("root", true);
+	extension(rootPi.asAPI());
+	const tool = await rootReady(rootPi, root);
+	await rootPi.emit("agent_start", {}, root);
+	await rootPi.emit("message_start", { message: { role: "user" } }, root);
+	await control(tool, "set_limits", { mainLoopLimit: 2 });
+	await rootPi.emit("turn_end", {}, root);
+	await rootPi.emit("turn_end", {}, root);
+
+	assert.deepEqual(rootPi.messages.at(-1)?.options, {
+		deliverAs: "steer",
+		triggerTurn: false,
+	});
+	const delivered = rootPi.messages.at(-1)?.message.details as {
+		warnings: string[];
+		status: { mainLoops: number; observedTotalLoops: number };
+	};
+	assert.deepEqual(delivered.warnings, ["mainLoopLimitReached"]);
+	assert.equal(delivered.status.mainLoops, 2);
+	assert.equal(delivered.status.observedTotalLoops, 2);
+	const reset = await control(tool, "status");
+	assert.equal(reset.details.mainLoops, 0);
+	assert.equal(reset.details.observedTotalLoops, 0);
+	assert.deepEqual(reset.details.latchedWarnings, []);
+
+	await rootPi.emit("turn_end", {}, root);
+	const continuation = await control(tool, "status");
+	assert.equal(continuation.details.mainLoops, 1);
+	assert.equal(continuation.details.observedTotalLoops, 1);
+	assert.equal(rootPi.messages.length, 1, "fresh cycle does not duplicate");
+});
+
+test("an idle child warning resets its cycle before next-turn delivery and keeps participating", async () => {
 	const { extension } = fixture();
 	const rootPi = new FakePi();
 	const childPi = new FakePi();
@@ -501,22 +536,35 @@ test("warnings steer active work, queue idle observer warnings, never abort, and
 	await childPi.emit("session_start", {}, child);
 	await rootPi.emit("agent_start", {}, root);
 	await rootPi.emit("message_start", { message: { role: "user" } }, root);
-	await control(tool, "set_limits", { mainLoopLimit: 1 });
-	await rootPi.emit("turn_end", {}, root);
-	assert.deepEqual(rootPi.messages.at(-1)?.options, {
-		deliverAs: "steer",
-		triggerTurn: false,
-	});
-	await rootPi.emit("turn_end", {}, root);
-	assert.equal(rootPi.messages.length, 1);
-	await rootPi.emit("agent_settled", {}, root);
 	await childPi.emit("message_start", { message: { role: "user" } }, child);
-	await control(tool, "set_limits", { observedTotalLoopLimit: 3 });
+	await childPi.emit("agent_start", {}, child);
+	await rootPi.emit("agent_settled", {}, root);
+	await control(tool, "set_limits", { observedTotalLoopLimit: 1 });
+
 	await childPi.emit("turn_end", {}, child);
+	const delivered = rootPi.messages.at(-1)?.message.details as {
+		warnings: string[];
+		status: { observedTotalLoops: number; activity: { active: boolean } };
+	};
+	assert.deepEqual(delivered.warnings, ["observedTotalLoopLimitReached"]);
+	assert.equal(delivered.status.observedTotalLoops, 1);
+	assert.equal(delivered.status.activity.active, true);
 	assert.deepEqual(rootPi.messages.at(-1)?.options, {
 		deliverAs: "nextTurn",
 		triggerTurn: false,
 	});
+	const reset = await control(tool, "status");
+	assert.equal(reset.details.observedTotalLoops, 0);
+	assert.deepEqual(reset.details.latchedWarnings, []);
+
+	await childPi.emit("turn_end", {}, child);
+	const nextCycle = await control(tool, "status");
+	assert.equal(nextCycle.details.observedChildLoops, 1);
+	assert.equal(
+		rootPi.messages.length,
+		1,
+		"retained child binding starts a new cycle",
+	);
 });
 
 test("control status reset limits restore and schema use a provider-compatible string enum", async () => {
@@ -544,6 +592,43 @@ test("control status reset limits restore and schema use a provider-compatible s
 	assert.match(afterReset.content[0].text, /main\/root loops: 1/);
 	assert.match(afterReset.content[0].text, /observed total loops: 1/);
 	assert.equal(JSON.stringify(tool.parameters).includes("prompt"), false);
+});
+
+test("model-facing limit controls reset before delivery and retain captured details", async () => {
+	const { extension } = fixture();
+	const pi = new FakePi();
+	const ctx = new FakeContext("root", true);
+	extension(pi.asAPI());
+	const tool = await rootReady(pi, ctx);
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("agent_start", {}, ctx);
+
+	await control(tool, "set_limits", { mainLoopLimit: 101 });
+	for (let loop = 0; loop < 100; loop += 1) await pi.emit("turn_end", {}, ctx);
+	const restored = await control(tool, "restore_defaults");
+	const restoreWarning = pi.messages.at(-1)?.message.details as {
+		status: { mainLoops: number; limits: { mainLoopLimit: number } };
+		warnings: string[];
+	};
+	assert.deepEqual(restoreWarning.warnings, ["mainLoopLimitReached"]);
+	assert.equal(restoreWarning.status.mainLoops, 100);
+	assert.equal(restoreWarning.status.limits.mainLoopLimit, 100);
+	assert.equal(restored.details.mainLoops, 0);
+	assert.equal(restored.details.limits.mainLoopLimit, 100);
+	assert.deepEqual(restored.details.latchedWarnings, []);
+
+	await pi.emit("turn_end", {}, ctx);
+	const lowered = await control(tool, "set_limits", { mainLoopLimit: 1 });
+	const setWarning = pi.messages.at(-1)?.message.details as {
+		status: { mainLoops: number; limits: { mainLoopLimit: number } };
+		warnings: string[];
+	};
+	assert.deepEqual(setWarning.warnings, ["mainLoopLimitReached"]);
+	assert.equal(setWarning.status.mainLoops, 1);
+	assert.equal(setWarning.status.limits.mainLoopLimit, 1);
+	assert.equal(lowered.details.mainLoops, 0);
+	assert.equal(lowered.details.limits.mainLoopLimit, 100);
+	assert.deepEqual(lowered.details.latchedWarnings, []);
 });
 
 test("watchdog_control schema bounds all limit integers at Number.MAX_SAFE_INTEGER", async () => {
@@ -637,21 +722,21 @@ test("live wall-clock boundary warns once and duplicate timer callbacks never du
 	assert.match(pi.messages[0].message.content ?? "", /^time/);
 	clock.fireStale(boundary.id);
 	assert.equal(pi.messages.length, 1, "duplicate threshold callback is inert");
+	const rearmed = clock.liveThreshold();
 	assert.equal(
-		clock.pending(),
-		1,
-		"only the status ticker remains after a latched boundary warning",
+		rearmed.delay,
+		30 * 60_000,
+		"warning restores configured defaults before rearming the next cycle",
 	);
 	assert.equal(
 		timerEntries(clock, "threshold").filter((entry) => entry.delay === 0)
 			.length,
 		0,
-		"a latched boundary never schedules a zero-delay rearm",
+		"a warning reset never schedules a zero-delay rearm",
 	);
-	const tickerOnly = clock.liveTicker();
-	clock.value = 120_000;
-	clock.fire(tickerOnly.id);
-	assert.equal(pi.messages.length, 1, "latched warning never repeats");
+	clock.value = 30 * 60_000 + 60_000;
+	clock.fire(rearmed.id);
+	assert.equal(pi.messages.length, 2, "fresh cycle warns at its next boundary");
 });
 
 test("early threshold delivery rearms the exact remaining delay without parallel timers", async () => {
@@ -691,24 +776,28 @@ test("early threshold delivery rearms the exact remaining delay without parallel
 		1,
 		"boundary warns exactly once after rearm",
 	);
+	const nextCycle = clock.liveThreshold();
 	assert.equal(
-		clock.pending(),
-		1,
-		"only the status ticker remains after the boundary warning",
+		nextCycle.delay,
+		30 * 60_000,
+		"boundary warning restores configured defaults for the fresh threshold",
 	);
 	assert.equal(
 		timerEntries(clock, "threshold").filter((entry) => entry.delay === 0)
 			.length,
 		0,
-		"latched boundary never schedules a zero-delay rearm",
+		"warning reset never schedules a zero-delay rearm",
 	);
-	const tickerOnly = clock.liveTicker();
-	clock.value = 120_000;
-	clock.fire(tickerOnly.id);
-	assert.equal(pi.messages.length, 1, "latched boundary warning never repeats");
+	clock.value = 30 * 60_000 + 60_000;
+	clock.fire(nextCycle.id);
+	assert.equal(
+		pi.messages.length,
+		2,
+		"fresh boundary warning follows the reset",
+	);
 });
 
-test("oversized threshold delays chunk to the exact boundary without a post-warning timer", async () => {
+test("oversized threshold delays chunk to the exact boundary then rearms a fresh cycle", async () => {
 	const { extension, clock } = fixture();
 	const pi = new FakePi();
 	const ctx = new FakeContext("root", true);
@@ -758,21 +847,21 @@ test("oversized threshold delays chunk to the exact boundary without a post-warn
 	clock.fire(final.id);
 	assert.equal(pi.messages.length, 1, "boundary warns exactly once");
 	assert.match(pi.messages[0].message.content ?? "", /^time/);
+	const nextCycle = clock.liveThreshold();
 	assert.equal(
-		clock.pending(),
-		1,
-		"only the status ticker remains after the boundary warning",
+		nextCycle.delay,
+		30 * 60_000,
+		"warning restores configured defaults for the fresh cycle",
 	);
 	assert.equal(
 		timerEntries(clock, "threshold").filter((entry) => entry.delay === 0)
 			.length,
 		0,
-		"latched boundary never schedules a zero-delay rearm",
+		"warning reset never schedules a zero-delay rearm",
 	);
-	const tickerOnly = clock.liveTicker();
 	clock.value = 2 * limitMs;
-	clock.fire(tickerOnly.id);
-	assert.equal(pi.messages.length, 1, "latched warning never repeats");
+	clock.fireStale(final.id);
+	assert.equal(pi.messages.length, 1, "stale old-cycle callback remains inert");
 });
 
 test("RPC status ticker refreshes at 30s exactly once per interval and never duplicates", async () => {
@@ -823,9 +912,9 @@ test("reset, new task, and raising or restoring limits rearm the threshold from 
 	);
 	assert.equal(pi.messages.length, 1, "first boundary warns once");
 	assert.equal(
-		clock.pending(),
-		1,
-		"only the status ticker remains after the latched warning",
+		clock.liveThreshold().delay,
+		30 * 60_000,
+		"warning restores configured defaults for the fresh wall-clock threshold",
 	);
 
 	clock.value = 70_000;
@@ -833,47 +922,53 @@ test("reset, new task, and raising or restoring limits rearm the threshold from 
 	const afterReset = clock.liveThreshold();
 	assert.equal(
 		afterReset.delay,
-		60_000,
-		"manual reset schedules the threshold from the reset cycle",
+		30 * 60_000,
+		"manual reset retains the warning-restored configured wall-clock limit",
 	);
-	clock.value = 130_000;
+	clock.value = 30 * 60_000 + 70_000;
 	clock.fire(afterReset.id);
 	assert.equal(
 		pi.messages.length,
 		2,
 		"reset cycle warns again at its boundary",
 	);
-	assert.equal(clock.pending(), 1, "ticker only after the reset-cycle warning");
+	assert.equal(
+		clock.liveThreshold().delay,
+		30 * 60_000,
+		"warning restores configured defaults for the next wall-clock cycle",
+	);
 
-	// Raising the limit above the elapsed time rearms the remaining delay.
-	// activeSince is still 70_000, so at 130_000 the elapsed time is 60_000.
+	// Raising the limit starts from the warning-reset cycle at 1,870,000ms.
 	await control(tool, "set_limits", { wallClockMinutes: 3 });
 	const raised = clock.liveThreshold();
 	assert.equal(
 		raised.delay,
-		120_000,
-		"raising the limit above elapsed rearms the remaining delay",
+		3 * 60_000,
+		"raising the limit preserves the fresh cycle's zero elapsed time",
 	);
-	clock.value = 250_000;
+	clock.value = 2_050_000;
 	clock.fire(raised.id);
 	assert.equal(pi.messages.length, 3, "raised boundary warns once");
-	assert.equal(clock.pending(), 1);
+	assert.equal(
+		clock.liveThreshold().delay,
+		30 * 60_000,
+		"warning restores configured defaults after the raised-limit boundary",
+	);
 
-	// Restoring the configured 30-minute limit rearms the exact remainder.
-	// Elapsed at 250_000 is 250_000 - 70_000 = 180_000.
+	// Restoring defaults starts from the warning-reset cycle at 2,050,000ms.
 	await control(tool, "restore_defaults");
 	const restored = clock.liveThreshold();
 	assert.equal(
 		restored.delay,
-		30 * 60_000 - 180_000,
-		"restoring the configured limit rearms the exact remaining delay",
+		30 * 60_000,
+		"restoring defaults preserves the fresh cycle's zero elapsed time",
 	);
-	clock.value = 70_000 + 30 * 60_000;
+	clock.value = 2_050_000 + 30 * 60_000;
 	clock.fire(restored.id);
 	assert.equal(pi.messages.length, 4, "restored boundary warns once");
-	assert.equal(clock.pending(), 1);
+	assert.equal(clock.liveThreshold().delay, 30 * 60_000);
 
-	clock.value = 70_000 + 31 * 60_000;
+	clock.value = 2_050_000 + 31 * 60_000;
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
 	const newTask = clock.liveThreshold();
 	assert.equal(
@@ -881,10 +976,14 @@ test("reset, new task, and raising or restoring limits rearm the threshold from 
 		30 * 60_000,
 		"a new task schedules the full threshold from its own epoch",
 	);
-	clock.value = 70_000 + 61 * 60_000;
+	clock.value = 2_050_000 + 61 * 60_000;
 	clock.fire(newTask.id);
 	assert.equal(pi.messages.length, 5, "new task boundary warns once");
-	assert.equal(clock.pending(), 1, "ticker only after the new-task warning");
+	assert.equal(
+		clock.liveThreshold().delay,
+		30 * 60_000,
+		"new task warning also starts a fresh threshold",
+	);
 	assert.equal(
 		timerEntries(clock, "threshold").filter((entry) => entry.delay === 0)
 			.length,
@@ -1026,36 +1125,36 @@ test("RPC role-aware collision keeps a 30s threshold and status ticker independe
 		"threshold delivers exactly one wall warning",
 	);
 	assert.match(pi.messages[0].message.content ?? "", /^time/);
-	assert.equal(
+	assert.notEqual(
 		clock.live("rpc-status").id,
 		rpcStatus.id,
-		"threshold leaves status tick live",
+		"warning reset replaces the stale status-tick lifecycle",
 	);
-	assert.equal(clock.pending(), 1, "latched threshold does not rearm");
+	assert.equal(clock.pending(), 2, "warning re-arms its fresh threshold");
 	clock.fireStale(threshold.id);
 	assert.equal(pi.messages.length, 1, "stale threshold copy is inert");
 	assert.equal(
 		ctx.statuses.length,
 		statusesBeforeThreshold + 2,
-		"threshold warning and its schedule completion update status, never the status-tick callback",
-	);
-	clock.fire(rpcStatus.id);
-	assert.equal(
-		pi.messages.length,
-		1,
-		"status tick cannot repeat a latched warning",
-	);
-	assert.equal(clock.pending(), 1, "only the rearmed rpc status timer remains");
-	const nextStatus = clock.live("rpc-status");
-	assert.notEqual(
-		nextStatus.id,
-		rpcStatus.id,
-		"status tick alone rearms itself",
+		"threshold warning and its fresh timer schedule update status, never the status-tick callback",
 	);
 	clock.fireStale(rpcStatus.id);
 	assert.equal(
+		pi.messages.length,
+		1,
+		"stale status tick cannot repeat the already-delivered warning",
+	);
+	assert.equal(clock.pending(), 2, "fresh threshold and status tick remain");
+	const nextStatus = clock.live("rpc-status");
+	clock.fire(nextStatus.id);
+	assert.equal(
+		clock.pending(),
+		2,
+		"fresh status tick rearms exactly one timer",
+	);
+	assert.notEqual(
 		clock.live("rpc-status").id,
 		nextStatus.id,
-		"stale status copy is inert",
+		"fresh status tick alone rearms itself",
 	);
 });

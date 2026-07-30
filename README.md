@@ -10,18 +10,18 @@ It is deliberately not a subagent controller. The main/root agent is the only se
 - Built-in limits are **100 root loops**, **500 observable total loops**, and a **30-minute root active task cycle**.
 - The wall clock belongs to the root only. It never times, steers, warns, stops, or otherwise controls subagents.
 - A root user message begins a new watchdog task cycle. It clears task-cycle counters, warning latches, runtime limits, and temporary prompt overrides. Observer-session user messages only bind that observer to the current root task.
-- Threshold warnings are latched once per task cycle. They are delivered as Pi custom messages, not user messages, so they do not start a new task.
-- When the root is active, a warning is delivered as `steer` with `triggerTurn: false`: Pi waits for the current turn's tools to finish, then the ordinary continuation turn can reflect on the warning. The watchdog does not cancel or interrupt tools. When the root is idle, the warning is queued as `nextTurn` with `triggerTurn: false`; it does not wake the root.
+- When a model-facing threshold is crossed, the watchdog captures the triggering status, resets the whole watchdog cycle, and then delivers the reminder from that captured status. The reset clears task elapsed time, root and observed loop counts, warning latches, runtime limits, and temporary prompt overrides; it preserves the separate active window and current root/child participants.
+- When the root is running, a warning is delivered as `steer` with `triggerTurn: false`: Pi waits for the current turn's tools to finish, then the ordinary continuation turn reflects on the warning as loop 1 of the fresh cycle. The watchdog does not cancel or interrupt tools. When the root is not running, the warning is queued as `nextTurn` with `triggerTurn: false`; it does not wake the root.
 - The root is normally the UI-bound session. In headless/non-UI execution, the first watchdog-enabled session bound in the process is a best-effort fallback because Pi has no public root/session-kind field.
 
 ### Active window versus watchdog task cycle
 
 The TUI displays two different measurements:
 
-- **`active`** is root-only elapsed active time paired with root completed loops for the automatic activity window. It excludes idle time and every child loop.
-- **`task`**, **`root`**, and **`observed`** are the current watchdog cycle: task-cycle root-active time, root turn count, and root-plus-observable-child turn count. A manual reset clears these cycle counters and warning latches but leaves `active` unchanged.
+- **`active`** is elapsed supervised-work time paired with completed root loops for the automatic activity window. It excludes fully idle time and every child loop, but it continues while a watchdog-observable child bound to the current task is running after the root settles.
+- **`task`**, **`root`**, and **`observed`** are the current watchdog cycle: accumulated root-running time, root turn count, and root-plus-observable-child turn count. A manual reset clears these cycle counters and warning latches but leaves `active` unchanged.
 
-An automatic active-window reset happens only when the root settles/stops or an interjecting/new root user message replaces an already active window. It produces exactly one user-only TUI notification; manual `/watchdog reset`, AI `watchdog_control` reset, threshold warnings, and runtime limit changes do not:
+An automatic active-window reset happens only when the last current-task participant settles/stops, or when an interjecting/new root user message replaces an already active window. Root settle alone does not reset it while an observable child remains running. The transition produces exactly one user-only TUI notification; manual `/watchdog reset`, AI `watchdog_control` reset, threshold-cycle resets, and runtime limit changes do not:
 
 ```text
 Watchdog reset | active 2h14m/137 loops
@@ -37,7 +37,7 @@ In a TUI root session, pi-watchdog installs one restrained below-editor line (no
 Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500
 ```
 
-The line refreshes about once per second while the root is active, truncates to terminal width, and stops ticking when idle. Only the current TUI root receives the widget. RPC, print, JSON, and observer sessions do not render it.
+The line refreshes about once per second while the active window is open—including observable child-only work—truncates to terminal width, and stops ticking when all current-task participants are idle. Only the current TUI root receives the widget. RPC, print, JSON, and observer sessions do not render it.
 
 ## Install and try locally
 
@@ -186,13 +186,13 @@ The current root model receives `watchdog_control` with these actions:
 - `set_limits` (supply at least one of `mainLoopLimit`, `observedTotalLoopLimit`, `wallClockMinutes`, each a positive safe integer)
 - `restore_defaults`
 
-All changes are runtime-only for the current task/process and never persist to either JSON configuration file. `reset` clears the task cycle without stopping agents. A threshold warning only latches; it does not reset anything. `set_limits` and `restore_defaults` preserve counters and elapsed time. They selectively rearm a latched threshold only when its current measurement is below the replacement limit, then immediately evaluate the replacement limit (so lowering an already-crossed limit can warn). Invalid, fractional, non-positive, or unsafe `set_limits` values are rejected before any limit mutates. The tool intentionally has no prompt-edit action: only the user command can temporarily override reminder text.
+All changes are runtime-only for the current task/process and never persist to either JSON configuration file. `reset` clears the task cycle without stopping agents and retains current runtime limits and temporary prompt overrides. `set_limits` and `restore_defaults` preserve counters and elapsed time when no threshold is crossed, selectively rearm thresholds whose current measurement is below the replacement limit, and immediately evaluate the replacement limit. If that model-facing evaluation crosses one or more thresholds, the watchdog captures the triggering status, restores configured limits and prompts while resetting all cycle measurements, and only then delivers one combined reminder from the captured status. Invalid, fractional, non-positive, or unsafe `set_limits` values are rejected before any limit mutates. The tool intentionally has no prompt-edit action: only the user command can temporarily override reminder text. The corresponding `/watchdog limits` commands remain UI-only: they can notify the user about crossed values but never send a model message or reset the cycle merely because the user changed a limit.
 
 ## Lifecycle and coverage limits
 
 The watchdog has no dependency on a subagent plugin. It observes only child sessions that also load pi-watchdog in the same process and that bind to the current root task. Initial observers do not register `/watchdog`. Observer cleanup is best effort because some embedders can dispose child sessions without a `session_shutdown` event; attachment tokens, root generations, and task epochs prevent stale observer turns from contaminating a later task.
 
-On root settle, the root timer and active TUI/RPC refresh stop. On root shutdown, the root attachment, timers, statuses, and widget are cleaned up. Pi has no public command-unregistration API: when a root is demoted, its prior `/watchdog` definition can remain discoverable, but its handler is inert unless its original root generation and context are still current. Reload/new/resume/fork attachments begin fresh task state rather than sharing a previous root's task.
+On root settle, the root-only threshold timer stops; the active TUI/RPC refresh continues while a bound observable child still runs and stops when the final participant settles. On root shutdown, the root attachment, timers, statuses, and widget are cleaned up. Pi has no public command-unregistration API: when a root is demoted, its prior `/watchdog` definition can remain discoverable, but its handler is inert unless its original root generation and context are still current. Reload/new/resume/fork attachments begin fresh task state rather than sharing a previous root's task.
 
 ## Development and package contents
 
@@ -230,5 +230,5 @@ Pi packages and extensions execute with your user permissions. Review the packag
 - **`/watchdog` is missing:** it is registered only after a watchdog-enabled session wins the current root claim. Check that the package was built/loaded, restart or reload the appropriate Pi extension location, and use the root rather than an observer/stale session.
 - **Project settings appear ignored:** verify the file is `.pi/pi-watchdog.json` below Pi's current working directory and that Pi trusts the project. The global file may live somewhere other than `~/.pi/agent` when `PI_CODING_AGENT_DIR` changes Pi's agent directory.
 - **No status line:** the widget is TUI-root-only. RPC, print, JSON, headless, and observer sessions have no below-editor widget. The root's compact status is available through RPC status updates and through `/watchdog status` in a UI-capable root.
-- **A threshold did not reset `active`:** that is intentional. A threshold only latches. Explicit `/watchdog reset`, `watchdog_control reset`, or a new root task reset the watchdog cycle; changing/restoring limits selectively rearms only thresholds whose measurements fall below their replacements. Limits preserve counters and elapsed time; none of these operations resets the automatic active window.
+- **A threshold reset `task`/`root`/`observed` but not `active`:** that is intentional. A model-facing threshold reminder captures the triggering status, resets the watchdog cycle before delivery, and preserves the independent automatic active window. Manual resets also preserve `active`; user slash limit changes remain UI-only and do not reset the cycle merely because a limit changed.
 - **Observed total is lower than expected:** it is not a global process tree audit. Only same-process, watchdog-enabled, currently bound child sessions contribute.
