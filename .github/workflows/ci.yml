@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-watchdog-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          tmux -V
+      - run: npm ci
+      - name: Assert stock Pi version
+        run: test "$(./node_modules/.bin/pi --version)" = "0.82.1"
+      - run: npm run check
+      - name: Stock Pi dual-distribution E2E
+        run: npm run test:e2e
+
+  promote-release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'xz-dev/pi-watchdog'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Generate and validate release tree locally
+        run: |
+          release_tree="$(mktemp -d)"
+          node scripts/build-release.mjs --output "$release_tree"
+          test ! -e "$release_tree/.github"
+          test ! -e "$release_tree/src"
+          test ! -e "$release_tree/test"
+          rm -rf "$release_tree"
+      - name: Validate release through stock Pi Git install
+        run: node scripts/e2e/validate-release-install.mjs
+      - name: Promote release with remote OID race guard
+        run: node scripts/release-promotion.mjs

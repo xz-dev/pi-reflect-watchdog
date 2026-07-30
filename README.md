@@ -41,20 +41,32 @@ The line refreshes about once per second while the root is active, truncates to 
 
 ## Install and try locally
 
-This repository names the package `pi-watchdog`, but it is **not published to npm**. Build before either local `pi install` command: local paths are referenced by Pi, not copied, and `pi install` does not build the package for you.
+This repository is distributed through **Git branches only**. It is not published to npm, does not use tags or GitHub Releases, and has no stable-version channel.
+
+- **`master`** is the source manifest: it declares `src/extension.ts`, so Pi installs it directly without a build step.
+- **`release`** is a minimal generated manifest: it declares prebuilt `dist/extension.js` for users who prefer not to run TypeScript at install time.
+
+After public publication, install either branch directly with stock Pi:
 
 ```bash
-npm ci
-npm run build
+# Source manifest; no package build is needed for this Git install.
+pi install git:github.com/xz-dev/pi-watchdog@master
 
-# Global package setting: Pi references this local directory.
+# Minimal prebuilt distribution branch.
+pi install git:github.com/xz-dev/pi-watchdog@release
+```
+
+Before the public repository exists, use an equivalent local checkout. A package-directory install on the current `master` reads the source manifest and likewise needs no build:
+
+```bash
+# Global package setting.
 pi install /absolute/path/to/pi-watchdog
 
 # Or write the package setting for the current trusted project.
 pi install -l /absolute/path/to/pi-watchdog
 ```
 
-For a one-run temporary extension load, without writing Pi settings, build first and pass the built extension file to Pi's documented `-e`/`--extension` flag:
+For a one-run temporary extension load, `-e` names a built file rather than reading the package manifest. Build first, then point Pi at `dist`:
 
 ```bash
 npm ci
@@ -64,26 +76,18 @@ pi -e /absolute/path/to/pi-watchdog/dist/extension.js
 pi --extension /absolute/path/to/pi-watchdog/dist/extension.js
 ```
 
-A local directory installed with `pi install` is interpreted as a package using its manifest. This package declares `dist/extension.js` under `package.json` → `pi.extensions`; use that package-directory form to verify package-manifest behavior, and the built-file `-e` form for a temporary extension-only check.
-
-After the planned public GitHub publication, install directly from its source repository:
-
-```bash
-pi install git:github.com/xz-dev/pi-watchdog
-```
-
-This is Git installation guidance, not an npm publication claim. Until the repository is created and made public, use the local path above.
+The npm-packed artifact is only a CI distribution check. Its staging script rewrites the manifest to `dist/extension.js`; it does not publish the tarball or use it as the normal install path.
 
 ### Build requirements and reloads
 
-Use Node.js **22 or newer**. The locked development setup and build are:
+Use Node.js **22.14.0 or newer**. Build only when you need generated `dist/` output (for `-e dist/extension.js`, the packed-artifact check, or release-tree generation):
 
 ```bash
 npm ci
 npm run build
 ```
 
-Pi loads the package's built `dist/extension.js`; edit/build it again before testing a source change. After rebuilding, use `/reload` or restart Pi to reload the configured local package. `/reload` does not build the package, so run `npm run build` first.
+After rebuilding a configured `dist` extension, use `/reload` or restart Pi. `/reload` does not build the package.
 
 ## Configuration
 
@@ -193,14 +197,25 @@ On root settle, the root timer and active TUI/RPC refresh stop. On root shutdown
 ## Development and package contents
 
 ```bash
-npm run lint       # Biome check for src/ and test/
-npm run typecheck  # no-emit TypeScript check
-npm test           # Node test runner through tsx
-npm run build      # emits dist/
-npm run check      # lint + typecheck + test + build
+npm run lint            # Biome checks src/, test/, scripts/, and MJS E2E files
+npm run typecheck       # no-emit TypeScript check
+npm test                # focused TypeScript behavior tests through tsx
+npm run build           # emits dist/
+npm run check           # lint + typecheck + focused tests + build
+npm run test:e2e:fast   # packed artifact plus bounded stock-Pi fast E2E
+npm run test:e2e        # full stock-Pi E2E, including the real one-minute warning
 ```
 
-Source lives in `src/`; focused behavior tests live in `test/`; TypeScript declarations and JavaScript are emitted to `dist/`. The npm `files` allowlist is `dist`; npm automatically includes `package.json`, this README, and [`LICENSE`](LICENSE) with a package tarball. Use `npm pack --dry-run --json` to inspect the exact publish set: it must contain only `README.md`, `LICENSE`, `package.json`, and `dist/` files.
+Source lives in `src/`; focused behavior tests live in `test/*.test.ts`; E2E tests and their harness live in `test/e2e/` and `scripts/e2e/`. TypeScript declarations and JavaScript are emitted to `dist/`.
+
+The packed-artifact check deliberately creates an external temporary staging tree, rewrites **only its staged manifest** to `dist/extension.js`, and verifies the exact tarball contents. It does not publish to npm. To create a release branch candidate manually, first build, then provide an explicit **absolute directory outside this repository**:
+
+```bash
+npm run build
+node scripts/build-release.mjs --output "$(mktemp -d)"
+```
+
+The generator rejects omitted, relative, repository-contained, repository-ancestor, symlinked, and unowned non-empty output paths. It prints the generated directory; remove that directory when it is no longer needed.
 
 ## License
 

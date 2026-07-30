@@ -13,13 +13,23 @@
     "url": "https://github.com/xz-dev/pi-watchdog/issues"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.14.0"
   },
-  "keywords": ["pi-package", "pi-extension", "pi", "watchdog", "agent"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "watchdog",
+    "agent"
+  ],
   "pi": {
-    "extensions": ["./dist/extension.js"]
+    "extensions": [
+      "./src/extension.ts"
+    ]
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -31,19 +41,24 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.check.json",
-    "lint": "biome check src test",
-    "format": "biome format --write src test",
-    "test": "tsx --test test/**/*.test.ts",
-    "check": "npm run lint && npm run typecheck && npm test && npm run build"
+    "lint": "biome check src test scripts",
+    "format": "biome format --write src test scripts",
+    "test": "npm run test:unit",
+    "test:unit": "tsx --test test/*.test.ts",
+    "test:e2e:fast": "node scripts/e2e/run-tests.mjs fast",
+    "test:e2e": "node scripts/e2e/run-tests.mjs all",
+    "check": "npm run lint && npm run typecheck && npm run test:unit && npm run build"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.8",
+    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@earendil-works/pi-tui": "0.82.1",
     "@types/node": "^24.10.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"

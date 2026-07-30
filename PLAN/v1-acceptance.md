@@ -1,6 +1,6 @@
 # pi-watchdog v1 Acceptance Contract
 
-Status: implementation slices 1–4 merged at `938c4f5`; slice 5 is a candidate pending final approval and public GitHub publication. Its final verification must include checks, tarball install/import, Pi RPC command discovery, trusted/untrusted config smoke, license/package metadata, and reviewer TUI proof.
+Status: clean recovered baseline commit 1 is `7eed6ed0e2eea12f4cc0143337b97944e673d097`; the stock-Pi E2E/documentation candidate is pending as the planned second commit. Nothing is accepted, merged, or published after the recovered baseline. Final verification must include checks, tarball install/import, Pi RPC command discovery, trusted/untrusted config smoke, license/package metadata, reviewer TUI proof, bounded process-tree cleanup, and the real one-minute wall-clock warning.
 Language: English
 Product authority: repository owner
 
@@ -190,6 +190,6 @@ Only the current root in `tui` mode renders the widget; RPC, print, and json mod
 2. **Runtime watchdog:** process-local root/observer hub, lifecycle events, main-only timers, warnings, and model tool.
 3. **Dedicated TUI activity status:** the below-editor status line, activity-window reset notification, mode-specific refresh lifecycle, and compact root status fallback for non-TUI root UI modes. **Merged.**
 4. **User controls:** `/watchdog` user controls and current-task prompt editing. **Merged.**
-5. **Documentation and package verification:** English README, BSD 3-Clause `LICENSE` and package metadata, install/config reference, full checks, and package smoke test. **Candidate pending final approval/publication:** final evidence must cover `npm run check`; package dry-run and actual tarball; isolated tarball install/ESM import; Pi RPC command discovery; pseudo-TTY idle widget/reviewer proof; and trusted/untrusted config-path smoke.
+5. **Stock-Pi E2E, documentation, and package verification:** English README, BSD 3-Clause `LICENSE` and package metadata, source/release branch install reference, bounded external release-tree generation, full checks, process-tree cleanup proof, and package smoke test. **Candidate pending final approval/publication:** final evidence must cover `npm run check`; packed artifact inspection and isolated install/ESM import; source and release Git install through stock Pi; Pi RPC command discovery; pseudo-TTY idle widget/reviewer proof; trusted/untrusted config-path smoke; no leaked Pi/test descendants; and the real one-minute wall-clock warning.
 
-Slices 1–4 are merged at `938c4f5`. Slice 5 is not accepted, merged, committed, or published. Current smoke evidence is retained at `/tmp/pi-watchdog-final-smoke.txt` and must be superseded with the final factual run.
+The recovered baseline is commit 1 (`7eed6ed0e2eea12f4cc0143337b97944e673d097`). Slice 5 is the pending commit-2 candidate and is not accepted, committed, merged, or published. Supersede any prior temporary smoke output with the final factual run before requesting acceptance.
