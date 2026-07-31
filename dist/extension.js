@@ -1,5 +1,4 @@
 import { StringEnum, Type } from "@earendil-works/pi-ai";
-import { RootActivityTracker } from "./activity.js";
 import { loadRuntimeConfig } from "./config-loader.js";
 import { controllerOptionsFromConfig, TaskController, } from "./controller.js";
 import { parseWatchdogCommand, WATCHDOG_USAGE, } from "./controls.js";
@@ -42,7 +41,6 @@ function rootIsCurrent(runtime) {
     return (runtime.state === "root" &&
         runtime.root !== undefined &&
         runtime.controller !== undefined &&
-        runtime.activity !== undefined &&
         runtime.ctx !== undefined &&
         isCurrentRoot(getHub(), runtime.token, runtime.root.generation));
 }
@@ -75,9 +73,8 @@ function deactivate(runtime, services) {
     removeControlTool(runtime);
     runtime.observerBinding = undefined;
     runtime.root = undefined;
+    runtime.controller?.finalize();
     runtime.controller = undefined;
-    runtime.activity?.finalize();
-    runtime.activity = undefined;
     runtime.ctx = undefined;
     runtime.sessionManager = undefined;
     if (runtime.state !== "shutdown")
@@ -89,7 +86,7 @@ function statusLine(status) {
 function widgetState(runtime, now) {
     const status = runtime.controller.status(now);
     return {
-        activity: runtime.activity.status(now),
+        activity: status.activity,
         taskElapsedMs: status.wallClockElapsedMs,
         wallClockMinutes: status.limits.wallClockMinutes,
         rootLoops: status.mainLoops,
@@ -170,7 +167,7 @@ function scheduleTimers(runtime, services) {
         if (remaining <= 0) {
             // Already at or beyond the boundary (a rearmed limit can land there):
             // evaluate exactly once instead of scheduling a zero-delay timer.
-            deliverWarnings(runtime, runtime.controller.evaluateWallClock(services.now()).warnings, services);
+            deliverWarnings(runtime, runtime.controller.evaluateWallClock(services.now()), services);
             return;
         }
         const fired = { consumed: false };
@@ -178,12 +175,11 @@ function scheduleTimers(runtime, services) {
             if (stale(fired))
                 return;
             runtime.timer = undefined;
-            deliverWarnings(runtime, runtime.controller.evaluateWallClock(services.now()).warnings, services);
-            // A host clock may deliver before its deadline, and a capped chunk
-            // fires before the boundary. Recompute rather than letting an early
-            // callback permanently lose the threshold warning; at or beyond the
-            // boundary no timer is rearmed, so only the status ticker remains.
-            scheduleWallClock();
+            const delivered = deliverWarnings(runtime, runtime.controller.evaluateWallClock(services.now()), services);
+            // A warning reset creates a fresh timer lifecycle. Only an early or
+            // capped callback without a warning may rearm this lifecycle in place.
+            if (!delivered)
+                scheduleWallClock();
             updateStatus(runtime, services);
         }, Math.min(remaining, MAX_TIMER_DELAY_MS));
         runtime.timer.unref?.();
@@ -201,9 +197,10 @@ function scheduleTimers(runtime, services) {
         runtime.ticker.unref?.();
     };
     // Refresh roles are deliberately mode-specific. The widget needs a
-    // second-level redraw; RPC keeps its established bounded footer refresh;
-    // print/json/headless have no changing UI surface to refresh.
-    if (!runtime.controller.status(services.now()).rootActive)
+    // second-level redraw while any current-epoch participant runs; RPC keeps
+    // its established bounded footer refresh; print/json/headless have no
+    // changing UI surface to refresh.
+    if (!runtime.controller.status(services.now()).activity.active)
         return;
     if (runtime.ctx.mode === "tui")
         scheduleRefreshTick("tui-refresh", WIDGET_TICK_MS, () => {
@@ -225,21 +222,27 @@ function templateVariables(status) {
         coverage: status.coverage,
     };
 }
-function deliverWarnings(runtime, warnings, services) {
-    if (warnings.length === 0 || !rootIsCurrent(runtime))
-        return;
-    const status = runtime.controller.status(services.now());
-    const content = warnings
+function deliverWarnings(runtime, transition, services) {
+    if (transition.warnings.length === 0 || !rootIsCurrent(runtime))
+        return false;
+    const status = transition.triggerStatus;
+    if (status === undefined)
+        throw new Error("warning transition must include its pre-reset status");
+    const content = transition.warnings
         .map((kind) => renderTemplate(status.prompts[kind], templateVariables(status)))
         .join("\n\n");
-    runtime.ctx.ui.notify(`Watchdog warning: ${warnings.join(", ")}`, "warning");
+    runtime.ctx.ui.notify(`Watchdog warning: ${transition.warnings.join(", ")}`, "warning");
     runtime.pi.sendMessage({
         customType: WARNING_TYPE,
         content,
         display: true,
-        details: { warnings, status },
+        details: { warnings: transition.warnings, status },
     }, { deliverAs: status.rootActive ? "steer" : "nextTurn", triggerTurn: false });
+    // Recreate timers only from the reset state, so old callbacks are stale and
+    // a running root receives a full fresh wall-clock interval before another warning.
+    scheduleTimers(runtime, services);
     updateStatus(runtime, services);
+    return true;
 }
 export function createWatchdogExtension(overrides = {}) {
     const services = { ...defaultServices, ...overrides };
@@ -280,7 +283,6 @@ export function createWatchdogExtension(overrides = {}) {
                 return;
             runtime.ctx = ctx;
             runtime.controller = new TaskController(controllerOptionsFromConfig(loaded.config));
-            runtime.activity = new RootActivityTracker();
             runtime.state = "root";
             for (const diagnostic of loaded.diagnostics.slice(0, 3))
                 ctx.ui.notify(`pi-watchdog ${diagnostic.source}: ${diagnostic.message}`, "warning");
@@ -297,8 +299,7 @@ export function createWatchdogExtension(overrides = {}) {
             if (rootIsCurrent(runtime)) {
                 // An interjecting/new root user message replaces a begun activity
                 // window; the finished window is announced exactly once.
-                const snapshot = runtime.activity.startRootTask(services.now());
-                runtime.controller.startRootTask(services.now(), runtime.controller.status(services.now()).rootActive);
+                const snapshot = runtime.controller.startRootTask(services.now(), runtime.controller.status(services.now()).rootActive);
                 emitResetNotification(runtime, snapshot);
                 scheduleTimers(runtime, services);
                 updateStatus(runtime, services);
@@ -317,28 +318,10 @@ export function createWatchdogExtension(overrides = {}) {
             };
         });
         pi.on("agent_start", () => {
-            if (!rootIsCurrent(runtime))
-                return;
-            // Pi emits this before the initial root user message; record activity independently.
-            runtime.controller.startRootActiveSegment(services.now());
-            runtime.activity.beginRun(services.now());
-            scheduleTimers(runtime, services);
-            updateStatus(runtime, services);
-        });
-        pi.on("agent_settled", () => {
-            if (!rootIsCurrent(runtime))
-                return;
-            runtime.controller.settleRootActiveSegment(services.now());
-            emitResetNotification(runtime, runtime.activity.settle(services.now()));
-            clearTimers(runtime, services);
-            updateStatus(runtime, services);
-        });
-        pi.on("turn_end", () => {
             if (rootIsCurrent(runtime)) {
-                // One root turn counts exactly once in both the current cycle and
-                // the paired activity window; observer turns never reach this.
-                runtime.activity.completeRootTurn();
-                deliverWarnings(runtime, runtime.controller.completeRootTurn(services.now()).warnings, services);
+                // Pi emits this before the initial root user message; it arms no task alone.
+                runtime.controller.startRootActiveSegment(services.now());
+                scheduleTimers(runtime, services);
                 updateStatus(runtime, services);
                 return;
             }
@@ -350,7 +333,47 @@ export function createWatchdogExtension(overrides = {}) {
                 binding.observerAttachmentToken !== runtime.token ||
                 binding.rootGeneration !== root.root.generation)
                 return;
-            deliverWarnings(root, root.controller.completeObserverTurn(runtime.token, binding.taskEpoch, services.now()).warnings, services);
+            root.controller.startObserverRun(runtime.token, services.now());
+            scheduleTimers(root, services);
+            updateStatus(root, services);
+        });
+        pi.on("agent_settled", () => {
+            if (rootIsCurrent(runtime)) {
+                const snapshot = runtime.controller.settleRootActiveSegment(services.now());
+                emitResetNotification(runtime, snapshot);
+                scheduleTimers(runtime, services);
+                updateStatus(runtime, services);
+                return;
+            }
+            const root = getHub().root?.value;
+            const binding = runtime.observerBinding;
+            if (!root ||
+                !rootIsCurrent(root) ||
+                !binding ||
+                binding.observerAttachmentToken !== runtime.token ||
+                binding.rootGeneration !== root.root.generation)
+                return;
+            const snapshot = root.controller.settleObserverRun(runtime.token, binding.taskEpoch, services.now());
+            emitResetNotification(root, snapshot);
+            scheduleTimers(root, services);
+            updateStatus(root, services);
+        });
+        pi.on("turn_end", () => {
+            if (rootIsCurrent(runtime)) {
+                // Root turns count once in the root and observed aggregate cycles.
+                deliverWarnings(runtime, runtime.controller.completeRootTurn(services.now()), services);
+                updateStatus(runtime, services);
+                return;
+            }
+            const root = getHub().root?.value;
+            const binding = runtime.observerBinding;
+            if (!root ||
+                !rootIsCurrent(root) ||
+                !binding ||
+                binding.observerAttachmentToken !== runtime.token ||
+                binding.rootGeneration !== root.root.generation)
+                return;
+            deliverWarnings(root, root.controller.completeObserverTurn(runtime.token, binding.taskEpoch, services.now()), services);
         });
         pi.on("session_shutdown", () => {
             if (runtime.state === "shutdown")
@@ -370,8 +393,12 @@ export function createWatchdogExtension(overrides = {}) {
                 if (root &&
                     rootIsCurrent(root) &&
                     binding &&
-                    binding.rootGeneration === root.root.generation)
-                    root.controller.unbindObserver(runtime.token, binding.taskEpoch);
+                    binding.rootGeneration === root.root.generation) {
+                    const snapshot = root.controller.unbindObserver(runtime.token, services.now(), binding.taskEpoch);
+                    emitResetNotification(root, snapshot);
+                    scheduleTimers(root, services);
+                    updateStatus(root, services);
+                }
                 clearTimers(runtime, services);
                 clearWidget(runtime);
                 runtime.observerBinding = undefined;
@@ -396,8 +423,7 @@ function commandIsCurrent(runtime, ctx) {
 }
 function userStatusText(runtime, services) {
     const status = runtime.controller?.status(services.now());
-    const activity = runtime.activity?.status(services.now());
-    if (!status || !activity)
+    if (!status)
         return "Watchdog is not active for this session.";
     return [
         "Watchdog status",
@@ -410,7 +436,7 @@ function userStatusText(runtime, services) {
         `configured defaults: main=${status.configuredLimits.mainLoopLimit}; observed-total=${status.configuredLimits.observedTotalLoopLimit}; wall-clock=${status.configuredLimits.wallClockMinutes}m`,
         `latched warnings: ${status.latchedWarnings.join(", ") || "none"}`,
         `coverage: ${status.coverage}`,
-        `active window: ${formatDuration(activity.elapsedMs)}/${activity.loops} root loops`,
+        `active window: ${formatDuration(status.activity.elapsedMs)}/${status.activity.loops} root loops`,
     ].join("\n");
 }
 function promptText(runtime, services) {
@@ -464,17 +490,17 @@ function registerWatchdogCommand(pi, runtime, services) {
                     notifyCommand(ctx, userStatusText(runtime, services));
                     return;
                 case "limits-set": {
-                    const warnings = runtime.controller.setLimits(parsed.command, current).warnings;
+                    const transition = runtime.controller.setLimits(parsed.command, current);
                     scheduleTimers(runtime, services);
-                    notifyCommandWarnings(ctx, warnings);
+                    notifyCommandWarnings(ctx, transition.warnings);
                     updateStatus(runtime, services);
                     notifyCommand(ctx, "Watchdog current-task limits updated.");
                     return;
                 }
                 case "limits-reset": {
-                    const warnings = runtime.controller.restoreConfiguredDefaults(current).warnings;
+                    const transition = runtime.controller.restoreConfiguredDefaults(current);
                     scheduleTimers(runtime, services);
-                    notifyCommandWarnings(ctx, warnings);
+                    notifyCommandWarnings(ctx, transition.warnings);
                     updateStatus(runtime, services);
                     notifyCommand(ctx, "Watchdog configured limits restored for this task.");
                     return;
@@ -537,7 +563,7 @@ function registerControlTool(pi, runtime, services) {
             if (!rootIsCurrent(runtime))
                 throw new Error("watchdog_control is available only to the current root session");
             const current = services.now();
-            let warnings = [];
+            let transition = { warnings: [] };
             if (params.action === "reset")
                 runtime.controller.resetRuntime(current);
             else if (params.action === "set_limits") {
@@ -551,13 +577,12 @@ function registerControlTool(pi, runtime, services) {
                     throw new Error("set_limits requires at least one positive safe integer");
                 if (!values.every(positiveSafeInteger))
                     throw new Error("set_limits accepts only positive safe integer limits");
-                warnings = runtime.controller.setLimits(limits, current).warnings;
+                transition = runtime.controller.setLimits(limits, current, true);
             }
             else if (params.action === "restore_defaults")
-                warnings =
-                    runtime.controller.restoreConfiguredDefaults(current).warnings;
-            scheduleTimers(runtime, services);
-            deliverWarnings(runtime, warnings, services);
+                transition = runtime.controller.restoreConfiguredDefaults(current, true);
+            if (!deliverWarnings(runtime, transition, services))
+                scheduleTimers(runtime, services);
             updateStatus(runtime, services);
             const status = runtime.controller.status(current);
             return {
