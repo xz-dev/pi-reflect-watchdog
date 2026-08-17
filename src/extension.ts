@@ -54,6 +54,10 @@ import {
 	showReflectionTimeline,
 } from "./reflection-timeline.js";
 import {
+	isProcessDomainObservation,
+	PROCESS_DOMAIN_OBSERVATION_DETAILS,
+} from "./run-activity.js";
+import {
 	createWatchdogWidget,
 	formatDuration,
 	WIDGET_KEY,
@@ -135,6 +139,8 @@ interface ActiveReflection extends PendingReflection {
 	submitted: boolean;
 }
 
+type RunActivity = "pending" | "work" | "observation";
+
 interface Runtime {
 	pi: ExtensionAPI;
 	token: string;
@@ -161,6 +167,7 @@ interface Runtime {
 	domainCounters?: ReflectDomainCounters;
 	domainCounterUnsubscribe?: () => void;
 	domainAttached: boolean;
+	runActivity: RunActivity;
 	suppressNextRootTurn: boolean;
 }
 
@@ -232,6 +239,7 @@ function deactivate(runtime: Runtime, services: RuntimeServices): void {
 		void services.processDomain.detach(runtime).catch(() => {});
 	}
 	runtime.domainCounters = undefined;
+	runtime.runActivity = "pending";
 	clearWidget(runtime);
 	if (runtime.ctx) runtime.ctx.ui.setStatus(STATUS_KEY, undefined);
 	removeControlTool(runtime);
@@ -532,7 +540,11 @@ function sendActiveReflection(runtime: Runtime): void {
 			customType: REFLECTION_MESSAGE_TYPE,
 			content,
 			display: false,
-			details: { reflectionId: active.id, attempt: active.reasks + 1 },
+			details: {
+				reflectionId: active.id,
+				attempt: active.reasks + 1,
+				...PROCESS_DOMAIN_OBSERVATION_DETAILS,
+			},
 		},
 		{ deliverAs: "steer", triggerTurn: true },
 	);
@@ -689,8 +701,57 @@ export function createWatchdogExtension(
 			reflectionQueue: [],
 			pausedForReflection: false,
 			resumeAfterReflectionTurn: false,
+			runActivity: "pending",
 			suppressNextRootTurn: false,
 			domainAttached: false,
+		};
+
+		const classifyWork = (): void => {
+			if (runtime.runActivity === "work") return;
+			runtime.runActivity = "work";
+			if (runtime.domainAttached)
+				void services.processDomain.setBusy(runtime, true).catch(() => {});
+			if (rootIsCurrent(runtime)) {
+				runtime.controller.startRootActiveSegment(services.now());
+				scheduleTimers(runtime, services);
+				updateStatus(runtime, services);
+				return;
+			}
+			const root = getHub<Runtime>().root?.value;
+			const binding = runtime.observerBinding;
+			if (
+				!root ||
+				!rootIsCurrent(root) ||
+				!binding ||
+				binding.observerAttachmentToken !== runtime.token ||
+				binding.rootGeneration !== root.root.generation
+			)
+				return;
+			root.controller.startObserverRun(runtime.token, services.now());
+			scheduleTimers(root, services);
+			updateStatus(root, services);
+		};
+
+		const classifyMessage = (message: {
+			readonly role?: unknown;
+			readonly details?: unknown;
+		}): void => {
+			// Real user input upgrades an observation run to work. This covers user
+			// takeover and steering without trusting the original extension marker.
+			if (message.role === "user") {
+				classifyWork();
+				return;
+			}
+			if (runtime.runActivity !== "pending") return;
+			if (
+				message.role === "custom" &&
+				isProcessDomainObservation(message.details)
+			) {
+				runtime.runActivity = "observation";
+				return;
+			}
+			// Unknown custom metadata and no-input/error assistant runs are work.
+			classifyWork();
 		};
 
 		pi.on("session_start", async (_event, ctx) => {
@@ -783,6 +844,7 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("message_start", (event) => {
+			classifyMessage(event.message);
 			if (event.message.role === "custom") {
 				const active = runtime.activeReflection;
 				const message = event.message as typeof event.message & {
@@ -822,30 +884,12 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("agent_start", () => {
-			if (runtime.domainAttached)
-				void services.processDomain.setBusy(runtime, true).catch(() => {});
-			if (rootIsCurrent(runtime)) {
-				// Pi emits this before the initial root user message; it arms no task alone.
-				runtime.controller.startRootActiveSegment(services.now());
-				scheduleTimers(runtime, services);
-				updateStatus(runtime, services);
-				return;
-			}
-			const root = getHub<Runtime>().root?.value;
-			const binding = runtime.observerBinding;
-			if (
-				!root ||
-				!rootIsCurrent(root) ||
-				!binding ||
-				binding.observerAttachmentToken !== runtime.token ||
-				binding.rootGeneration !== root.root.generation
-			)
-				return;
-			root.controller.startObserverRun(runtime.token, services.now());
-			scheduleTimers(root, services);
-			updateStatus(root, services);
+			// The run source is not present on agent_start. Keep an existing
+			// classification across provider retries; only a fully settled run resets it.
 		});
 		pi.on("agent_settled", () => {
+			const completedActivity = runtime.runActivity;
+			runtime.runActivity = "pending";
 			if (runtime.pausedForReflection) {
 				if (runtime.domainAttached)
 					void services.processDomain.setBusy(runtime, false).catch(() => {});
@@ -860,6 +904,7 @@ export function createWatchdogExtension(
 			}
 			if (runtime.domainAttached)
 				void services.processDomain.setBusy(runtime, false).catch(() => {});
+			if (completedActivity !== "work") return;
 			if (rootIsCurrent(runtime)) {
 				const snapshot = runtime.controller.settleRootActiveSegment(
 					services.now(),
@@ -923,7 +968,11 @@ export function createWatchdogExtension(
 							customType: REFLECTION_MESSAGE_TYPE,
 							content: buildReflectionReaskPrompt(validation.error),
 							display: false,
-							details: { reflectionId: active.id, attempt: active.reasks + 1 },
+							details: {
+								reflectionId: active.id,
+								attempt: active.reasks + 1,
+								...PROCESS_DOMAIN_OBSERVATION_DETAILS,
+							},
 						},
 						{ deliverAs: "steer", triggerTurn: true },
 					);
@@ -939,7 +988,9 @@ export function createWatchdogExtension(
 			finalizeReflection(runtime, services, text, validation.decision);
 		});
 		pi.on("turn_end", () => {
-			if (runtime.pausedForReflection) return;
+			if (runtime.pausedForReflection || runtime.runActivity === "observation")
+				return;
+			if (runtime.runActivity === "pending") classifyWork();
 			if (rootIsCurrent(runtime)) {
 				if (runtime.suppressNextRootTurn) {
 					runtime.suppressNextRootTurn = false;

@@ -86,7 +86,7 @@ const counters: ReflectDomainCounters = {
 	activeMs: counter("active"),
 };
 
-function fakeDomain(): ReflectDomainCoordinator {
+function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
 	let rootLoops = 0n;
 	let domainLoops = 0n;
 	let snapshot = counters;
@@ -95,7 +95,9 @@ function fakeDomain(): ReflectDomainCoordinator {
 		rootProcess: true,
 		async attach() {},
 		async detach() {},
-		async setBusy() {},
+		async setBusy(_instance, busy) {
+			activityWrites.push(busy);
+		},
 		async recordRootLoop() {
 			rootLoops += 1n;
 			domainLoops += 1n;
@@ -145,8 +147,9 @@ function install() {
 	reset();
 	const pi = new Pi();
 	const ctx = context();
+	const activityWrites: boolean[] = [];
 	const extension = createWatchdogExtension({
-		processDomain: fakeDomain(),
+		processDomain: fakeDomain(activityWrites),
 		loadConfig: async () => ({
 			config: {
 				mainLoopLimit: 2,
@@ -158,7 +161,7 @@ function install() {
 		}),
 	});
 	extension(pi as any);
-	return { pi, ctx };
+	return { pi, ctx, activityWrites };
 }
 
 test("root registers new commands, history tools, and no legacy command aliases", async () => {
@@ -191,6 +194,89 @@ test("/reflect queues one fixed-context inquiry with explicit empty supplement",
 	);
 	assert.match(pi.messages[0].message.content, /User supplement: \(none\)/);
 	assert.equal(pi.messages[0].options.triggerTurn, true);
+	assert.deepEqual(pi.messages[0].message.details["pi-process-domain"], {
+		version: 1,
+		activity: "observation",
+	});
+});
+
+test("process-domain observation turns do not become busy or increment loops", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit(
+		"message_start",
+		{
+			message: {
+				role: "custom",
+				customType: "unrelated-observer:inquiry",
+				details: {
+					"pi-process-domain": {
+						version: 1,
+						activity: "observation",
+					},
+				},
+			},
+		},
+		ctx,
+	);
+	await pi.emit("turn_start", {}, ctx);
+	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(activityWrites, [false]);
+	const control = pi.tools.find(
+		(tool) => tool.name === "reflect_watchdog_control",
+	);
+	assert.ok(control);
+	const status = await control.execute("status", { action: "status" }, ctx);
+	assert.equal(status.details.mainLoops, 0);
+});
+
+test("user input upgrades an observation run to ordinary work", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit(
+		"message_start",
+		{
+			message: {
+				role: "custom",
+				details: {
+					"pi-process-domain": {
+						version: 1,
+						activity: "observation",
+					},
+				},
+			},
+		},
+		ctx,
+	);
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(activityWrites, [true, false]);
+});
+
+test("unknown activity metadata fails closed to ordinary work", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit(
+		"message_start",
+		{
+			message: {
+				role: "custom",
+				customType: "unknown:inquiry",
+				details: {
+					"pi-process-domain": { version: 2, activity: "observation" },
+				},
+			},
+		},
+		ctx,
+	);
+	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(activityWrites, [true, false]);
 });
 
 test("threshold inquiry is queued instead of using legacy warning message", async () => {
