@@ -1,16 +1,16 @@
 {
-  "name": "pi-watchdog",
+  "name": "pi-reflect-watchdog",
   "version": "0.1.0",
   "type": "module",
   "description": "Root-agent loop and active-time watchdog for Pi.",
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xz-dev/pi-watchdog.git"
+    "url": "git+https://github.com/xz-dev/pi-reflect-watchdog.git"
   },
-  "homepage": "https://github.com/xz-dev/pi-watchdog#readme",
+  "homepage": "https://github.com/xz-dev/pi-reflect-watchdog#readme",
   "bugs": {
-    "url": "https://github.com/xz-dev/pi-watchdog/issues"
+    "url": "https://github.com/xz-dev/pi-reflect-watchdog/issues"
   },
   "engines": {
     "node": ">=22.14.0"
@@ -39,5 +39,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "pi-process-domain": "git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f"
   }
 }

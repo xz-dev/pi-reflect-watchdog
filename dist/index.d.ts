@@ -2,8 +2,10 @@ export { type ActivitySnapshot, type ActivityStatus, RootActivityTracker, } from
 export { BUILT_IN_CONFIG, type ConfigDiagnostic, type ConfigInput, type ConfigResult, loadConfigText, type MergeConfigResult, mergeConfig, validateConfig, type WatchdogConfig, } from "./config.js";
 export { type ConfigFileIO, type LoadedConfig, loadRuntimeConfig, } from "./config-loader.js";
 export { type ControllerTransition, controllerOptionsFromConfig, type RuntimeLimits, TaskController, type TaskControllerOptions, type TaskStatus, type WarningKind, } from "./controller.js";
-export { type PromptAlias, parseWatchdogCommand, WATCHDOG_USAGE, } from "./controls.js";
-export { createWatchdogExtension, type RuntimeServices, } from "./extension.js";
+export { parseReflectWatchdogCommand, REFLECT_COMMAND, REFLECT_TIMELINE_COMMAND, REFLECT_WATCHDOG_COMMAND, REFLECT_WATCHDOG_USAGE, type ReflectWatchdogCommand, } from "./controls.js";
+export { createWatchdogExtension, type RuntimeServices } from "./extension.js";
 export { HUB_SYMBOL, type RootAttachment, type RootClaim, type RootPriority, type WatchdogHub, } from "./hub.js";
-export { BUILT_IN_PROMPTS, PROMPT_KINDS, type PromptKind, type PromptTemplateOverrides, type PromptTemplates, renderTemplate, } from "./prompts.js";
+export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
+export { formatHistoryResult, formatReflectionReport, MAX_HISTORY_RESULT_ITEMS, parseReflectionHistoryData, queryReflectionHistory, REFLECTION_HISTORY_ENTRY_TYPE, type ReflectionHistoryEntry, type ReflectionHistoryQuery, reflectionHistory, } from "./reflection-history.js";
+export { buildReflectionPrompt, buildReflectionReaskPrompt, extractTrailingReflectionXml, MAX_REFLECTION_REASKS, MAX_REFLECTION_TEXT_CHARACTERS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, type ReflectionDecision, type ReflectionPromptContext, type ReflectionThresholdSnapshot, type ReflectionTriggerReason, type ReflectionValidation, } from "./reflection-protocol.js";
 export { createWatchdogWidget, formatDuration, formatWidgetText, WIDGET_KEY, type WidgetState, type WidgetTheme, } from "./widget.js";

@@ -1,4 +1,4 @@
-export const HUB_SYMBOL = Symbol.for("pi-watchdog:hub:v1");
+export const HUB_SYMBOL = Symbol.for("pi-reflect-watchdog:hub:v1");
 export function getHub() {
     const globalState = globalThis;
     globalState[HUB_SYMBOL] ??= { nextToken: 0, nextGeneration: 0 };

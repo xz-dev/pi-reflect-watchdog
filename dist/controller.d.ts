@@ -1,7 +1,6 @@
 import type { ActivitySnapshot, ActivityStatus } from "./activity.js";
 import { type WatchdogConfig } from "./config.js";
-import type { PromptKind, PromptTemplateOverrides, PromptTemplates } from "./prompts.js";
-export type WarningKind = PromptKind;
+export type WarningKind = "ROOT_LOOP_LIMIT" | "DOMAIN_LOOP_LIMIT" | "CONTINUOUS_DOMAIN_ACTIVE_TIME";
 export interface RuntimeLimits {
     mainLoopLimit: number;
     observedTotalLoopLimit: number;
@@ -20,7 +19,6 @@ export interface TaskStatus {
     observedChildSessions: number;
     limits: RuntimeLimits;
     configuredLimits: RuntimeLimits;
-    prompts: PromptTemplates;
     latchedWarnings: WarningKind[];
     /** True only while the root agent is running; drives root-only wall-clock warnings. */
     rootActive: boolean;
@@ -31,13 +29,10 @@ export interface TaskStatus {
 }
 export interface TaskControllerOptions extends Partial<Omit<RuntimeLimits, "wallClockMinutes">> {
     wallClockMinutes?: number;
-    prompts?: PromptTemplateOverrides;
 }
 export declare class TaskController {
     private readonly configuredLimits;
-    private readonly configuredPrompts;
     private limits;
-    private promptOverrides;
     private epoch;
     private mainLoops;
     private activeLoops;
@@ -66,8 +61,6 @@ export declare class TaskController {
     private resetWarningCycle;
     setLimits(limits: Partial<RuntimeLimits>, now: number, resetWarningCycle?: boolean): ControllerTransition;
     restoreConfiguredDefaults(now: number, resetWarningCycle?: boolean): ControllerTransition;
-    setPromptOverride(kind: PromptKind, template: string): void;
-    resetPromptOverride(kind?: PromptKind): void;
     startRootActiveSegment(now: number): void;
     settleRootActiveSegment(now: number): ActivitySnapshot | undefined;
     finalize(): void;

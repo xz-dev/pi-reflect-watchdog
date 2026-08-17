@@ -8,7 +8,7 @@
  */
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { ActivityStatus } from "./activity.js";
-export declare const WIDGET_KEY = "pi-watchdog";
+export declare const WIDGET_KEY = "pi-reflect-watchdog";
 export declare const WIDGET_PLACEMENT = "belowEditor";
 /** Theme face needed to style the line; matches the public Theme.fg API. */
 export interface WidgetTheme {

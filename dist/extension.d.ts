@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type LoadedConfig } from "./config-loader.js";
+import { type ReflectDomainCoordinator } from "./process-domain.js";
 type Timer = ReturnType<typeof setTimeout>;
 export type WatchdogTimerRole = "threshold" | "tui-refresh" | "rpc-status";
 export interface RuntimeServices {
@@ -12,6 +13,7 @@ export interface RuntimeServices {
     setTimeout(callback: () => void, delay: number): Timer;
     clearTimeout(timer: Timer): void;
     loadConfig(cwd: string, trusted: boolean): Promise<LoadedConfig>;
+    processDomain: ReflectDomainCoordinator;
     /** Optional role-aware scheduling seam; production falls back to setTimeout. */
     scheduleTimer?(role: WatchdogTimerRole, callback: () => void, delay: number): Timer;
 }

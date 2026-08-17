@@ -1,6 +1,1 @@
-export declare const PROMPT_KINDS: readonly ["mainLoopLimitReached", "observedTotalLoopLimitReached", "wallClockLimitReached"];
-export type PromptKind = (typeof PROMPT_KINDS)[number];
-export type PromptTemplates = Record<PromptKind, string>;
-export type PromptTemplateOverrides = Partial<Record<PromptKind, string>>;
-export declare const BUILT_IN_PROMPTS: Readonly<PromptTemplates>;
-export declare function renderTemplate(template: string, variables: Readonly<Record<string, string | number>>): string;
+export declare const DEFAULT_REFLECTION_PROMPT = "Pause the current work rhythm and critically review the steps taken so far.\n\nDetermine whether the work is still following the user's actual objective and agreed plan. Check for repeated investigation, repeated attempts to repair the same failure without learning from prior results, duplicated work across agents, scope drift, or deviation from the final objective that was not reported to the user in advance.\n\nUse the existing conversation and, when necessary, bounded tool verification to separate real progress from repetition. Report what has actually been completed, the current step, and the correct next step. If the route needs correction, state the correction clearly rather than justifying the existing approach.";

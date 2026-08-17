@@ -1,12 +1,15 @@
-export const WATCHDOG_USAGE = "Usage: /watchdog [status|reset|limits [<main> <observed> <minutes>|reset]|prompt [show|<main|total|time>|reset <main|total|time|all>]]";
+export const REFLECT_WATCHDOG_COMMAND = "reflect-watchdog";
+export const REFLECT_COMMAND = "reflect";
+export const REFLECT_TIMELINE_COMMAND = "reflect-timeline";
+export const REFLECT_WATCHDOG_USAGE = "Usage: /reflect-watchdog [status|reset|limits [<main> <observed> <minutes>|reset]]";
 function positiveSafeInteger(token) {
     if (token === undefined || !/^\d+$/.test(token))
         return undefined;
     const value = Number(token);
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
-/** Parse user command words without touching runtime state. */
-export function parseWatchdogCommand(input) {
+/** Parse the reflect-watchdog control command without touching runtime state. */
+export function parseReflectWatchdogCommand(input) {
     const words = input.trim().split(/\s+/).filter(Boolean);
     if (words.length === 0 || (words.length === 1 && words[0] === "status"))
         return { command: { action: "status" } };
@@ -34,23 +37,10 @@ export function parseWatchdogCommand(input) {
                 };
         }
         return {
-            error: `Limits must use three positive safe integers. ${WATCHDOG_USAGE}`,
+            error: `Limits must use three positive safe integers. ${REFLECT_WATCHDOG_USAGE}`,
         };
     }
-    if (words[0] === "prompt") {
-        if (words.length === 2 && words[1] === "show")
-            return { command: { action: "prompt-show" } };
-        if (words.length === 2 &&
-            (words[1] === "main" || words[1] === "total" || words[1] === "time"))
-            return { command: { action: "prompt-edit", kind: words[1] } };
-        if (words.length === 3 &&
-            words[1] === "reset" &&
-            (words[2] === "main" ||
-                words[2] === "total" ||
-                words[2] === "time" ||
-                words[2] === "all"))
-            return { command: { action: "prompt-reset", kind: words[2] } };
-        return { error: `Invalid prompt command. ${WATCHDOG_USAGE}` };
-    }
-    return { error: `Unknown watchdog command. ${WATCHDOG_USAGE}` };
+    return {
+        error: `Unknown reflect-watchdog command. ${REFLECT_WATCHDOG_USAGE}`,
+    };
 }

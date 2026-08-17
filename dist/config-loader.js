@@ -22,9 +22,9 @@ async function readConfig(path, source, io) {
     }
 }
 export async function loadRuntimeConfig(cwd, trusted, io = nodeFileIO, agentDir = getAgentDir()) {
-    const global = await readConfig(join(agentDir, "pi-watchdog.json"), "global", io);
+    const global = await readConfig(join(agentDir, "pi-reflect-watchdog.json"), "global", io);
     const project = trusted
-        ? await readConfig(join(cwd, CONFIG_DIR_NAME, "pi-watchdog.json"), "project", io)
+        ? await readConfig(join(cwd, CONFIG_DIR_NAME, "pi-reflect-watchdog.json"), "project", io)
         : { config: {}, diagnostics: [] };
     const merged = mergeConfig(global.config, project.config);
     return {

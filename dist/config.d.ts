@@ -1,9 +1,8 @@
-import { type PromptTemplateOverrides, type PromptTemplates } from "./prompts.js";
 export interface WatchdogConfig {
     mainLoopLimit: number;
     observedTotalLoopLimit: number;
     wallClockMinutes: number;
-    prompts: PromptTemplates;
+    reflectionPrompt: string;
 }
 export type ConfigInput = Record<string, unknown>;
 export interface ConfigDiagnostic {
@@ -11,9 +10,7 @@ export interface ConfigDiagnostic {
     message: string;
 }
 export interface ConfigResult {
-    config: Partial<Omit<WatchdogConfig, "prompts">> & {
-        prompts?: PromptTemplateOverrides;
-    };
+    config: Partial<WatchdogConfig>;
     diagnostics: ConfigDiagnostic[];
 }
 export interface MergeConfigResult {

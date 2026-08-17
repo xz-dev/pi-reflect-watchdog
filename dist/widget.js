@@ -7,7 +7,7 @@
  * current root session in TUI mode.
  */
 import { truncateToWidth } from "@earendil-works/pi-tui";
-export const WIDGET_KEY = "pi-watchdog";
+export const WIDGET_KEY = "pi-reflect-watchdog";
 export const WIDGET_PLACEMENT = "belowEditor";
 /** Compact duration: seconds under a minute, then m+s, then h+m. */
 export function formatDuration(ms) {
