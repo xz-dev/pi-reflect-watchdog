@@ -91,15 +91,11 @@ export async function createIsolatedEnvironment(
 		PI_CODING_AGENT_DIR: agentDir,
 		PI_CODING_AGENT_SESSION_DIR: path.join(base, "sessions"),
 		NO_COLOR: "1",
+		npm_config_audit: "false",
+		npm_config_fund: "false",
+		npm_config_prefer_offline: "true",
 	};
-	for (const name of [
-		"PI_PROCESS_DOMAIN_ID",
-		"PI_PROCESS_DOMAIN_KEY",
-		"PI_PROCESS_DOMAIN_PROTOCOL",
-		"PI_PROCESS_DOMAIN_RESERVATION",
-		"PI_CONTINUE_WATCHDOG_ROOT_PID",
-	])
-		delete env[name];
+	delete env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	return { agentDir, workspace, env };
 }
 
@@ -125,14 +121,27 @@ export async function installPackedArtifact({ base, agentDir }) {
 		);
 	const installRoot = path.join(base, "installed-artifact");
 	await mkdir(installRoot, { recursive: true });
-	const processDomainTarball = process.env.PI_PROCESS_DOMAIN_E2E_TARBALL;
-	const installTargets = processDomainTarball
-		? [`pi-process-domain@${processDomainTarball}`, tarball]
+	const extensionUtilsTarball = process.env.PI_EXTENSION_UTILS_E2E_TARBALL;
+	const installTargets = extensionUtilsTarball
+		? [`pi-extension-utils@${extensionUtilsTarball}`, tarball]
 		: [tarball];
 	const install = await runBoundedProcess(
 		"npm",
-		["install", "--ignore-scripts", "--prefix", installRoot, ...installTargets],
-		{ timeoutMs: 60_000 },
+		[
+			"install",
+			"--prefer-offline",
+			"--ignore-scripts",
+			"--no-audit",
+			"--no-fund",
+			// Packed E2E installs the watchdog as a tarball dependency, so its
+			// reviewed Git dependency is transitive to this temporary root.
+			// Production Git installs use the tracked allow-git=root policy.
+			"--allow-git=all",
+			"--prefix",
+			installRoot,
+			...installTargets,
+		],
+		{ timeoutMs: 120_000 },
 	);
 	if (install.status !== 0 || install.timedOut || install.error)
 		throw new Error(
@@ -141,7 +150,7 @@ export async function installPackedArtifact({ base, agentDir }) {
 	const packagePath = await realpath(
 		path.join(installRoot, "node_modules", "pi-reflect-watchdog"),
 	);
-	if (processDomainTarball) {
+	if (extensionUtilsTarball) {
 		const override = await runBoundedProcess(
 			"npm",
 			[
@@ -150,13 +159,13 @@ export async function installPackedArtifact({ base, agentDir }) {
 				"--no-save",
 				"--prefix",
 				packagePath,
-				processDomainTarball,
+				extensionUtilsTarball,
 			],
-			{ timeoutMs: 60_000 },
+			{ timeoutMs: 120_000 },
 		);
 		if (override.status !== 0 || override.timedOut || override.error)
 			throw new Error(
-				`process-domain override failed${override.timedOut ? " after timeout" : ""}:\n${override.stdout}\n${override.stderr}`,
+				`pi-extension-utils override failed${override.timedOut ? " after timeout" : ""}:\n${override.stdout}\n${override.stderr}`,
 			);
 	}
 	await writeJson(path.join(agentDir, "settings.json"), {

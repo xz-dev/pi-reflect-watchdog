@@ -70,20 +70,20 @@ function reset() {
 	delete (globalThis as any)[HUB_SYMBOL];
 }
 
-function counter(name: string) {
-	return {
-		name,
-		value: 0n,
-		paused: false,
-		generation: 1n,
-		ownerParticipantId: "root",
-	};
+function counter() {
+	return { value: 0n, paused: false };
 }
 
 const counters: ReflectDomainCounters = {
-	rootLoops: counter("root"),
-	domainLoops: counter("domain"),
-	activeMs: counter("active"),
+	domainEpoch: "domain",
+	revision: 1n,
+	generation: 1n,
+	certain: true,
+	anyBusy: false,
+	fence: { domainEpoch: "domain", generation: 1n },
+	rootLoops: counter(),
+	domainLoops: counter(),
+	activeMs: counter(),
 };
 
 function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
@@ -194,13 +194,15 @@ test("/reflect queues one fixed-context inquiry with explicit empty supplement",
 	);
 	assert.match(pi.messages[0].message.content, /User supplement: \(none\)/);
 	assert.equal(pi.messages[0].options.triggerTurn, true);
-	assert.deepEqual(pi.messages[0].message.details["pi-process-domain"], {
+	assert.deepEqual(pi.messages[0].message.details, {
 		version: 1,
-		activity: "observation",
+		namespace: "pi-reflect-watchdog",
+		inquiryId: "reflection-1",
+		attempt: 1,
 	});
 });
 
-test("process-domain observation turns do not become busy or increment loops", async () => {
+test("unrelated custom inquiries fail closed to ordinary work", async () => {
 	const { pi, ctx, activityWrites } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.emit("agent_start", {}, ctx);
@@ -209,48 +211,27 @@ test("process-domain observation turns do not become busy or increment loops", a
 		{
 			message: {
 				role: "custom",
-				customType: "unrelated-observer:inquiry",
+				customType: "unrelated:inquiry",
 				details: {
-					"pi-process-domain": {
-						version: 1,
-						activity: "observation",
-					},
+					version: 1,
+					namespace: "unrelated",
+					inquiryId: "foreign",
+					attempt: 1,
 				},
 			},
 		},
 		ctx,
 	);
-	await pi.emit("turn_start", {}, ctx);
 	await pi.emit("turn_end", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [false]);
-	const control = pi.tools.find(
-		(tool) => tool.name === "reflect_watchdog_control",
-	);
-	assert.ok(control);
-	const status = await control.execute("status", { action: "status" }, ctx);
-	assert.equal(status.details.mainLoops, 0);
+	assert.deepEqual(activityWrites, [true, false]);
 });
 
-test("user input upgrades an observation run to ordinary work", async () => {
+test("user input remains ordinary work during unrelated custom traffic", async () => {
 	const { pi, ctx, activityWrites } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.emit("agent_start", {}, ctx);
-	await pi.emit(
-		"message_start",
-		{
-			message: {
-				role: "custom",
-				details: {
-					"pi-process-domain": {
-						version: 1,
-						activity: "observation",
-					},
-				},
-			},
-		},
-		ctx,
-	);
+	await pi.emit("message_start", { message: { role: "custom" } }, ctx);
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
 	await pi.emit("turn_end", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
@@ -266,9 +247,12 @@ test("unknown activity metadata fails closed to ordinary work", async () => {
 		{
 			message: {
 				role: "custom",
-				customType: "unknown:inquiry",
+				customType: "pi-reflect-watchdog:inquiry",
 				details: {
-					"pi-process-domain": { version: 2, activity: "observation" },
+					version: 2,
+					namespace: "pi-reflect-watchdog",
+					inquiryId: "forged",
+					attempt: 1,
 				},
 			},
 		},
@@ -327,7 +311,12 @@ test("three total invalid XML attempts fail and finish the inquiry", async () =>
 	await pi.emit("message_end", assistant("invalid two"), ctx);
 	await submitReflection(pi, ctx);
 	await pi.emit("message_end", assistant("invalid three"), ctx);
-	assert.equal(pi.messages.length, 3, "initial request plus two reasks");
+	assert.equal(pi.messages.length, 4, "initial request, two reasks, and fold");
+	assert.equal(
+		pi.messages.at(-1)?.message.customType,
+		"pi-reflect-watchdog:inquiry-fold",
+	);
+	assert.equal(pi.messages.at(-1)?.options.triggerTurn, false);
 	assert.match(ctx.notifications.at(-1)?.[0] ?? "", /Reflection failed/);
 });
 
@@ -346,9 +335,40 @@ test("NO_ISSUE persists one report and starts no ordinary follow-up turn", async
 	await pi.emit("turn_end", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(replacement.message.content, []);
+	assert.deepEqual(replacement.message.details.piInquiry, {
+		version: 1,
+		namespace: "pi-reflect-watchdog",
+		inquiryId: "reflection-1",
+		attempt: 1,
+	});
 	assert.equal(pi.entries.length, 1);
 	assert.equal(pi.entries[0].data.decision.type, "NO_ISSUE");
-	assert.equal(pi.messages.length, 1);
+	assert.equal(pi.messages.length, 2);
+	assert.equal(
+		pi.messages[1].message.customType,
+		"pi-reflect-watchdog:inquiry-fold",
+	);
+
+	const persisted = (sent: any, timestamp: number) => ({
+		role: "custom",
+		customType: sent.customType,
+		content: [{ type: "text", text: sent.content }],
+		display: sent.display,
+		details: sent.details,
+		timestamp,
+	});
+	const folded = await pi.emit(
+		"context",
+		{
+			messages: [
+				persisted(pi.messages[0].message, 1),
+				{ ...replacement.message, timestamp: 2 },
+				persisted(pi.messages[1].message, 3),
+			],
+		},
+		ctx,
+	);
+	assert.deepEqual(folded.messages, []);
 });
 
 test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", async () => {
@@ -368,13 +388,17 @@ test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", asy
 	assert.deepEqual(replacement.message.content, []);
 	assert.equal(pi.entries.length, 1);
 	assert.equal(pi.entries[0].data.decision.type, "ROUTE_CORRECTION");
-	assert.equal(pi.messages.length, 2);
+	assert.equal(pi.messages.length, 3);
+	assert.equal(
+		pi.messages[1].message.customType,
+		"pi-reflect-watchdog:inquiry-fold",
+	);
 	assert.match(
-		pi.messages[1].message.content,
+		pi.messages[2].message.content,
 		/Next step: use corrected route/,
 	);
-	assert.equal(pi.messages[1].options.triggerTurn, true);
-	assert.equal(pi.messages[1].options.deliverAs, "steer");
+	assert.equal(pi.messages[2].options.triggerTurn, true);
+	assert.equal(pi.messages[2].options.deliverAs, "steer");
 });
 
 test("reflection and correction attempts do not re-trigger loop counting", async () => {
@@ -389,5 +413,5 @@ test("reflection and correction attempts do not re-trigger loop counting", async
 	await pi.emit("turn_end", {}, ctx);
 	await submitReflection(pi, ctx);
 	await pi.emit("message_end", assistant(validNoIssue), ctx);
-	assert.equal(pi.messages.length, 2);
+	assert.equal(pi.messages.length, 3);
 });

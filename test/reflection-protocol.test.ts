@@ -6,9 +6,9 @@ import {
 	parseReflectionXml,
 } from "../src/index.js";
 
-test("reflection XML is case-insensitive, decodes entities, and requires unique fields", () => {
+test("reflection XML is strict, decodes entities, and requires unique fields", () => {
 	const result = parseReflectionXml(
-		"thought\n<ReFlEcTiOn><TYPE>route_correction</TYPE><REASON>a &amp; b</REASON><DONE>done</DONE><CURRENT_STEP>now</CURRENT_STEP><NEXT_STEP>next</NEXT_STEP></rEfLeCtIoN>",
+		"thought\n<reflection><type>ROUTE_CORRECTION</type><reason>a &amp; b</reason><done>done</done><current_step>now</current_step><next_step>next</next_step></reflection>",
 	);
 	assert.deepEqual(result, {
 		valid: true,
@@ -23,6 +23,12 @@ test("reflection XML is case-insensitive, decodes entities, and requires unique 
 	assert.equal(
 		parseReflectionXml(
 			"<reflection><type>NO_ISSUE</type><reason>x</reason><reason>y</reason><done>d</done><current_step>c</current_step><next_step>n</next_step></reflection>",
+		).valid,
+		false,
+	);
+	assert.equal(
+		parseReflectionXml(
+			"<Reflection><type>NO_ISSUE</type><reason>x</reason><done>d</done><current_step>c</current_step><next_step>n</next_step></Reflection>",
 		).valid,
 		false,
 	);

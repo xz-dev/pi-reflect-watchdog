@@ -7,6 +7,7 @@ import { ROOT, runBoundedProcess } from "./harness.mjs";
 
 export const FAST_PATTERNS = [
 	"test/e2e/distribution.test.mjs",
+	"test/e2e/process-domain-cross-process.test.mjs",
 	"test/e2e/release-promotion.test.mjs",
 	"test/e2e/release-promotion-git.test.mjs",
 	"test/e2e/tmux-security.test.mjs",
@@ -74,7 +75,7 @@ export async function runE2eSuite(
 				// The full suite includes stock-Pi startup, Git installation, a real
 				// one-minute warning, and a pseudo-TTY test. It is bounded but needs
 				// headroom for a slow CI worker to finish orderly cleanup.
-				timeoutMs: mode === "fast" ? 300_000 : 420_000,
+				timeoutMs: mode === "fast" ? 600_000 : 900_000,
 			},
 			"E2E tests",
 		);

@@ -88,7 +88,7 @@ test("master metadata targets the exact stock Pi Node floor and TypeScript sourc
 	const manifest = JSON.parse(
 		await readFile(path.join(fixture.root, "package.json"), "utf8"),
 	);
-	assert.equal(manifest.engines?.node, ">=22.14.0");
+	assert.equal(manifest.engines?.node, ">=22.19.0");
 	assert.deepEqual(manifest.pi?.extensions, ["./src/extension.ts"]);
 });
 
@@ -102,15 +102,12 @@ test("pack staging rewrites only the staged manifest to dist", async (t) => {
 	assert.deepEqual(manifest.pi?.extensions, ["./dist/extension.js"]);
 	assert.deepEqual(await listTree(stage), PACK_ALLOWLIST);
 	assert.equal(
-		await readFile(path.join(stage, "dist", "run-activity.js"), "utf8"),
-		await readFile(path.join(fixture.root, "dist", "run-activity.js"), "utf8"),
+		await readFile(path.join(stage, "dist", "fatal-exit.js"), "utf8"),
+		await readFile(path.join(fixture.root, "dist", "fatal-exit.js"), "utf8"),
 	);
 	assert.equal(
-		await readFile(path.join(stage, "dist", "run-activity.d.ts"), "utf8"),
-		await readFile(
-			path.join(fixture.root, "dist", "run-activity.d.ts"),
-			"utf8",
-		),
+		await readFile(path.join(stage, "dist", "fatal-exit.d.ts"), "utf8"),
+		await readFile(path.join(fixture.root, "dist", "fatal-exit.d.ts"), "utf8"),
 	);
 	const sourceManifest = JSON.parse(
 		await readFile(path.join(fixture.root, "package.json"), "utf8"),

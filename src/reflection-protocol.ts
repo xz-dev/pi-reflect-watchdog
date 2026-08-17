@@ -1,7 +1,12 @@
+import {
+	buildXmlDocument,
+	MAX_XML_TEXT_CODE_POINTS,
+	parseTrailingXml,
+} from "pi-extension-utils/xml";
 import type { WarningKind } from "./controller.js";
 
 export const REFLECTION_ROOT_TAG = "reflection";
-export const MAX_REFLECTION_TEXT_CHARACTERS = 16_384;
+export const MAX_REFLECTION_TEXT_CHARACTERS = MAX_XML_TEXT_CODE_POINTS;
 export const MAX_REFLECTION_TOOL_CALLS = 10;
 /** Maximum total invalid XML attempts, matching the continue-watchdog contract. */
 export const MAX_REFLECTION_REASKS = 3;
@@ -42,184 +47,51 @@ export type ReflectionValidation =
 	| { readonly valid: true; readonly decision: ReflectionDecision }
 	| { readonly valid: false; readonly error: string };
 
-function decodeXmlEntities(value: string): string | null {
-	let result = "";
-	for (let index = 0; index < value.length; index += 1) {
-		const char = value[index];
-		if (char !== "&") {
-			result += char;
-			continue;
-		}
-		const semicolon = value.indexOf(";", index + 1);
-		if (semicolon === -1) return null;
-		const entity = value.slice(index + 1, semicolon);
-		if (entity === "lt") result += "<";
-		else if (entity === "gt") result += ">";
-		else if (entity === "amp") result += "&";
-		else if (entity === "quot") result += '"';
-		else if (entity === "apos") result += "'";
-		else if (/^#\d+$/.test(entity)) {
-			const codePoint = Number(entity.slice(1));
-			if (
-				!Number.isSafeInteger(codePoint) ||
-				codePoint < 0 ||
-				codePoint > 0x10ffff ||
-				(codePoint >= 0xd800 && codePoint <= 0xdfff)
-			)
-				return null;
-			result += String.fromCodePoint(codePoint);
-		} else if (/^#x[0-9a-fA-F]+$/.test(entity)) {
-			const codePoint = Number.parseInt(entity.slice(2), 16);
-			if (
-				!Number.isSafeInteger(codePoint) ||
-				codePoint < 0 ||
-				codePoint > 0x10ffff ||
-				(codePoint >= 0xd800 && codePoint <= 0xdfff)
-			)
-				return null;
-			result += String.fromCodePoint(codePoint);
-		} else return null;
-		index = semicolon;
-	}
-	return result;
-}
+const REQUIRED_FIELDS = [
+	"type",
+	"reason",
+	"done",
+	"current_step",
+	"next_step",
+] as const;
 
-function skipWhitespace(source: string, index: number): number {
-	while (/\s/u.test(source[index] ?? "")) index += 1;
-	return index;
-}
-
-function readName(
-	source: string,
-	index: number,
-): { readonly name: string; readonly next: number } | null {
-	const match = /^[A-Za-z_][A-Za-z0-9_.-]*/.exec(source.slice(index));
-	return match === null
-		? null
-		: { name: match[0], next: index + match[0].length };
-}
-
-/** Extract one unique bare trailing reflection XML document, case-insensitively. */
-export function extractTrailingReflectionXml(text: string): string | null {
-	if (Array.from(text).length > MAX_REFLECTION_TEXT_CHARACTERS) return null;
-	const trimmed = text.trim();
-	const lower = trimmed.toLowerCase();
-	const open = `<${REFLECTION_ROOT_TAG}>`;
-	const close = `</${REFLECTION_ROOT_TAG}>`;
-	if (!lower.endsWith(close)) return null;
-	const start = lower.lastIndexOf(open);
-	if (start === -1 || lower.indexOf(open) !== start) return null;
-	const closeIndex = lower.indexOf(close);
-	if (closeIndex !== lower.lastIndexOf(close)) return null;
-	return trimmed.slice(start);
-}
-
-/** Parse required case-insensitive tags while rejecting duplicate required fields. */
 export function parseReflectionXml(text: string): ReflectionValidation {
-	const document = extractTrailingReflectionXml(text);
-	if (document === null)
-		return { valid: false, error: "End with one valid reflection XML block." };
-	const lower = document.toLowerCase();
-	const rootOpen = `<${REFLECTION_ROOT_TAG}>`;
-	const rootClose = `</${REFLECTION_ROOT_TAG}>`;
-	if (!lower.startsWith(rootOpen))
-		return { valid: false, error: "The reflection root must be a bare tag." };
-
-	let index = rootOpen.length;
-	const required = new Set([
-		"type",
-		"reason",
-		"done",
-		"current_step",
-		"next_step",
-	]);
-	const fields = new Map<string, string>();
-	while (true) {
-		index = skipWhitespace(document, index);
-		if (lower.startsWith(rootClose, index)) {
-			index += rootClose.length;
-			if (index !== document.length)
-				return { valid: false, error: "Unsupported trailing XML content." };
-			break;
-		}
-		if (document[index] !== "<" || "/!?".includes(document[index + 1] ?? ""))
-			return { valid: false, error: "Malformed reflection XML." };
-		index += 1;
-		const openName = readName(document, index);
-		if (openName === null || document[openName.next] !== ">")
-			return {
-				valid: false,
-				error: "Reflection fields cannot have attributes.",
-			};
-		const normalizedName = openName.name.toLowerCase();
-		index = openName.next + 1;
-		const textStart = index;
-		while (index < document.length && document[index] !== "<") index += 1;
-		const decoded = decodeXmlEntities(document.slice(textStart, index));
-		if (
-			decoded === null ||
-			document[index] !== "<" ||
-			document[index + 1] !== "/"
-		)
-			return { valid: false, error: "Malformed reflection field content." };
-		const closeName = readName(document, index + 2);
-		if (
-			closeName === null ||
-			closeName.name.toLowerCase() !== normalizedName ||
-			document[closeName.next] !== ">"
-		)
-			return { valid: false, error: "Reflection field tags do not match." };
-		index = closeName.next + 1;
-		if (!required.has(normalizedName)) continue;
-		if (fields.has(normalizedName))
-			return {
-				valid: false,
-				error: `Duplicate reflection field: ${normalizedName}.`,
-			};
-		const value = decoded.trim();
-		if (value.length === 0)
-			return {
-				valid: false,
-				error: `Reflection field ${normalizedName} must be non-empty.`,
-			};
-		fields.set(normalizedName, value);
-	}
-
-	for (const name of required) {
-		if (!fields.has(name))
-			return {
-				valid: false,
-				error: `Missing required reflection field: ${name}.`,
-			};
-	}
-	const normalizedType = fields.get("type")?.toUpperCase();
-	if (normalizedType !== "NO_ISSUE" && normalizedType !== "ROUTE_CORRECTION")
+	const parsed = parseTrailingXml(text, REFLECTION_ROOT_TAG);
+	if (!parsed.valid) return parsed;
+	if (
+		parsed.value.fields.size !== REQUIRED_FIELDS.length ||
+		REQUIRED_FIELDS.some((name) => !parsed.value.fields.has(name))
+	)
 		return {
 			valid: false,
-			error: "Reflection type must be NO_ISSUE or ROUTE_CORRECTION.",
+			error: "reflection XML must contain exactly the five required fields",
 		};
-	const reason = fields.get("reason");
-	const done = fields.get("done");
-	const currentStep = fields.get("current_step");
-	const nextStep = fields.get("next_step");
-	if (
-		reason === undefined ||
-		done === undefined ||
-		currentStep === undefined ||
-		nextStep === undefined
-	)
-		return { valid: false, error: "Missing required reflection field." };
+	const values = new Map<string, string>();
+	for (const name of REQUIRED_FIELDS) {
+		const value = parsed.value.fields.get(name)?.trim();
+		if (!value)
+			return {
+				valid: false,
+				error: `reflection field ${name} must be non-empty`,
+			};
+		values.set(name, value);
+	}
+	const type = values.get("type");
+	if (type !== "NO_ISSUE" && type !== "ROUTE_CORRECTION")
+		return {
+			valid: false,
+			error: "reflection type must be NO_ISSUE or ROUTE_CORRECTION",
+		};
 	return {
 		valid: true,
-		decision: { type: normalizedType, reason, done, currentStep, nextStep },
+		decision: {
+			type,
+			reason: values.get("reason") as string,
+			done: values.get("done") as string,
+			currentStep: values.get("current_step") as string,
+			nextStep: values.get("next_step") as string,
+		},
 	};
-}
-
-function escapeXml(value: string): string {
-	return value
-		.replaceAll("&", "&amp;")
-		.replaceAll("<", "&lt;")
-		.replaceAll(">", "&gt;");
 }
 
 /** Append all non-customizable facts and parser constraints to the semantic prefix. */
@@ -228,9 +100,16 @@ export function buildReflectionPrompt(
 ): string {
 	const supplement = context.userSupplement?.trim();
 	const previous = context.previousReflection;
-	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; domain=${context.thresholds.domainLoops}/${context.thresholds.domainLoopLimit}; continuous-domain-active=${context.thresholds.continuousDomainActiveMs}ms/${context.thresholds.continuousDomainActiveMinutes}m\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one <reflection>...</reflection> XML block. Tag names and the type value are case-insensitive. All five fields are required, unique, and non-empty. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Use one of:\n<reflection><type>NO_ISSUE</type><reason>why the route is sound</reason><done>completed work</done><current_step>current work</current_step><next_step>correct next step</next_step></reflection>\n<reflection><type>ROUTE_CORRECTION</type><reason>why the route must change</reason><done>completed work</done><current_step>current work</current_step><next_step>corrected next step</next_step></reflection>\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement: ${escapeXml(supplement ?? "none")}`;
+	const example = buildXmlDocument(REFLECTION_ROOT_TAG, [
+		{ name: "type", value: "NO_ISSUE" },
+		{ name: "reason", value: "why the route is sound" },
+		{ name: "done", value: "completed work" },
+		{ name: "current_step", value: "current work" },
+		{ name: "next_step", value: "correct next step" },
+	]);
+	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; domain=${context.thresholds.domainLoops}/${context.thresholds.domainLoopLimit}; continuous-domain-active=${context.thresholds.continuousDomainActiveMs}ms/${context.thresholds.continuousDomainActiveMinutes}m\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one trailing <reflection>...</reflection> XML block. XML names are case-sensitive. The block must contain exactly these five unique, non-empty fields in any order: type, reason, done, current_step, next_step. The type must be NO_ISSUE or ROUTE_CORRECTION. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Example:\n${example}\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement:\n${buildXmlDocument("supplement", [{ name: "text", value: supplement ?? "none" }])}`;
 }
 
 export function buildReflectionReaskPrompt(error: string): string {
-	return `Your previous reflection response was invalid: ${error}\nCorrect it now. The same tool-call budget remains in force. End with one valid trailing reflection XML block containing unique non-empty type, reason, done, current_step, and next_step fields.`;
+	return `Your previous reflection response was invalid: ${error}\nCorrect it now. The same tool-call budget remains in force. End with one valid trailing reflection XML block containing exactly the unique non-empty type, reason, done, current_step, and next_step fields.`;
 }

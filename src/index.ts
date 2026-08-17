@@ -59,7 +59,6 @@ export {
 export {
 	buildReflectionPrompt,
 	buildReflectionReaskPrompt,
-	extractTrailingReflectionXml,
 	MAX_REFLECTION_REASKS,
 	MAX_REFLECTION_TEXT_CHARACTERS,
 	MAX_REFLECTION_TOOL_CALLS,

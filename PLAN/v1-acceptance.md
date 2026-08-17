@@ -11,17 +11,17 @@
 
 - `reflectionPrompt` layers built-in, global agent-dir JSON, then trusted project JSON.
 - Configuration can replace only the semantic prefix. The plugin appends current local RFC3339 time, reasons, thresholds, previous history, optional supplement, tool budget, and XML requirements.
-- Trailing reflection XML is case-insensitive for tags/type, entity-aware, and limited to 16,384 Unicode characters.
+- Trailing reflection XML is case-sensitive for tags/type, XML 1.0 entity-aware, and limited to 16,384 Unicode characters.
 - `type`, `reason`, `done`, `current_step`, and `next_step` are unique, required, and non-empty.
 - Maximum three total invalid XML attempts.
 - Maximum 10 tool calls per reflection across all attempts; call 11 is blocked before execution.
 
 ## Exact counters
 
-- Broker-authoritative named counters track root loops, domain loops, and continuous aggregate-active milliseconds.
-- Each ordinary `turn_end` atomically increments domain loops; root ordinary turns also increment root loops.
+- `pi-reflect-watchdog` owns root loops, domain loops, continuous aggregate-active milliseconds, certainty, generation, and fences.
+- Each ordinary `turn_end` contributes one versioned loop message; root ordinary turns increment both root and domain loops.
 - Reflection and correction attempts do not increment counters.
-- Root owns pause/reset/resume under a counter generation; stale generations and non-owner control writes fail closed.
+- Root owns pause/reset/resume. Fresh activity and loop revisions are acknowledged in snapshots; stale epochs, revisions, or reconnect snapshots fail closed.
 - Active time uses recursive fixed-quantum `setTimeout`; delayed callbacks never backfill host sleep.
 - Aggregate idle uses one fixed 10-second handoff grace. Busy returning within grace continues the window; idle through grace resets continuous-active time.
 
@@ -44,8 +44,8 @@
 
 ## Cross-repository acceptance
 
-- `pi-process-domain`: typecheck, lint, build, unit, and real cross-process acceptance covering concurrent increments, subscription, owner pause/reset/resume, stale generation rejection, reconnect replay, and packed import.
-- `pi-reflect-watchdog`: lint, typecheck, unit/runtime lifecycle, packed stock-Pi RPC, TUI, and process-domain integration.
-- `pi-continue-watchdog`: case-insensitive XML root/fields/function while retaining unique trailing XML, entity decode, duplicate rejection, and three attempts; `/continue-timeline` covers manual lock, continue, AI/human unlock, and decision-failed with TUI/fallback.
-- Joint packed installation uses matching `pi-process-domain` counter API and both watchdogs without command/tool collisions.
+- `pi-extension-utils`: lint, typecheck, build, unit, pack, production audit, and real cross-process authenticated transport acceptance.
+- `pi-reflect-watchdog`: lint, typecheck, unit/runtime lifecycle, strict XML/inquiry folding, packed stock-Pi RPC/TUI, and real process-domain integration.
+- `pi-continue-watchdog`: strict XML and inquiry folding, `/continue-timeline`, packed installation, and real process-domain reconnect acceptance.
+- Joint packed installation uses both watchdogs pinned to the same full `pi-extension-utils` commit SHA without command/tool collisions.
 - Preserve unrelated untracked artifacts; do not commit, push, publish, or clean them.

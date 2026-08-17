@@ -4,6 +4,11 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+	createInquiryRuntime,
+	foldInquiryContext,
+	type InquiryRuntime,
+} from "pi-extension-utils/pi-inquiry";
 
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import {
@@ -18,6 +23,7 @@ import {
 	REFLECT_TIMELINE_COMMAND,
 	REFLECT_WATCHDOG_COMMAND,
 } from "./controls.js";
+import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
 import {
 	allocateAttachmentToken,
 	claimRoot,
@@ -28,6 +34,7 @@ import {
 } from "./hub.js";
 import {
 	getReflectDomainCoordinator,
+	isReflectDomainFatalError,
 	type ReflectDomainCoordinator,
 	type ReflectDomainCounters,
 } from "./process-domain.js";
@@ -54,10 +61,6 @@ import {
 	showReflectionTimeline,
 } from "./reflection-timeline.js";
 import {
-	isProcessDomainObservation,
-	PROCESS_DOMAIN_OBSERVATION_DETAILS,
-} from "./run-activity.js";
-import {
 	createWatchdogWidget,
 	formatDuration,
 	WIDGET_KEY,
@@ -73,7 +76,8 @@ const CONTROL_TOOL_NAMES = new Set([
 	HISTORY_COUNT_TOOL_NAME,
 	HISTORY_GET_TOOL_NAME,
 ]);
-const REFLECTION_MESSAGE_TYPE = "pi-reflect-watchdog:inquiry";
+const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
+const REFLECTION_MESSAGE_TYPE = `${REFLECTION_INQUIRY_NAMESPACE}:inquiry`;
 const REFLECTION_ENTRY_TYPE = REFLECTION_HISTORY_ENTRY_TYPE;
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -103,6 +107,7 @@ export interface RuntimeServices {
 	clearTimeout(timer: Timer): void;
 	loadConfig(cwd: string, trusted: boolean): Promise<LoadedConfig>;
 	processDomain: ReflectDomainCoordinator;
+	fatalExit: FatalExitAdapter;
 	/** Optional role-aware scheduling seam; production falls back to setTimeout. */
 	scheduleTimer?(
 		role: WatchdogTimerRole,
@@ -117,6 +122,7 @@ const defaultServices: RuntimeServices = {
 	clearTimeout: (timer) => clearTimeout(timer),
 	loadConfig: loadRuntimeConfig,
 	processDomain: getReflectDomainCoordinator(),
+	fatalExit: createFatalExitAdapter(),
 };
 
 interface ObserverBinding {
@@ -136,10 +142,11 @@ interface PendingReflection {
 interface ActiveReflection extends PendingReflection {
 	reasks: number;
 	toolCalls: number;
-	submitted: boolean;
+	submittedAttempt?: number;
+	readonly inquiry: InquiryRuntime;
 }
 
-type RunActivity = "pending" | "work" | "observation";
+type RunActivity = "pending" | "work";
 
 interface Runtime {
 	pi: ExtensionAPI;
@@ -422,9 +429,9 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 		);
 		runtime.timer.unref?.();
 	};
-	// Once attached, the broker's named activeMs counter is the sole
+	// Once attached, the watchdog-owned activeMs state is the sole
 	// cross-process wall-threshold authority. A parallel local timer can race
-	// one subscription broadcast ahead and enqueue a reflection with a stale
+	// one snapshot broadcast ahead and enqueue a reflection with a stale
 	// snapshot (for example 59000ms at the 60000ms boundary).
 	if (!runtime.domainAttached) scheduleWallClock();
 	const scheduleRefreshTick = (
@@ -483,6 +490,13 @@ function domainThresholdReasons(
 	runtime: Runtime & { controller: TaskController },
 	counters: ReflectDomainCounters,
 ): ReflectionTriggerReason[] {
+	if (
+		!counters.certain ||
+		counters.rootLoops.paused ||
+		counters.domainLoops.paused ||
+		counters.activeMs.paused
+	)
+		return [];
 	const status = runtime.controller.status(Date.now());
 	const reasons: ReflectionTriggerReason[] = [];
 	if (counters.rootLoops.value >= BigInt(status.limits.mainLoopLimit))
@@ -534,20 +548,8 @@ function sendActiveReflection(runtime: Runtime): void {
 				? undefined
 				: { timestamp: previous.timestamp, report: previous.report },
 	});
-	active.submitted = false;
-	runtime.pi.sendMessage(
-		{
-			customType: REFLECTION_MESSAGE_TYPE,
-			content,
-			display: false,
-			details: {
-				reflectionId: active.id,
-				attempt: active.reasks + 1,
-				...PROCESS_DOMAIN_OBSERVATION_DETAILS,
-			},
-		},
-		{ deliverAs: "steer", triggerTurn: true },
-	);
+	active.submittedAttempt = undefined;
+	active.inquiry.send(runtime.pi, content, active.reasks + 1);
 }
 
 function beginNextReflection(
@@ -561,7 +563,9 @@ function beginNextReflection(
 		...pending,
 		reasks: 0,
 		toolCalls: 0,
-		submitted: false,
+		inquiry: createInquiryRuntime(REFLECTION_INQUIRY_NAMESPACE, {
+			inquiryId: `reflection-${pending.id}`,
+		}),
 	};
 	clearTimers(runtime, services);
 	runtime.pausedForReflection = true;
@@ -693,6 +697,12 @@ export function createWatchdogExtension(
 ): (pi: ExtensionAPI) => void {
 	const services: RuntimeServices = { ...defaultServices, ...overrides };
 	return (pi) => {
+		pi.on("context", (event) => ({
+			messages: foldInquiryContext(
+				event.messages,
+				REFLECTION_INQUIRY_NAMESPACE,
+			),
+		}));
 		const runtime: Runtime = {
 			pi,
 			token: "",
@@ -735,26 +745,12 @@ export function createWatchdogExtension(
 			updateStatus(root, services);
 		};
 
-		const classifyMessage = (message: {
-			readonly role?: unknown;
-			readonly details?: unknown;
-		}): void => {
-			// Real user input upgrades an observation run to work. This covers user
-			// takeover and steering without trusting the original extension marker.
+		const classifyMessage = (message: { readonly role?: unknown }): void => {
 			if (message.role === "user") {
 				classifyWork();
 				return;
 			}
-			if (runtime.runActivity !== "pending") return;
-			if (
-				message.role === "custom" &&
-				isProcessDomainObservation(message.details)
-			) {
-				runtime.runActivity = "observation";
-				return;
-			}
-			// Unknown custom metadata and no-input/error assistant runs are work.
-			classifyWork();
+			if (runtime.runActivity === "pending") classifyWork();
 		};
 
 		pi.on("session_start", async (_event, ctx) => {
@@ -766,9 +762,9 @@ export function createWatchdogExtension(
 			runtime.sessionId = ctx.sessionManager.getSessionId();
 			runtime.token = allocateAttachmentToken(hub, runtime.sessionId);
 			runtime.state = "loading";
-			// Reserve ownership before awaiting configuration. This is the atomic
-			// priority decision: a UI reservation may replace a fallback, but no
-			// delayed equal/lower-priority callback may steal it afterward.
+			// Claim ownership before awaiting configuration. This atomic priority
+			// decision lets a UI claim replace a fallback while preventing delayed
+			// equal/lower-priority callbacks from stealing it afterward.
 			const claim = claimRoot(hub, runtime.token, priority(ctx), runtime);
 			if (!claim) {
 				runtime.state = "observer";
@@ -794,13 +790,29 @@ export function createWatchdogExtension(
 					`pi-reflect-watchdog ${diagnostic.source}: ${diagnostic.message}`,
 					"warning",
 				);
+			let initialAttachComplete = false;
+			let initialExitRequested = false;
+			const exitForInitialDomainFailure = (error: Error): boolean => {
+				if (
+					initialAttachComplete ||
+					initialExitRequested ||
+					!isReflectDomainFatalError(error)
+				)
+					return false;
+				initialExitRequested = true;
+				services.fatalExit.fail(error, ctx);
+				return true;
+			};
 			try {
-				await services.processDomain.attach(runtime, (error) =>
+				await services.processDomain.attach(runtime, (error) => {
+					if (exitForInitialDomainFailure(error)) return;
+					runtime.domainCounters = undefined;
 					ctx.ui.notify(
-						`pi-reflect-watchdog process-domain: ${error.message}`,
-						"error",
-					),
-				);
+						"pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.",
+						"warning",
+					);
+				});
+				initialAttachComplete = true;
 				runtime.domainAttached = true;
 				runtime.domainCounters = services.processDomain.counters();
 				if (services.processDomain.rootProcess) {
@@ -826,8 +838,11 @@ export function createWatchdogExtension(
 						},
 					);
 				}
-			} catch {
+			} catch (error) {
+				const attachError =
+					error instanceof Error ? error : new Error("process domain failed");
 				deactivate(runtime, services);
+				exitForInitialDomainFailure(attachError);
 				return;
 			}
 			registerControlTool(pi, runtime, services);
@@ -847,21 +862,33 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("message_start", (event) => {
-			classifyMessage(event.message);
 			if (event.message.role === "custom") {
 				const active = runtime.activeReflection;
 				const message = event.message as typeof event.message & {
 					readonly customType?: string;
-					readonly details?: { readonly reflectionId?: number };
+					readonly details?: {
+						readonly version?: number;
+						readonly namespace?: string;
+						readonly inquiryId?: string;
+						readonly attempt?: number;
+					};
 				};
+				const attempt = active === undefined ? 0 : active.reasks + 1;
+				const correlation = active?.inquiry.correlation(attempt || 1);
 				if (
 					active !== undefined &&
+					correlation !== undefined &&
 					message.customType === REFLECTION_MESSAGE_TYPE &&
-					message.details?.reflectionId === active.id
-				)
-					active.submitted = true;
-				return;
+					message.details?.version === correlation.version &&
+					message.details?.namespace === correlation.namespace &&
+					message.details?.inquiryId === correlation.inquiryId &&
+					message.details?.attempt === correlation.attempt
+				) {
+					active.submittedAttempt = attempt;
+					return;
+				}
 			}
+			classifyMessage(event.message);
 			if (event.message.role !== "user") return;
 			if (rootIsCurrent(runtime)) {
 				// An interjecting/new root user message replaces a begun activity
@@ -948,47 +975,29 @@ export function createWatchdogExtension(
 		});
 		pi.on("message_end", (event) => {
 			const active = runtime.activeReflection;
-			if (
-				active === undefined ||
-				!active.submitted ||
-				event.message.role !== "assistant"
-			)
-				return;
-			// Pi applies this replacement before rendering, agent-state reduction,
-			// and session persistence. Reflection XML is internal protocol output.
+			const attempt = active?.submittedAttempt;
+			if (active === undefined || attempt === undefined) return;
+			const text = active.inquiry.capture(event.message);
+			if (text === null) return;
+			active.submittedAttempt = undefined;
 			const replacement = {
-				message: {
-					...event.message,
-					content: [],
-				},
+				message: active.inquiry.neutralize(event.message, attempt),
 			};
-			active.submitted = false;
-			const text = event.message.content
-				.filter(
-					(block): block is { type: "text"; text: string } =>
-						block.type === "text",
-				)
-				.map((block) => block.text)
-				.join("");
 			const validation = parseReflectionXml(text);
 			if (!validation.valid) {
 				active.reasks += 1;
 				if (active.reasks < MAX_REFLECTION_REASKS) {
-					runtime.pi.sendMessage(
-						{
-							customType: REFLECTION_MESSAGE_TYPE,
-							content: buildReflectionReaskPrompt(validation.error),
-							display: false,
-							details: {
-								reflectionId: active.id,
-								attempt: active.reasks + 1,
-								...PROCESS_DOMAIN_OBSERVATION_DETAILS,
-							},
-						},
-						{ deliverAs: "steer", triggerTurn: true },
+					active.inquiry.send(
+						runtime.pi,
+						buildReflectionReaskPrompt(validation.error),
+						active.reasks + 1,
 					);
 					return replacement;
 				}
+				runtime.pi.sendMessage(active.inquiry.fold(attempt), {
+					deliverAs: "steer",
+					triggerTurn: false,
+				});
 				finalizeReflection(
 					runtime,
 					services,
@@ -996,12 +1005,15 @@ export function createWatchdogExtension(
 				);
 				return replacement;
 			}
+			runtime.pi.sendMessage(active.inquiry.fold(attempt), {
+				deliverAs: "steer",
+				triggerTurn: false,
+			});
 			finalizeReflection(runtime, services, text, validation.decision);
 			return replacement;
 		});
 		pi.on("turn_end", () => {
-			if (runtime.pausedForReflection || runtime.runActivity === "observation")
-				return;
+			if (runtime.pausedForReflection) return;
 			if (runtime.runActivity === "pending") classifyWork();
 			if (rootIsCurrent(runtime)) {
 				if (runtime.suppressNextRootTurn) {
@@ -1043,10 +1055,11 @@ export function createWatchdogExtension(
 			);
 		});
 		pi.on("session_shutdown", () => {
+			services.fatalExit.completeShutdown();
 			if (runtime.state === "shutdown") return;
 			runtime.state = "shutdown";
 			const hub = getHub<Runtime>();
-			// Release the exact hub reservation, including a pending one whose
+			// Release the exact hub claim, including a pending one whose
 			// configuration never resolved, so an equal-priority replacement can
 			// become root while the stale resolution stays inert.
 			const generation = runtime.root?.generation;

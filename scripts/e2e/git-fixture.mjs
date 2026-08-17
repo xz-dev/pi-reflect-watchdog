@@ -7,6 +7,7 @@ import { createReleaseTree } from "../distribution.mjs";
 import { PI_BIN, ROOT, runBoundedProcess, terminateChild } from "./harness.mjs";
 
 export const MASTER_FIXTURE_ALLOWLIST = [
+	".npmrc",
 	"LICENSE",
 	"README.md",
 	"package-lock.json",
@@ -17,6 +18,7 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"src/controller.ts",
 	"src/controls.ts",
 	"src/extension.ts",
+	"src/fatal-exit.ts",
 	"src/hub.ts",
 	"src/index.ts",
 	"src/process-domain.ts",
@@ -24,7 +26,6 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"src/reflection-history.ts",
 	"src/reflection-protocol.ts",
 	"src/reflection-timeline.ts",
-	"src/run-activity.ts",
 	"src/widget.ts",
 	"tsconfig.check.json",
 	"tsconfig.json",
@@ -74,6 +75,7 @@ async function copyMasterTree(destination) {
 	);
 	assertStockPiDependencyShape(manifest);
 	for (const name of [
+		".npmrc",
 		"LICENSE",
 		"README.md",
 		"package.json",
@@ -237,7 +239,7 @@ export async function tryInstallGitPackage({
 	source,
 	cwd,
 	env,
-	timeoutMs = 60_000,
+	timeoutMs = 120_000,
 }) {
 	return runBoundedProcess(PI_BIN, ["install", source], {
 		cwd,

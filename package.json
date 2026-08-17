@@ -13,7 +13,7 @@
     "url": "https://github.com/xz-dev/pi-reflect-watchdog/issues"
   },
   "engines": {
-    "node": ">=22.14.0"
+    "node": ">=22.19.0"
   },
   "keywords": [
     "pi-package",
@@ -64,6 +64,9 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "pi-process-domain": "git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f"
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#2fe6a4f73c388e3e55a95ab522ef6cdf323c77cc"
+  },
+  "allowScripts": {
+    "zeromq": true
   }
 }

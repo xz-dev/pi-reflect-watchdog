@@ -37,8 +37,8 @@ const DIST_FILES = [
 	"reflection-protocol.js",
 	"reflection-timeline.d.ts",
 	"reflection-timeline.js",
-	"run-activity.d.ts",
-	"run-activity.js",
+	"fatal-exit.d.ts",
+	"fatal-exit.js",
 	"index.d.ts",
 	"index.js",
 	"prompts.d.ts",
@@ -54,7 +54,12 @@ export const PACK_ALLOWLIST = [
 	"package.json",
 	...DIST_FILES.map((name) => `dist/${name}`),
 ].sort();
-export const RELEASE_ALLOWLIST = [...PACK_ALLOWLIST, "provenance.json"].sort();
+export const RELEASE_ALLOWLIST = [
+	...PACK_ALLOWLIST,
+	".npmrc",
+	"package-lock.json",
+	"provenance.json",
+].sort();
 
 function stableJson(value) {
 	return `${JSON.stringify(value, null, 2)}\n`;
@@ -72,6 +77,19 @@ function releaseManifest(source) {
 	delete manifest.devDependencies;
 	delete manifest.files;
 	return manifest;
+}
+
+function releaseLock(source, manifest) {
+	const lock = structuredClone(source);
+	lock.packages[""] = {
+		name: manifest.name,
+		version: manifest.version,
+		license: manifest.license,
+		dependencies: manifest.dependencies,
+		engines: manifest.engines,
+		peerDependencies: manifest.peerDependencies,
+	};
+	return lock;
 }
 
 function contains(parent, child) {
@@ -245,10 +263,16 @@ export async function createReleaseTree({
 	);
 	try {
 		await copyPayload(root, stage);
-		await writeFile(
-			path.join(stage, "package.json"),
-			stableJson(releaseManifest(await sourceManifest(root))),
+		await cp(path.join(root, ".npmrc"), path.join(stage, ".npmrc"));
+		const manifest = releaseManifest(await sourceManifest(root));
+		const sourceLock = JSON.parse(
+			await readFile(path.join(root, "package-lock.json"), "utf8"),
 		);
+		await writeFile(
+			path.join(stage, "package-lock.json"),
+			stableJson(releaseLock(sourceLock, manifest)),
+		);
+		await writeFile(path.join(stage, "package.json"), stableJson(manifest));
 		await writeFile(
 			path.join(stage, "provenance.json"),
 			stableJson({

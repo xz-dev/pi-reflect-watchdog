@@ -1,20 +1,116 @@
 import {
-	type CycleCounterSnapshot,
-	openDomain,
-	type ProcessDomain,
-} from "pi-process-domain";
+	isProcessDomainOpenError,
+	openProcessDomain,
+	type ProcessDomainDataMessage,
+	type ProcessDomainEvent,
+	type ProcessDomainNode,
+	type ProcessDomainOpenErrorCode,
+} from "pi-extension-utils/process-domain";
 
-const ROOT_COUNTER = "pi-reflect-watchdog.root-loops";
-const DOMAIN_COUNTER = "pi-reflect-watchdog.domain-loops";
-const ACTIVE_COUNTER = "pi-reflect-watchdog.active-ms";
+export const FATAL_EXIT_CODE = 78;
+
+const ACTIVITY_CHANNEL = "pi-reflect-watchdog.activity.v1";
+const LOOP_CHANNEL = "pi-reflect-watchdog.loop.v1";
+const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v1";
+const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v1";
 const ACTIVE_TICK_MS = 1_000;
 const IDLE_GRACE_MS = 10_000;
 
-type CounterName = "rootLoops" | "domainLoops" | "activeMs";
+export type ReflectDomainFatalCode =
+	| ProcessDomainOpenErrorCode
+	| "DOMAIN_UNRECOVERABLE";
+
+export class ReflectDomainFatalError extends Error {
+	readonly isReflectDomainFatalError = true as const;
+
+	constructor(
+		readonly code: ReflectDomainFatalCode,
+		message: string,
+		options?: { readonly cause?: unknown },
+	) {
+		super(message, options);
+		this.name = "ReflectDomainFatalError";
+	}
+}
+
+export function isReflectDomainFatalError(
+	value: unknown,
+): value is ReflectDomainFatalError {
+	return (
+		value instanceof Error &&
+		(value as ReflectDomainFatalError).isReflectDomainFatalError === true
+	);
+}
+
+export interface ReflectCounterValue {
+	readonly value: bigint;
+	readonly paused: boolean;
+}
+
+export interface ReflectDomainFence {
+	readonly domainEpoch: string;
+	readonly generation: bigint;
+}
+
 export interface ReflectDomainCounters {
-	readonly rootLoops: CycleCounterSnapshot;
-	readonly domainLoops: CycleCounterSnapshot;
-	readonly activeMs: CycleCounterSnapshot;
+	readonly domainEpoch: string;
+	readonly revision: bigint;
+	readonly generation: bigint;
+	readonly certain: boolean;
+	readonly anyBusy: boolean;
+	readonly fence: ReflectDomainFence;
+	readonly rootLoops: ReflectCounterValue;
+	readonly domainLoops: ReflectCounterValue;
+	readonly activeMs: ReflectCounterValue;
+}
+
+interface ActivityWire {
+	readonly revision: string;
+	readonly busy: boolean;
+}
+
+interface LoopWire {
+	readonly revision: string;
+	readonly rootLoops: string;
+	readonly domainLoops: string;
+}
+
+interface RevisionWire {
+	readonly nodeId: string;
+	readonly revision: string;
+}
+
+interface CountersWire {
+	readonly revision: string;
+	readonly generation: string;
+	readonly domainEpoch: string;
+	readonly certain: boolean;
+	readonly paused: boolean;
+	readonly anyBusy: boolean;
+	readonly rootLoops: string;
+	readonly domainLoops: string;
+	readonly activeMs: string;
+	readonly activityRevisions: readonly RevisionWire[];
+	readonly loopRevisions: readonly RevisionWire[];
+}
+
+interface PeerActivity {
+	busy: boolean;
+	activityRevision: bigint;
+	loopRevision: bigint;
+	rootLoops: bigint;
+	domainLoops: bigint;
+}
+
+interface Attachment {
+	busy: boolean;
+	onFatal: (error: Error) => void;
+}
+
+interface ParsedCounterMessage {
+	readonly counters: ReflectDomainCounters;
+	readonly activityRevision: bigint;
+	readonly loopRevision: bigint;
 }
 
 export interface ReflectDomainCoordinator {
@@ -30,19 +126,6 @@ export interface ReflectDomainCoordinator {
 	resume(): Promise<void>;
 }
 
-interface Attachment {
-	busy: boolean;
-	onFatal: (error: Error) => void;
-}
-
-function counterNames(): Record<CounterName, string> {
-	return {
-		rootLoops: ROOT_COUNTER,
-		domainLoops: DOMAIN_COUNTER,
-		activeMs: ACTIVE_COUNTER,
-	};
-}
-
 export interface ReflectDomainClock {
 	setTimeout(
 		callback: () => void,
@@ -52,16 +135,181 @@ export interface ReflectDomainClock {
 }
 
 export interface ReflectDomainOptions {
-	readonly open?: typeof openDomain;
+	readonly open?: typeof openProcessDomain;
+	readonly env?: NodeJS.ProcessEnv;
 	readonly clock?: ReflectDomainClock;
 	readonly activeTickMs?: number;
 	readonly idleGraceMs?: number;
 }
 
+function counter(value = 0n, paused = false): ReflectCounterValue {
+	return { value, paused };
+}
+
+function zeroCounters(
+	paused = false,
+	state: {
+		readonly domainEpoch?: string;
+		readonly revision?: bigint;
+		readonly generation?: bigint;
+		readonly certain?: boolean;
+		readonly anyBusy?: boolean;
+	} = {},
+): ReflectDomainCounters {
+	const domainEpoch = state.domainEpoch ?? "pending";
+	const generation = state.generation ?? 0n;
+	return {
+		domainEpoch,
+		revision: state.revision ?? 0n,
+		generation,
+		certain: state.certain ?? false,
+		anyBusy: state.anyBusy ?? false,
+		fence: { domainEpoch, generation },
+		rootLoops: counter(0n, paused),
+		domainLoops: counter(0n, paused),
+		activeMs: counter(0n, paused),
+	};
+}
+
+function sameCounters(
+	left: ReflectDomainCounters,
+	right: ReflectDomainCounters,
+): boolean {
+	return (
+		left.domainEpoch === right.domainEpoch &&
+		left.revision === right.revision &&
+		left.generation === right.generation &&
+		left.certain === right.certain &&
+		left.anyBusy === right.anyBusy &&
+		left.rootLoops.value === right.rootLoops.value &&
+		left.rootLoops.paused === right.rootLoops.paused &&
+		left.domainLoops.value === right.domainLoops.value &&
+		left.domainLoops.paused === right.domainLoops.paused &&
+		left.activeMs.value === right.activeMs.value &&
+		left.activeMs.paused === right.activeMs.paused
+	);
+}
+
+function validId(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function validRevision(value: unknown): value is string {
+	return typeof value === "string" && /^[1-9]\d*$/.test(value);
+}
+
+function validCounterValue(value: unknown): value is string {
+	return typeof value === "string" && /^\d+$/.test(value);
+}
+
+function parseRevisionMap(value: unknown): Map<string, bigint> | null {
+	if (!Array.isArray(value)) return null;
+	const parsed = new Map<string, bigint>();
+	for (const entry of value) {
+		if (
+			typeof entry !== "object" ||
+			entry === null ||
+			!validId((entry as Partial<RevisionWire>).nodeId) ||
+			!validRevision((entry as Partial<RevisionWire>).revision) ||
+			parsed.has((entry as RevisionWire).nodeId)
+		) {
+			return null;
+		}
+		parsed.set(
+			(entry as RevisionWire).nodeId,
+			BigInt((entry as RevisionWire).revision),
+		);
+	}
+	return parsed;
+}
+
+function parseActivity(
+	value: unknown,
+): { busy: boolean; revision: bigint } | null {
+	if (typeof value !== "object" || value === null) return null;
+	const wire = value as Partial<ActivityWire>;
+	if (typeof wire.busy !== "boolean" || !validRevision(wire.revision))
+		return null;
+	return { busy: wire.busy, revision: BigInt(wire.revision) };
+}
+
+function parseLoop(value: unknown): {
+	revision: bigint;
+	rootLoops: bigint;
+	domainLoops: bigint;
+} | null {
+	if (typeof value !== "object" || value === null) return null;
+	const wire = value as Partial<LoopWire>;
+	if (
+		!validRevision(wire.revision) ||
+		!validCounterValue(wire.rootLoops) ||
+		!validCounterValue(wire.domainLoops)
+	)
+		return null;
+	const revision = BigInt(wire.revision);
+	const rootLoops = BigInt(wire.rootLoops);
+	const domainLoops = BigInt(wire.domainLoops);
+	if (domainLoops !== revision || rootLoops > domainLoops) return null;
+	return { revision, rootLoops, domainLoops };
+}
+
+function parseCounters(
+	value: unknown,
+	nodeId: string,
+): ParsedCounterMessage | null {
+	if (typeof value !== "object" || value === null) return null;
+	const wire = value as Partial<CountersWire>;
+	const activityRevisions = parseRevisionMap(wire.activityRevisions);
+	const loopRevisions = parseRevisionMap(wire.loopRevisions);
+	if (
+		!validRevision(wire.revision) ||
+		!validRevision(wire.generation) ||
+		!validId(wire.domainEpoch) ||
+		typeof wire.certain !== "boolean" ||
+		typeof wire.paused !== "boolean" ||
+		typeof wire.anyBusy !== "boolean" ||
+		!validCounterValue(wire.rootLoops) ||
+		!validCounterValue(wire.domainLoops) ||
+		!validCounterValue(wire.activeMs) ||
+		activityRevisions === null ||
+		loopRevisions === null
+	) {
+		return null;
+	}
+	const generation = BigInt(wire.generation);
+	return {
+		counters: {
+			domainEpoch: wire.domainEpoch,
+			revision: BigInt(wire.revision),
+			generation,
+			certain: wire.certain,
+			anyBusy: wire.anyBusy,
+			fence: { domainEpoch: wire.domainEpoch, generation },
+			rootLoops: counter(BigInt(wire.rootLoops), wire.paused),
+			domainLoops: counter(BigInt(wire.domainLoops), wire.paused),
+			activeMs: counter(BigInt(wire.activeMs), wire.paused),
+		},
+		activityRevision: activityRevisions.get(nodeId) ?? 0n,
+		loopRevision: loopRevisions.get(nodeId) ?? 0n,
+	};
+}
+
+function revisionMap(
+	value: ReadonlyMap<string, bigint>,
+): readonly RevisionWire[] {
+	return Array.from(value)
+		.filter(([, revision]) => revision > 0n)
+		.map(([nodeId, revision]) => ({
+			nodeId,
+			revision: revision.toString(),
+		}));
+}
+
 export function createReflectDomainCoordinator(
 	options: ReflectDomainOptions = {},
 ): ReflectDomainCoordinator {
-	const open = options.open ?? openDomain;
+	const open = options.open ?? openProcessDomain;
+	const env = options.env ?? process.env;
 	const clock = options.clock ?? {
 		setTimeout: (callback: () => void, delayMs: number) =>
 			setTimeout(callback, delayMs),
@@ -72,102 +320,286 @@ export function createReflectDomainCoordinator(
 	const idleGraceMs = options.idleGraceMs ?? IDLE_GRACE_MS;
 	const attachments = new Map<object, Attachment>();
 	const listeners = new Set<(counters: ReflectDomainCounters) => void>();
-	const reclaiming = new Set<string>();
-	let domain: ProcessDomain | undefined;
+	const peers = new Map<string, PeerActivity>();
+	const uncertainPeers = new Set<string>();
+	let node: ProcessDomainNode | undefined;
 	let rootProcess = false;
 	let opening: Promise<void> | undefined;
 	let countersValue: ReflectDomainCounters | undefined;
+	let hostState: ReflectDomainCounters | undefined;
+	let hostStateRevision = 0n;
+	let acceptedHostRevision = 0n;
+	let acceptedHostEpoch: string | undefined;
 	let paused = false;
+	let transportHealthy = true;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let idleGrace: ReturnType<typeof setTimeout> | undefined;
-	let unsubscribeDomain: (() => void) | undefined;
-	let unsubscribeCounters: Array<() => void> = [];
+	let unsubscribeEvents: (() => void) | undefined;
+	let unsubscribeActivity: (() => void) | undefined;
+	let unsubscribeLoops: (() => void) | undefined;
+	let unsubscribeCounters: (() => void) | undefined;
+	let unsubscribeLeave: (() => void) | undefined;
 	let writeTail = Promise.resolve();
+	let lifecycleTail = Promise.resolve();
+	let snapshotRevision = 0n;
+	let snapshotGeneration = 0n;
+	let localActivityRevision = 0n;
+	let localLoopRevision = 0n;
+	let localRootLoops = 0n;
+	let localDomainLoops = 0n;
+	let requiredActivityRevision = 0n;
+	let requiredLoopRevision = 0n;
+
+	const desiredActivity = (): boolean =>
+		Array.from(attachments.values()).some((attachment) => attachment.busy);
 
 	const notify = (next: ReflectDomainCounters): void => {
+		if (countersValue !== undefined && sameCounters(countersValue, next))
+			return;
 		countersValue = next;
 		for (const listener of Array.from(listeners)) {
 			try {
 				listener(next);
 			} catch {
-				// Observers cannot corrupt broker state or the writer queue.
+				// Observers cannot corrupt coordinator state or the writer queue.
 			}
 		}
 	};
 
-	const readCounters = async (): Promise<ReflectDomainCounters> => {
-		if (!domain) throw new Error("reflection process domain is not attached");
-		const names = counterNames();
-		const [rootLoops, domainLoops, activeMs] = await Promise.all([
-			domain.getCycleCounter(names.rootLoops),
-			domain.getCycleCounter(names.domainLoops),
-			domain.getCycleCounter(names.activeMs),
-		]);
-		const next = { rootLoops, domainLoops, activeMs };
-		notify(next);
-		return next;
+	const markClientUncertain = (): void => {
+		countersValue = undefined;
 	};
 
-	const generation = (name: CounterName): bigint => {
-		const current = countersValue?.[name];
-		if (!current || current.generation === 0n)
-			throw new Error(`reflection counter ${name} is not claimed`);
-		return current.generation;
+	const queueLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+		const result = lifecycleTail.catch(() => {}).then(operation);
+		lifecycleTail = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
 	};
 
-	const increment = (
-		name: CounterName,
-		delta: bigint,
-	): Promise<ReflectDomainCounters> => {
-		const operation = writeTail
-			.catch(() => {})
-			.then(async () => {
-				if (!domain)
-					throw new Error("reflection process domain is not attached");
-				const counter = await domain.incrementCycleCounter(
-					counterNames()[name],
-					delta,
-					generation(name),
+	const queueTransport = <T>(operation: () => Promise<T>): Promise<T> => {
+		const result = writeTail.catch(() => {}).then(operation);
+		writeTail = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
+	};
+
+	const markTransportUncertain = (forceTransport = false): void => {
+		if (node === undefined) return;
+		if (!rootProcess) {
+			markClientUncertain();
+			return;
+		}
+		let changed = false;
+		if (forceTransport && transportHealthy) {
+			transportHealthy = false;
+			changed = true;
+		}
+		for (const peer of node.peers()) {
+			if (
+				peer.status === "offline" &&
+				peers.has(peer.nodeId) &&
+				!uncertainPeers.has(peer.nodeId)
+			) {
+				uncertainPeers.add(peer.nodeId);
+				changed = true;
+			}
+		}
+		if (!changed) return;
+		hostStateRevision += 1n;
+		const current = countersValue ?? hostCounters();
+		if (!current.certain) return;
+		snapshotRevision += 1n;
+		snapshotGeneration += 1n;
+		const domainEpoch = node.declaration.domainId;
+		notify({
+			...current,
+			domainEpoch,
+			revision: snapshotRevision,
+			generation: snapshotGeneration,
+			certain: false,
+			fence: { domainEpoch, generation: snapshotGeneration },
+		});
+	};
+
+	const reportFatal = (error: Error, forceTransport = false): void => {
+		markTransportUncertain(forceTransport);
+		for (const attachment of attachments.values()) {
+			try {
+				attachment.onFatal(error);
+			} catch {
+				// Fatal ownership remains with the host adapter.
+			}
+		}
+	};
+
+	const hostCounters = (): ReflectDomainCounters => {
+		const current = hostState ?? zeroCounters(paused);
+		return {
+			...current,
+			rootLoops: counter(current.rootLoops.value, paused),
+			domainLoops: counter(current.domainLoops.value, paused),
+			activeMs: counter(current.activeMs.value, paused),
+		};
+	};
+
+	const hostBusy = (): boolean => {
+		if (desiredActivity()) return true;
+		for (const peer of peers.values()) if (peer.busy) return true;
+		return false;
+	};
+
+	const hostCertain = (): boolean =>
+		transportHealthy && uncertainPeers.size === 0;
+
+	const publishHostNow = async (): Promise<void> => {
+		if (!rootProcess || node === undefined) return;
+		const current = hostCounters();
+		const publishedStateRevision = hostStateRevision;
+		snapshotRevision += 1n;
+		snapshotGeneration += 1n;
+		const domainEpoch = node.declaration.domainId;
+		const counters: ReflectDomainCounters = {
+			...current,
+			domainEpoch,
+			revision: snapshotRevision,
+			generation: snapshotGeneration,
+			certain: uncertainPeers.size === 0,
+			anyBusy: hostBusy(),
+			fence: { domainEpoch, generation: snapshotGeneration },
+		};
+		const activityRevisions = new Map<string, bigint>();
+		const loopRevisions = new Map<string, bigint>();
+		for (const [nodeId, peer] of peers) {
+			activityRevisions.set(nodeId, peer.activityRevision);
+			loopRevisions.set(nodeId, peer.loopRevision);
+		}
+		const message: CountersWire = {
+			revision: snapshotRevision.toString(),
+			generation: snapshotGeneration.toString(),
+			domainEpoch,
+			certain: counters.certain,
+			paused,
+			anyBusy: counters.anyBusy,
+			rootLoops: counters.rootLoops.value.toString(),
+			domainLoops: counters.domainLoops.value.toString(),
+			activeMs: counters.activeMs.value.toString(),
+			activityRevisions: revisionMap(activityRevisions),
+			loopRevisions: revisionMap(loopRevisions),
+		};
+		await node.broadcast(COUNTERS_CHANNEL, message);
+		transportHealthy = true;
+		if (publishedStateRevision === hostStateRevision) notify(counters);
+	};
+
+	const publishHost = (): Promise<void> =>
+		queueTransport(async () => {
+			try {
+				await publishHostNow();
+			} catch (error) {
+				reportFatal(
+					error instanceof Error
+						? error
+						: new Error("reflection transport write failed"),
+					true,
 				);
-				const current = countersValue ?? (await readCounters());
-				const next = { ...current, [name]: counter } as ReflectDomainCounters;
-				// Broker broadcasts are the only listener notification path. Updating the
-				// local cache here only makes sequential writes use the committed value.
-				countersValue = next;
-				return next;
-			});
-		writeTail = operation.then(
-			() => {},
-			() => {},
-		);
-		return operation;
+				throw error;
+			}
+		});
+
+	const applyHostActivity = (message: ProcessDomainDataMessage): void => {
+		if (!rootProcess || node === undefined) return;
+		const peer = node
+			.peers()
+			.find((candidate) => candidate.nodeId === message.senderId);
+		if (peer?.status !== "online") return;
+		const activity = parseActivity(message.value);
+		const current = peers.get(message.senderId);
+		if (
+			activity === null ||
+			current === undefined ||
+			activity.revision <= current.activityRevision
+		)
+			return;
+		current.busy = activity.busy;
+		current.activityRevision = activity.revision;
+		hostStateRevision += 1n;
+		uncertainPeers.delete(message.senderId);
+		void publishHost()
+			.then(updateHostTimers)
+			.catch(() => {});
 	};
 
-	const anyBusy = (): boolean =>
-		Array.from(attachments.values()).some((attachment) => attachment.busy);
+	const applyHostLoop = (message: ProcessDomainDataMessage): void => {
+		if (!rootProcess || node === undefined) return;
+		const peer = node
+			.peers()
+			.find((candidate) => candidate.nodeId === message.senderId);
+		if (peer?.status !== "online") return;
+		const loop = parseLoop(message.value);
+		const current = peers.get(message.senderId);
+		if (
+			loop === null ||
+			current === undefined ||
+			loop.revision <= current.loopRevision ||
+			loop.rootLoops < current.rootLoops ||
+			loop.domainLoops < current.domainLoops
+		)
+			return;
+		const rootDelta = loop.rootLoops - current.rootLoops;
+		const domainDelta = loop.domainLoops - current.domainLoops;
+		current.loopRevision = loop.revision;
+		current.rootLoops = loop.rootLoops;
+		current.domainLoops = loop.domainLoops;
+		hostStateRevision += 1n;
+		if (!paused) {
+			const currentCounters = hostCounters();
+			hostState = {
+				...currentCounters,
+				rootLoops: counter(currentCounters.rootLoops.value + rootDelta, paused),
+				domainLoops: counter(
+					currentCounters.domainLoops.value + domainDelta,
+					paused,
+				),
+			};
+		}
+		void publishHost().catch(() => {});
+	};
 
-	const resetContinuousActive = async (): Promise<void> => {
-		if (!rootProcess || !domain || !countersValue || paused) return;
-		const activeMs = await domain.resetCycleCounter(
-			counterNames().activeMs,
-			countersValue.activeMs.generation,
-		);
-		countersValue = { ...countersValue, activeMs };
+	const clearIdleGrace = (): void => {
+		if (idleGrace !== undefined) clock.clearTimeout(idleGrace);
+		idleGrace = undefined;
+	};
+
+	const resetContinuousActive = (): void => {
+		if (!rootProcess || paused) return;
+		const current = hostCounters();
+		hostStateRevision += 1n;
+		hostState = { ...current, activeMs: counter(0n, paused) };
+		void publishHost().catch(() => {});
 	};
 
 	const scheduleTick = (): void => {
-		if (!rootProcess || !domain || tick !== undefined || paused) return;
-		tick = clock.setTimeout(async () => {
+		if (!rootProcess || node === undefined || tick !== undefined || paused)
+			return;
+		tick = clock.setTimeout(() => {
 			tick = undefined;
-			if (!domain || paused) return;
-			if (domain.snapshot().busyParticipants > 0) {
-				try {
-					await increment("activeMs", BigInt(activeTickMs));
-				} catch {
-					// Runtime reconnect makes the snapshot uncertain; the next tick retries.
-				}
-			}
-			if (anyBusy() || domain.snapshot().busyParticipants > 0) {
+			if (!rootProcess || paused || !hostCertain()) return;
+			if (hostBusy()) {
+				const current = hostCounters();
+				hostStateRevision += 1n;
+				hostState = {
+					...current,
+					activeMs: counter(
+						current.activeMs.value + BigInt(activeTickMs),
+						paused,
+					),
+				};
+				void publishHost().catch(() => {});
 				scheduleTick();
 				return;
 			}
@@ -177,116 +609,252 @@ export function createReflectDomainCoordinator(
 	};
 
 	const startIdleGrace = (): void => {
-		if (!rootProcess || !domain || paused || idleGrace !== undefined) return;
+		if (!rootProcess || paused || idleGrace !== undefined) return;
 		idleGrace = clock.setTimeout(() => {
 			idleGrace = undefined;
-			if (!domain || paused) return;
-			if (anyBusy() || domain.snapshot().busyParticipants > 0) {
+			if (!rootProcess || paused || !hostCertain()) return;
+			if (hostBusy()) {
 				scheduleTick();
 				return;
 			}
-			void resetContinuousActive().catch(() => {});
+			resetContinuousActive();
 		}, idleGraceMs);
 		idleGrace.unref?.();
 	};
 
-	const installCounterSubscriptions = (opened: ProcessDomain): void => {
-		const names = counterNames();
-		const keyByName = new Map(
-			(Object.entries(names) as Array<[CounterName, string]>).map(
-				([key, name]) => [name, key] as const,
-			),
-		);
-		for (const name of Object.values(names)) {
-			unsubscribeCounters.push(
-				opened.subscribeCycleCounter(name, (counter) => {
-					const key = keyByName.get(counter.name);
-					if (!key || !countersValue) return;
-					if (
-						rootProcess &&
-						counter.ownerParticipantId === null &&
-						!reclaiming.has(counter.name)
-					) {
-						reclaiming.add(counter.name);
-						void opened
-							.claimCycleCounter(counter.name)
-							.then((claimed) => {
-								if (!countersValue) return;
-								const current = countersValue[key];
-								if (
-									current.value === claimed.value &&
-									current.paused === claimed.paused &&
-									current.generation === claimed.generation &&
-									current.ownerParticipantId === claimed.ownerParticipantId
-								)
-									return;
-								const next = {
-									...countersValue,
-									[key]: claimed,
-								} as ReflectDomainCounters;
-								if (key === "rootLoops") countersValue = next;
-								else notify(next);
-							})
-							.catch(() => {})
-							.finally(() => reclaiming.delete(counter.name));
-						return;
-					}
-					const current = countersValue[key];
-					if (
-						current.value === counter.value &&
-						current.paused === counter.paused &&
-						current.generation === counter.generation &&
-						current.ownerParticipantId === counter.ownerParticipantId
-					)
-						return;
-					const next = {
-						...countersValue,
-						[key]: counter,
-					} as ReflectDomainCounters;
-					if (key === "rootLoops") countersValue = next;
-					else notify(next);
-				}),
-			);
+	const updateHostTimers = (): void => {
+		if (!rootProcess || paused || !hostCertain()) return;
+		if (hostBusy()) {
+			clearIdleGrace();
+			scheduleTick();
+			return;
 		}
+		if (tick !== undefined) {
+			clock.clearTimeout(tick);
+			tick = undefined;
+		}
+		startIdleGrace();
+	};
+
+	const handleTransportEvent = (event: ProcessDomainEvent): void => {
+		if (event.type !== "peer" || node === undefined) return;
+		if (!rootProcess) {
+			if (event.peer.nodeId !== node.declaration.hostNodeId) return;
+			if (event.peer.status === "offline") markClientUncertain();
+			else {
+				markClientUncertain();
+				void (async () => {
+					await queueWrite("activity");
+					await queueLoopSnapshot();
+				})().catch(() => {});
+			}
+			return;
+		}
+		if (event.peer.status === "online") {
+			if (peers.has(event.peer.nodeId)) return;
+			peers.set(event.peer.nodeId, {
+				busy: event.peer.metadata.activity === "busy",
+				activityRevision: 0n,
+				loopRevision: 0n,
+				rootLoops: 0n,
+				domainLoops: 0n,
+			});
+			uncertainPeers.add(event.peer.nodeId);
+		} else {
+			if (!peers.has(event.peer.nodeId)) return;
+			uncertainPeers.add(event.peer.nodeId);
+		}
+		hostStateRevision += 1n;
+		void publishHost().catch(() => {});
+		updateHostTimers();
+	};
+
+	const queueWrite = (
+		kind: "activity" | "root-loop" | "domain-loop",
+	): Promise<void> => {
+		const clientWrite =
+			node !== undefined && !rootProcess
+				? kind === "activity"
+					? {
+							kind,
+							revision: ++localActivityRevision,
+							busy: desiredActivity(),
+						}
+					: {
+							kind,
+							revision: ++localLoopRevision,
+							rootLoops:
+								kind === "root-loop" ? ++localRootLoops : localRootLoops,
+							domainLoops: ++localDomainLoops,
+						}
+				: undefined;
+		if (clientWrite?.kind === "activity") {
+			requiredActivityRevision = clientWrite.revision;
+			markClientUncertain();
+		} else if (clientWrite !== undefined) {
+			requiredLoopRevision = clientWrite.revision;
+			markClientUncertain();
+		}
+		return queueTransport(async () => {
+			if (node === undefined || rootProcess || clientWrite === undefined)
+				return;
+			try {
+				if (clientWrite.kind === "activity") {
+					await node.send(node.declaration.hostNodeId, ACTIVITY_CHANNEL, {
+						revision: clientWrite.revision.toString(),
+						busy: clientWrite.busy,
+					} satisfies ActivityWire);
+					return;
+				}
+				await node.send(node.declaration.hostNodeId, LOOP_CHANNEL, {
+					revision: clientWrite.revision.toString(),
+					rootLoops: clientWrite.rootLoops.toString(),
+					domainLoops: clientWrite.domainLoops.toString(),
+				} satisfies LoopWire);
+			} catch (error) {
+				reportFatal(
+					error instanceof Error
+						? error
+						: new Error("reflection transport write failed"),
+				);
+				throw error;
+			}
+		});
+	};
+
+	const queueLoopSnapshot = (): Promise<void> => {
+		if (node === undefined || rootProcess || localLoopRevision === 0n)
+			return Promise.resolve();
+		const target = node.declaration.hostNodeId;
+		const revision = localLoopRevision;
+		const rootLoops = localRootLoops;
+		const domainLoops = localDomainLoops;
+		requiredLoopRevision = revision;
+		markClientUncertain();
+		return queueTransport(async () => {
+			if (node === undefined || rootProcess) return;
+			try {
+				await node.send(target, LOOP_CHANNEL, {
+					revision: revision.toString(),
+					rootLoops: rootLoops.toString(),
+					domainLoops: domainLoops.toString(),
+				} satisfies LoopWire);
+			} catch (error) {
+				reportFatal(
+					error instanceof Error
+						? error
+						: new Error("reflection transport write failed"),
+				);
+				throw error;
+			}
+		});
 	};
 
 	const ensureOpen = (): Promise<void> => {
 		if (opening) return opening;
 		opening = (async () => {
-			const result = await open({
-				initialActivity: anyBusy() ? "busy" : "idle",
-				metadata: { role: "pi-reflect-watchdog", pid: String(process.pid) },
-			});
-			domain = result.domain;
-			rootProcess = result.hosted;
-			if (rootProcess) {
-				const names = counterNames();
-				const rootLoops = await domain.claimCycleCounter(names.rootLoops);
-				const domainLoops = await domain.claimCycleCounter(names.domainLoops);
-				const activeMs = await domain.claimCycleCounter(names.activeMs);
-				notify({ rootLoops, domainLoops, activeMs });
-			} else await readCounters();
-			installCounterSubscriptions(domain);
-			unsubscribeDomain = domain.subscribe((snapshot) => {
-				if (!rootProcess || paused) return;
-				if (snapshot.busyParticipants > 0) {
-					if (idleGrace) clock.clearTimeout(idleGrace);
-					idleGrace = undefined;
-					scheduleTick();
-				} else if (tick === undefined) startIdleGrace();
-			});
-		})().catch((error) => {
-			for (const attachment of attachments.values()) {
-				try {
-					attachment.onFatal(
-						error instanceof Error ? error : new Error(String(error)),
-					);
-				} catch {
-					// Fatal ownership remains with the host adapter.
-				}
+			let opened: ProcessDomainNode;
+			try {
+				opened = await open({
+					env,
+					metadata: {
+						role: "pi-reflect-watchdog",
+						pid: String(process.pid),
+						activity: desiredActivity() ? "busy" : "idle",
+					},
+					onError: (error) => reportFatal(error, rootProcess && peers.size > 0),
+				});
+			} catch (error) {
+				throw new ReflectDomainFatalError(
+					isProcessDomainOpenError(error) ? error.code : "DOMAIN_UNRECOVERABLE",
+					"failed to initialize reflect-watchdog process transport",
+					{ cause: error },
+				);
 			}
+			node = opened;
+			rootProcess = opened.role === "host";
+			if (rootProcess) {
+				hostState = zeroCounters(false, {
+					domainEpoch: opened.declaration.domainId,
+					certain: true,
+				});
+				countersValue = hostState;
+				paused = false;
+				transportHealthy = true;
+				snapshotRevision = 0n;
+				snapshotGeneration = 0n;
+				unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
+				unsubscribeActivity = opened.subscribe(
+					ACTIVITY_CHANNEL,
+					applyHostActivity,
+				);
+				unsubscribeLoops = opened.subscribe(LOOP_CHANNEL, applyHostLoop);
+				unsubscribeLeave = opened.subscribe(LEAVE_CHANNEL, (message) => {
+					if (!peers.delete(message.senderId)) return;
+					uncertainPeers.delete(message.senderId);
+					hostStateRevision += 1n;
+					void publishHost()
+						.then(updateHostTimers)
+						.catch(() => {});
+				});
+				await publishHost();
+				return;
+			}
+			unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
+			unsubscribeCounters = opened.subscribe(COUNTERS_CHANNEL, (message) => {
+				if (message.senderId !== opened.declaration.hostNodeId) return;
+				const host = opened
+					.peers()
+					.find((peer) => peer.nodeId === opened.declaration.hostNodeId);
+				if (host?.status !== "online") return;
+				const parsed = parseCounters(message.value, opened.nodeId);
+				if (
+					parsed === null ||
+					parsed.counters.domainEpoch !== opened.declaration.domainId ||
+					(acceptedHostEpoch !== undefined &&
+						parsed.counters.domainEpoch !== acceptedHostEpoch) ||
+					parsed.counters.revision <= acceptedHostRevision ||
+					parsed.activityRevision < requiredActivityRevision ||
+					parsed.loopRevision < requiredLoopRevision
+				)
+					return;
+				acceptedHostEpoch = parsed.counters.domainEpoch;
+				acceptedHostRevision = parsed.counters.revision;
+				countersValue = parsed.counters;
+				for (const listener of Array.from(listeners)) {
+					try {
+						listener(parsed.counters);
+					} catch {
+						// Listener failures are isolated from coordinator state.
+					}
+				}
+			});
+			await queueWrite("activity");
+		})().catch(async (error) => {
+			const fatal = isReflectDomainFatalError(error)
+				? error
+				: new ReflectDomainFatalError(
+						"CONNECTION_UNAVAILABLE",
+						"failed to publish initial reflect-watchdog state",
+						{ cause: error },
+					);
+			reportFatal(fatal);
+			unsubscribeEvents?.();
+			unsubscribeActivity?.();
+			unsubscribeLoops?.();
+			unsubscribeCounters?.();
+			unsubscribeLeave?.();
+			unsubscribeEvents = undefined;
+			unsubscribeActivity = undefined;
+			unsubscribeLoops = undefined;
+			unsubscribeCounters = undefined;
+			unsubscribeLeave = undefined;
+			const failedNode = node;
+			node = undefined;
+			rootProcess = false;
 			opening = undefined;
-			throw error;
+			await failedNode?.close().catch(() => {});
+			throw fatal;
 		});
 		return opening;
 	};
@@ -296,47 +864,115 @@ export function createReflectDomainCoordinator(
 			return rootProcess;
 		},
 		attach(instance, onFatal) {
-			if (!attachments.has(instance))
+			return queueLifecycle(async () => {
+				if (attachments.has(instance)) return;
 				attachments.set(instance, { busy: false, onFatal });
-			return ensureOpen();
+				const alreadyOpen = node !== undefined;
+				try {
+					await ensureOpen();
+					if (alreadyOpen) await queueWrite("activity");
+				} catch (error) {
+					attachments.delete(instance);
+					throw error;
+				}
+			});
 		},
-		async detach(instance) {
-			attachments.delete(instance);
-			if (attachments.size !== 0 || !domain) return;
-			if (tick) clock.clearTimeout(tick);
-			if (idleGrace) clock.clearTimeout(idleGrace);
-			unsubscribeDomain?.();
-			for (const unsubscribe of unsubscribeCounters) unsubscribe();
-			unsubscribeCounters = [];
-			reclaiming.clear();
-			tick = undefined;
-			idleGrace = undefined;
-			unsubscribeDomain = undefined;
-			const closing = domain;
-			domain = undefined;
-			opening = undefined;
-			countersValue = undefined;
-			rootProcess = false;
-			await closing.close();
+		detach(instance) {
+			return queueLifecycle(async () => {
+				if (!attachments.delete(instance)) return;
+				if (attachments.size !== 0) {
+					await queueWrite("activity");
+					return;
+				}
+				if (node !== undefined && !rootProcess) {
+					await queueTransport(() =>
+						node === undefined
+							? Promise.resolve()
+							: node.send(node.declaration.hostNodeId, LEAVE_CHANNEL, {
+									version: 1,
+								}),
+					).catch(() => {});
+				}
+				await writeTail.catch(() => {});
+				unsubscribeEvents?.();
+				unsubscribeActivity?.();
+				unsubscribeLoops?.();
+				unsubscribeCounters?.();
+				unsubscribeLeave?.();
+				unsubscribeEvents = undefined;
+				unsubscribeActivity = undefined;
+				unsubscribeLoops = undefined;
+				unsubscribeCounters = undefined;
+				unsubscribeLeave = undefined;
+				if (tick !== undefined) clock.clearTimeout(tick);
+				clearIdleGrace();
+				tick = undefined;
+				const closing = node;
+				node = undefined;
+				rootProcess = false;
+				opening = undefined;
+				countersValue = undefined;
+				hostState = undefined;
+				hostStateRevision = 0n;
+				acceptedHostRevision = 0n;
+				acceptedHostEpoch = undefined;
+				paused = false;
+				transportHealthy = true;
+				peers.clear();
+				uncertainPeers.clear();
+				snapshotRevision = 0n;
+				snapshotGeneration = 0n;
+				localActivityRevision = 0n;
+				localLoopRevision = 0n;
+				localRootLoops = 0n;
+				localDomainLoops = 0n;
+				requiredActivityRevision = 0n;
+				requiredLoopRevision = 0n;
+				await closing?.close();
+			});
 		},
 		async setBusy(instance, busy) {
 			const attachment = attachments.get(instance);
-			if (!attachment || !domain) return;
+			if (attachment === undefined) return;
 			attachment.busy = busy;
-			await domain.setActivity(anyBusy() ? "busy" : "idle");
-			if (busy) {
-				if (idleGrace) clock.clearTimeout(idleGrace);
-				idleGrace = undefined;
-				scheduleTick();
+			if (rootProcess) hostStateRevision += 1n;
+			await queueWrite("activity");
+			if (rootProcess) {
+				await publishHost();
+				updateHostTimers();
 			}
 		},
 		async recordRootLoop() {
-			if (!rootProcess) return increment("domainLoops", 1n);
-			await increment("rootLoops", 1n);
-			return increment("domainLoops", 1n);
+			if (!rootProcess || paused) {
+				if (!rootProcess) await queueWrite("root-loop");
+				return countersValue ?? zeroCounters(paused);
+			}
+			const current = hostCounters();
+			hostStateRevision += 1n;
+			hostState = {
+				...current,
+				rootLoops: counter(current.rootLoops.value + 1n, false),
+				domainLoops: counter(current.domainLoops.value + 1n, false),
+				activeMs: counter(current.activeMs.value, false),
+			};
+			await publishHost();
+			updateHostTimers();
+			return countersValue ?? hostCounters();
 		},
-		recordDomainLoop() {
-			return increment("domainLoops", 1n);
+		async recordDomainLoop() {
+			if (!rootProcess) {
+				await queueWrite("domain-loop");
+				return countersValue ?? zeroCounters(true);
+			}
+			if (paused) return hostCounters();
+			const current = hostCounters();
+			hostStateRevision += 1n;
+			hostState = {
+				...current,
+				domainLoops: counter(current.domainLoops.value + 1n, false),
+			};
+			await publishHost();
+			return countersValue ?? hostCounters();
 		},
 		counters() {
 			return countersValue;
@@ -346,45 +982,40 @@ export function createReflectDomainCoordinator(
 			return () => listeners.delete(listener);
 		},
 		async pauseAndReset() {
-			if (!domain || !rootProcess || !countersValue) return countersValue;
+			if (!rootProcess || countersValue === undefined) return countersValue;
 			paused = true;
-			if (tick) clock.clearTimeout(tick);
+			if (tick !== undefined) clock.clearTimeout(tick);
 			tick = undefined;
-			const names = counterNames();
-			for (const name of Object.keys(names) as CounterName[]) {
-				const counter = countersValue[name];
-				await domain.setCycleCounterPaused(
-					names[name],
-					true,
-					counter.generation,
-				);
-			}
-			const before = await readCounters();
-			for (const name of Object.keys(names) as CounterName[]) {
-				const counter = before[name];
-				await domain.resetCycleCounter(names[name], counter.generation);
-			}
-			return readCounters();
+			clearIdleGrace();
+			hostStateRevision += 1n;
+			hostState = zeroCounters(true, {
+				domainEpoch: countersValue.domainEpoch,
+				revision: countersValue.revision,
+				generation: countersValue.generation,
+				certain: countersValue.certain,
+				anyBusy: countersValue.anyBusy,
+			});
+			await publishHost();
+			return countersValue;
 		},
 		async resume() {
-			if (!domain || !rootProcess || !countersValue) return;
-			const names = counterNames();
-			for (const name of Object.keys(names) as CounterName[]) {
-				const counter = countersValue[name];
-				await domain.setCycleCounterPaused(
-					names[name],
-					false,
-					counter.generation,
-				);
-			}
+			if (!rootProcess || countersValue === undefined) return;
 			paused = false;
-			if (anyBusy() || domain.snapshot().busyParticipants > 0) scheduleTick();
-			await readCounters();
+			hostStateRevision += 1n;
+			hostState = zeroCounters(false, {
+				domainEpoch: countersValue.domainEpoch,
+				revision: countersValue.revision,
+				generation: countersValue.generation,
+				certain: countersValue.certain,
+				anyBusy: countersValue.anyBusy,
+			});
+			await publishHost();
+			updateHostTimers();
 		},
 	};
 }
 
-const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v1");
+const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v2");
 type SharedHost = typeof globalThis & { [SHARED]?: ReflectDomainCoordinator };
 
 export function getReflectDomainCoordinator(): ReflectDomainCoordinator {
