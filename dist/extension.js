@@ -386,7 +386,11 @@ function finalizeReflection(runtime, services, report, decision) {
                 content: historyEntry.report,
                 display: true,
                 details: historyEntry,
-            }, { deliverAs: "nextTurn", triggerTurn: true });
+            }, 
+            // message_end runs while the reflection agent loop is still active.
+            // Steer the readable correction into that loop so continuation does
+            // not wait for another user prompt.
+            { deliverAs: "steer", triggerTurn: true });
         }
     }
     runtime.activeReflection = undefined;
@@ -625,6 +629,14 @@ export function createWatchdogExtension(overrides = {}) {
                 !active.submitted ||
                 event.message.role !== "assistant")
                 return;
+            // Pi applies this replacement before rendering, agent-state reduction,
+            // and session persistence. Reflection XML is internal protocol output.
+            const replacement = {
+                message: {
+                    ...event.message,
+                    content: [],
+                },
+            };
             active.submitted = false;
             const text = event.message.content
                 .filter((block) => block.type === "text")
@@ -644,12 +656,13 @@ export function createWatchdogExtension(overrides = {}) {
                             ...PROCESS_DOMAIN_OBSERVATION_DETAILS,
                         },
                     }, { deliverAs: "steer", triggerTurn: true });
-                    return;
+                    return replacement;
                 }
                 finalizeReflection(runtime, services, `Reflection failed: ${validation.error}`);
-                return;
+                return replacement;
             }
             finalizeReflection(runtime, services, text, validation.decision);
+            return replacement;
         });
         pi.on("turn_end", () => {
             if (runtime.pausedForReflection || runtime.runActivity === "observation")
