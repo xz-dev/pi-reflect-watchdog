@@ -1,11 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 
 export const ROOT = path.resolve(import.meta.dirname, "../..");
 export const PI_BIN = path.join(ROOT, "node_modules", ".bin", "pi");
-export const STOCK_PI_VERSION = "0.82.1";
+const MANIFEST = JSON.parse(
+	readFileSync(path.join(ROOT, "package.json"), "utf8"),
+);
+export const STOCK_PI_VERSION =
+	MANIFEST.devDependencies["@earendil-works/pi-coding-agent"];
 const SUPPORTS_PROCESS_GROUPS = process.platform !== "win32";
 
 /**

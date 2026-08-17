@@ -29,8 +29,10 @@ jobs:
           sudo apt-get install -y tmux
           tmux -V
       - run: npm ci
-      - name: Assert stock Pi version
-        run: test "$(./node_modules/.bin/pi --version)" = "0.82.1"
+      - name: Assert Pi fixture matches the manifest
+        run: |
+          expected="$(node -p 'require("./package.json").devDependencies["@earendil-works/pi-coding-agent"]')"
+          test "$(./node_modules/.bin/pi --version)" = "$expected"
       - run: npm run check
       - name: Stock Pi dual-distribution E2E
         run: npm run test:e2e
