@@ -17,7 +17,7 @@ import {
 import { assertTmux, TmuxPi } from "../../scripts/e2e/tmux.mjs";
 
 function activeSeconds(capture) {
-	const match = capture.match(/Watchdog \| active (\d+)s\/\d+ loops/);
+	const match = capture.match(/Reflect Watchdog \| active (\d+)s\/\d+ loops/);
 	return match ? Number(match[1]) : undefined;
 }
 
@@ -62,10 +62,10 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		],
 	});
 	resources.add(() => tui.close());
-	await tui.waitFor(/Watchdog \| idle/);
+	await tui.waitFor(/Reflect Watchdog \| idle/);
 
 	tui.send("First real turn");
-	const first = await tui.waitFor(/Watchdog \| active \d+s\/0 loops/);
+	const first = await tui.waitFor(/Reflect Watchdog \| active \d+s\/0 loops/);
 	await new Promise((resolve) => setTimeout(resolve, 1_300));
 	const second = tui.capture();
 	assert.ok(

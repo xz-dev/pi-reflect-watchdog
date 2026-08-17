@@ -13,7 +13,7 @@ test("widget keeps one stable compact line", () => {
 		observedTotalLoops: 3,
 		observedTotalLoopLimit: 500,
 	});
-	assert.match(text, /Watchdog \| active 2m14s\/7 loops/);
+	assert.match(text, /Reflect Watchdog \| active 2m14s\/7 loops/);
 });
 
 test("timeline fallback is bounded", () => {

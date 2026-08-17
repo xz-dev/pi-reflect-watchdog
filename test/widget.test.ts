@@ -45,7 +45,7 @@ test("idle state renders the meaningful zero line", () => {
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Watchdog | idle · active 0s/0 loops · task 0s/30m · root 0/100 · observed 0/500",
+		"Reflect Watchdog | idle · active 0s/0 loops · task 0s/30m · root 0/100 · observed 0/500",
 	);
 });
 
@@ -65,7 +65,7 @@ test("live state renders the exact approved example format", () => {
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
 	);
 });
 
@@ -84,7 +84,7 @@ test("component renders one truncated line through truncateToWidth", () => {
 	assert.equal(full.length, 1);
 	assert.equal(
 		full[0],
-		"Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
 	);
 	width = 40;
 	const narrow = widget.render(width);
