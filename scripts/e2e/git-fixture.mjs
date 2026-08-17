@@ -24,6 +24,7 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"src/reflection-history.ts",
 	"src/reflection-protocol.ts",
 	"src/reflection-timeline.ts",
+	"src/run-activity.ts",
 	"src/widget.ts",
 	"tsconfig.check.json",
 	"tsconfig.json",

@@ -37,6 +37,8 @@ const DIST_FILES = [
 	"reflection-protocol.js",
 	"reflection-timeline.d.ts",
 	"reflection-timeline.js",
+	"run-activity.d.ts",
+	"run-activity.js",
 	"index.d.ts",
 	"index.js",
 	"prompts.d.ts",
