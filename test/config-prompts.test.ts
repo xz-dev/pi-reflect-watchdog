@@ -43,3 +43,28 @@ test("malformed config keeps built-in reflection prompt", () => {
 	);
 	assert.equal(BUILT_IN_CONFIG.reflectionPrompt, DEFAULT_REFLECTION_PROMPT);
 });
+
+test("built-in reflection prompt preserves the Oracle persona and framing", () => {
+	assert.match(DEFAULT_REFLECTION_PROMPT, /The Oracle from \*The Matrix\*/);
+	assert.match(
+		DEFAULT_REFLECTION_PROMPT,
+		/do not predict a future that is already fixed/,
+	);
+	assert.match(DEFAULT_REFLECTION_PROMPT, /think from first principles/);
+	assert.match(
+		DEFAULT_REFLECTION_PROMPT,
+		/Is the stated goal the result we truly want\?/,
+	);
+	assert.match(
+		DEFAULT_REFLECTION_PROMPT,
+		/Even if the current approach succeeds, will it solve the underlying problem\?/,
+	);
+	assert.match(DEFAULT_REFLECTION_PROMPT, /fear, inertia, sunk costs/);
+	assert.match(DEFAULT_REFLECTION_PROMPT, /Speak calmly, kindly, and directly/);
+	assert.match(DEFAULT_REFLECTION_PROMPT, /short questions, simple analogies/);
+	assert.match(
+		DEFAULT_REFLECTION_PROMPT,
+		/Distinguish facts from inference and uncertainty/,
+	);
+	assert.match(DEFAULT_REFLECTION_PROMPT, /Prioritize the one insight/);
+});
