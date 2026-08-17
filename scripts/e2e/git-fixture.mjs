@@ -19,7 +19,11 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"src/extension.ts",
 	"src/hub.ts",
 	"src/index.ts",
+	"src/process-domain.ts",
 	"src/prompts.ts",
+	"src/reflection-history.ts",
+	"src/reflection-protocol.ts",
+	"src/reflection-timeline.ts",
 	"src/widget.ts",
 	"tsconfig.check.json",
 	"tsconfig.json",
@@ -93,6 +97,8 @@ function commitAll(repository, message) {
 			"user.name=E2E",
 			"-c",
 			"user.email=e2e@example.invalid",
+			"-c",
+			"commit.gpgsign=false",
 			"commit",
 			"-m",
 			message,
@@ -117,7 +123,7 @@ async function addInvalidInstallBranch(source) {
 	const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 	manifest.dependencies = {
 		...manifest.dependencies,
-		"pi-watchdog-e2e-not-a-real-package": "9999.9999.9999",
+		"pi-reflect-watchdog-e2e-not-a-real-package": "9999.9999.9999",
 	};
 	await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 	run("git", ["add", "package.json"], { cwd: source });
@@ -128,6 +134,8 @@ async function addInvalidInstallBranch(source) {
 			"user.name=E2E",
 			"-c",
 			"user.email=e2e@example.invalid",
+			"-c",
+			"commit.gpgsign=false",
 			"commit",
 			"-m",
 			"invalid install fixture",
@@ -144,7 +152,7 @@ export async function createGitFixture(
 	const source = path.join(base, "source");
 	const releaseTree = candidateReleaseTree ?? path.join(base, "release-tree");
 	const remoteParent = path.join(base, "remotes", "xz-dev");
-	const bare = path.join(remoteParent, "pi-watchdog.git");
+	const bare = path.join(remoteParent, "pi-reflect-watchdog.git");
 	let daemon;
 	try {
 		await mkdir(remoteParent, { recursive: true });
@@ -172,6 +180,8 @@ export async function createGitFixture(
 				"user.name=E2E",
 				"-c",
 				"user.email=e2e@example.invalid",
+				"-c",
+				"commit.gpgsign=false",
 				"commit",
 				"-m",
 				"release fixture",
@@ -204,7 +214,7 @@ export async function createGitFixture(
 		await new Promise((resolve) => setTimeout(resolve, 150));
 		if (daemon.exitCode !== null)
 			throw new Error(`git daemon exited: ${stderr}`);
-		const baseSource = `git:git://127.0.0.1:${port}/xz-dev/pi-watchdog.git`;
+		const baseSource = `git:git://127.0.0.1:${port}/xz-dev/pi-reflect-watchdog.git`;
 		return {
 			masterSource: `${baseSource}@master`,
 			releaseSource: `${baseSource}@release`,
@@ -245,5 +255,11 @@ export async function installGitPackage(options) {
 }
 
 export function managedGitPath(agentDir) {
-	return path.join(agentDir, "git", "127.0.0.1", "xz-dev", "pi-watchdog");
+	return path.join(
+		agentDir,
+		"git",
+		"127.0.0.1",
+		"xz-dev",
+		"pi-reflect-watchdog",
+	);
 }

@@ -88,7 +88,7 @@ export async function promoteRelease({
 	}
 
 	const temporary = await mkdtemp(
-		path.join(os.tmpdir(), "pi-watchdog-release-"),
+		path.join(os.tmpdir(), "pi-reflect-watchdog-release-"),
 	);
 	const generated = path.join(temporary, "tree");
 	const index = path.join(temporary, "index");

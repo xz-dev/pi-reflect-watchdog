@@ -1,15 +1,10 @@
-import {
-	BUILT_IN_PROMPTS,
-	PROMPT_KINDS,
-	type PromptTemplateOverrides,
-	type PromptTemplates,
-} from "./prompts.js";
+import { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 
 export interface WatchdogConfig {
 	mainLoopLimit: number;
 	observedTotalLoopLimit: number;
 	wallClockMinutes: number;
-	prompts: PromptTemplates;
+	reflectionPrompt: string;
 }
 
 export type ConfigInput = Record<string, unknown>;
@@ -20,9 +15,7 @@ export interface ConfigDiagnostic {
 }
 
 export interface ConfigResult {
-	config: Partial<Omit<WatchdogConfig, "prompts">> & {
-		prompts?: PromptTemplateOverrides;
-	};
+	config: Partial<WatchdogConfig>;
 	diagnostics: ConfigDiagnostic[];
 }
 
@@ -35,10 +28,11 @@ export const BUILT_IN_CONFIG: Readonly<WatchdogConfig> = Object.freeze({
 	mainLoopLimit: 100,
 	observedTotalLoopLimit: 500,
 	wallClockMinutes: 30,
-	prompts: BUILT_IN_PROMPTS,
+	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
+const MAX_REFLECTION_PROMPT_CHARACTERS = 16_384;
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
@@ -52,6 +46,14 @@ function template(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
 
+function boundedPrompt(value: unknown): value is string {
+	return (
+		template(value) &&
+		value.trim().length > 0 &&
+		Array.from(value).length <= MAX_REFLECTION_PROMPT_CHARACTERS
+	);
+}
+
 export function validateConfig(source: string, value: unknown): ConfigResult {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
 		return {
@@ -63,6 +65,19 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 	const input = value as ConfigInput;
 	const config: ConfigResult["config"] = {};
 	const diagnostics: ConfigDiagnostic[] = [];
+	if (input.reflectionPrompt !== undefined) {
+		if (boundedPrompt(input.reflectionPrompt)) {
+			config.reflectionPrompt = input.reflectionPrompt;
+		} else {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`reflectionPrompt must be a non-empty string of at most ${MAX_REFLECTION_PROMPT_CHARACTERS} Unicode characters`,
+				),
+			);
+		}
+	}
+
 	for (const key of [
 		"mainLoopLimit",
 		"observedTotalLoopLimit",
@@ -74,28 +89,6 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			diagnostics.push(
 				diagnostic(source, `${key} must be a positive safe integer`),
 			);
-	}
-
-	if (input.prompts !== undefined) {
-		if (
-			input.prompts === null ||
-			typeof input.prompts !== "object" ||
-			Array.isArray(input.prompts)
-		) {
-			diagnostics.push(diagnostic(source, "prompts must be an object"));
-		} else {
-			const prompts: PromptTemplateOverrides = {};
-			for (const key of PROMPT_KINDS) {
-				const candidate = (input.prompts as ConfigInput)[key];
-				if (candidate === undefined) continue;
-				if (template(candidate)) prompts[key] = candidate;
-				else
-					diagnostics.push(
-						diagnostic(source, `prompts.${key} must be a non-empty string`),
-					);
-			}
-			if (Object.keys(prompts).length > 0) config.prompts = prompts;
-		}
 	}
 
 	return { config, diagnostics };
@@ -122,10 +115,7 @@ export function mergeConfig(
 		validateConfig("global", global ?? {}),
 		validateConfig("project", project ?? {}),
 	];
-	const config: WatchdogConfig = {
-		...BUILT_IN_CONFIG,
-		prompts: { ...BUILT_IN_CONFIG.prompts },
-	};
+	const config: WatchdogConfig = { ...BUILT_IN_CONFIG };
 
 	for (const { config: partial } of layers) {
 		if (partial.mainLoopLimit !== undefined)
@@ -134,8 +124,8 @@ export function mergeConfig(
 			config.observedTotalLoopLimit = partial.observedTotalLoopLimit;
 		if (partial.wallClockMinutes !== undefined)
 			config.wallClockMinutes = partial.wallClockMinutes;
-		if (partial.prompts !== undefined)
-			Object.assign(config.prompts, partial.prompts);
+		if (partial.reflectionPrompt !== undefined)
+			config.reflectionPrompt = partial.reflectionPrompt;
 	}
 
 	return { config, diagnostics: layers.flatMap((layer) => layer.diagnostics) };

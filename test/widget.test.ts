@@ -19,7 +19,7 @@ function fakeTheme() {
 }
 
 test("widget identity uses the dedicated below-editor row", () => {
-	assert.equal(WIDGET_KEY, "pi-watchdog");
+	assert.equal(WIDGET_KEY, "pi-reflect-watchdog");
 	assert.equal(WIDGET_PLACEMENT, "belowEditor");
 });
 

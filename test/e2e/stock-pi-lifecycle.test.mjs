@@ -16,14 +16,17 @@ import {
 } from "../../scripts/e2e/harness.mjs";
 
 async function setup(t, { wallClockMinutes = 30, ...providerOptions } = {}) {
-	const resources = await createTestResources(t, "pi-watchdog-lifecycle-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-lifecycle-",
+	);
 	const { base } = resources;
 	const isolated = await createIsolatedEnvironment(base);
 	const artifact = await installPackedArtifact({
 		base,
 		agentDir: isolated.agentDir,
 	});
-	await writeJson(path.join(isolated.agentDir, "pi-watchdog.json"), {
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		wallClockMinutes,
 	});
 	const provider = await startFakeProvider(providerOptions);
@@ -66,8 +69,28 @@ test("the real one-minute wall warning steers exactly once while active", {
 }, async (t) => {
 	const { rpc, provider } = await setup(t, {
 		wallClockMinutes: 1,
-		slowMs: 60_000,
-		holdAfterThresholdMs: 6_000,
+		responsePlan: ({ requestIndex }) => {
+			if (requestIndex === 0)
+				return {
+					delay: 66_000,
+					halfway: 30_000,
+					chunks: [{ content: "working " }, { content: "done" }],
+				};
+			if (requestIndex === 1)
+				return {
+					delay: 20,
+					chunks: [
+						{
+							content:
+								"<reflection><type>NO_ISSUE</type><reason>timing route is sound</reason><done>checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
+						},
+					],
+				};
+			return {
+				delay: 20,
+				chunks: [{ content: "post-threshold completion" }],
+			};
+		},
 	});
 	const startedAt = Date.now();
 	const start = performance.now();
@@ -77,71 +100,60 @@ test("the real one-minute wall warning steers exactly once while active", {
 	});
 	assert.equal(response.success, true);
 	await rpc.waitFor((message) => message.type === "agent_start");
+	const initialDeadline = start + 10_000;
+	while (provider.requests.length < 1 && performance.now() < initialDeadline)
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(provider.requests.length, 1, "initial provider request started");
 	const earlyDeadline = start + 59_000;
 	while (performance.now() < earlyDeadline) {
-		const early = rpc.events.filter(
-			(entry) =>
-				entry.message.type === "extension_ui_request" &&
-				entry.message.method === "notify" &&
-				/wallClockLimitReached/.test(entry.message.message ?? ""),
+		assert.equal(
+			provider.requests.length,
+			1,
+			"no reflection before 59 seconds",
 		);
-		assert.equal(early.length, 0, "no wall warning before 59 seconds");
 		await new Promise((resolve) => setTimeout(resolve, 250));
 	}
-	const warning = await rpc.waitFor(
-		(message) =>
-			message.type === "extension_ui_request" &&
-			message.method === "notify" &&
-			/wallClockLimitReached/.test(message.message ?? ""),
-		10_000,
-	);
-	const warningElapsed = warning.at - start;
-	const schedulingToleranceMs = 250;
+	const reflectionDeadline = start + 75_000;
+	while (provider.requests.length < 2 && performance.now() < reflectionDeadline)
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.ok(provider.requests.length >= 2, "reflection request is dispatched");
+	const warningElapsed = provider.requests[1].startedAt - start;
 	assert.ok(
-		warningElapsed >= 60_000 - schedulingToleranceMs,
-		`warning was early at ${warningElapsed}ms`,
+		warningElapsed >= 60_000,
+		`reflection was early at ${warningElapsed}ms`,
 	);
-	assert.ok(warningElapsed < 66_000, `warning was late at ${warningElapsed}ms`);
+	assert.ok(
+		warningElapsed < 70_000,
+		`reflection was late at ${warningElapsed}ms`,
+	);
 	await rpc.waitFor((message) => message.type === "agent_settled", 25_000);
-	await new Promise((resolve) => setTimeout(resolve, 5_250));
-	const warnings = rpc.events.filter(
-		(entry) =>
-			entry.message.type === "extension_ui_request" &&
-			entry.message.method === "notify" &&
-			/wallClockLimitReached/.test(entry.message.message ?? ""),
+	await new Promise((resolve) => setTimeout(resolve, 1_250));
+	const reflectionRequests = provider.requests.filter((request) =>
+		JSON.stringify(request.body.messages).includes(
+			"Trigger source(s): CONTINUOUS_DOMAIN_ACTIVE_TIME",
+		),
 	);
 	assert.equal(
-		warnings.length,
+		reflectionRequests.length,
 		1,
-		"wall warning is latched without a timer storm",
+		"continuous threshold triggers once",
 	);
-	assert.equal(
-		provider.requests.length,
-		2,
-		"exactly one continuation request consumes the steering reminder",
-	);
-	assert.ok(
-		provider.requests[1].startedAt >= warning.at,
-		"continuation begins after warning delivery",
-	);
-	const continuationMessages = JSON.stringify(
-		provider.requests[1].body.messages,
-	);
+	const reflectionMessages = JSON.stringify(provider.requests[1].body.messages);
 	assert.match(
-		continuationMessages,
-		/main agent has been continuously active for 1 minute/i,
+		reflectionMessages,
+		/Trigger source\(s\): CONTINUOUS_DOMAIN_ACTIVE_TIME/,
 	);
-	assert.match(continuationMessages, /wall-clock/i);
+	assert.match(reflectionMessages, /continuous-domain-active=60000ms\/1m/i);
 	assert.ok(
 		provider.requests[1].finishedAt,
-		"continuation response was fully consumed",
+		"reflection response was fully consumed",
 	);
 	const state = await rpc.request({ type: "get_state" });
 	assert.equal(state.success, true, "RPC remains responsive after threshold");
 	const endedAt = Date.now();
 	assert.ok(
-		endedAt - startedAt >= 65_000,
-		`test observation lasted at least 65 seconds: ${endedAt - startedAt}ms`,
+		endedAt - startedAt >= 60_000,
+		`test observation lasted at least 60 seconds: ${endedAt - startedAt}ms`,
 	);
 	await rpc.close();
 });

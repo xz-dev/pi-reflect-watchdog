@@ -30,7 +30,7 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 }, async (t) => {
 	assertStockPi();
 	assert.match(assertTmux(), /^tmux /);
-	const resources = await createTestResources(t, "pi-watchdog-tui-");
+	const resources = await createTestResources(t, "pi-reflect-watchdog-tui-");
 	const { base } = resources;
 	const isolated = await createIsolatedEnvironment(base);
 	await installPackedArtifact({ base, agentDir: isolated.agentDir });
@@ -43,7 +43,7 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		path.join(isolated.agentDir, "models.json"),
 		modelConfig(provider.baseUrl),
 	);
-	const name = `pi-watchdog-${process.pid}-${Date.now()}`;
+	const name = `pi-reflect-watchdog-${process.pid}-${Date.now()}`;
 	const tui = new TmuxPi({
 		name,
 		cwd: isolated.workspace,
@@ -82,9 +82,9 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		"automatic settle notification appears once",
 	);
 
-	tui.send("/watchdog status");
+	tui.send("/reflect-watchdog status");
 	await tui.waitFor(/Watchdog status/);
-	tui.send("/watchdog reset");
+	tui.send("/reflect-watchdog reset");
 	const manual = await tui.waitFor(
 		/Watchdog task cycle reset\. Active window is unchanged\./,
 	);

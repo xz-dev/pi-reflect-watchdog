@@ -38,7 +38,9 @@ export async function runE2eSuite(
 	{ failureStep = process.env.PI_WATCHDOG_E2E_FORCE_FAILURE } = {},
 ) {
 	const patterns = mode === "fast" ? FAST_PATTERNS : ["test/e2e/*.test.mjs"];
-	const temporary = await mkdtemp(path.join("/tmp", "pi-watchdog-e2e-suite-"));
+	const temporary = await mkdtemp(
+		path.join("/tmp", "pi-reflect-watchdog-e2e-suite-"),
+	);
 	const artifactDirectory = path.join(temporary, "artifact");
 	try {
 		if (failureStep === "build")

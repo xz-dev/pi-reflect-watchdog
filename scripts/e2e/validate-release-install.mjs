@@ -33,7 +33,7 @@ export async function validateReleaseCandidate({
 	assertStockPi();
 	const resources = await createTestResources(
 		undefined,
-		"pi-watchdog-release-validation-",
+		"pi-reflect-watchdog-release-validation-",
 	);
 	const { base } = resources;
 	const candidate = path.join(base, "candidate-release-tree");

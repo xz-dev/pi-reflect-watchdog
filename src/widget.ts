@@ -12,7 +12,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 
 import type { ActivityStatus } from "./activity.js";
 
-export const WIDGET_KEY = "pi-watchdog";
+export const WIDGET_KEY = "pi-reflect-watchdog";
 export const WIDGET_PLACEMENT = "belowEditor";
 
 /** Theme face needed to style the line; matches the public Theme.fg API. */

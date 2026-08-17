@@ -8,7 +8,7 @@ import { createTestResources, ROOT } from "../../scripts/e2e/harness.mjs";
 import { promoteRelease } from "../../scripts/release-promotion.mjs";
 
 function git(args, cwd, options = {}) {
-	return execFileSync("git", args, {
+	return execFileSync("git", ["-c", "commit.gpgsign=false", ...args], {
 		cwd,
 		encoding: "utf8",
 		...options,
@@ -16,7 +16,10 @@ function git(args, cwd, options = {}) {
 }
 
 async function repository(t) {
-	const { base } = await createTestResources(t, "pi-watchdog-promotion-");
+	const { base } = await createTestResources(
+		t,
+		"pi-reflect-watchdog-promotion-",
+	);
 	const source = await createCompleteSourceFixture(base, "source");
 	const remote = path.join(base, "remote.git");
 	git(["init", "-b", "master"], source);

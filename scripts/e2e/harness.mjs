@@ -46,7 +46,10 @@ export class CleanupManager {
 	}
 }
 
-export async function createTestResources(t, prefix = "pi-watchdog-e2e-") {
+export async function createTestResources(
+	t,
+	prefix = "pi-reflect-watchdog-e2e-",
+) {
 	let cleanup;
 	try {
 		const base = await mkdtemp(path.join("/tmp", prefix));
@@ -77,17 +80,22 @@ export async function createIsolatedEnvironment(
 	const workspace = path.join(base, workspaceName);
 	await mkdir(agentDir, { recursive: true });
 	await mkdir(workspace, { recursive: true });
-	return {
-		agentDir,
-		workspace,
-		env: {
-			...process.env,
-			HOME: path.join(base, "home"),
-			PI_CODING_AGENT_DIR: agentDir,
-			PI_CODING_AGENT_SESSION_DIR: path.join(base, "sessions"),
-			NO_COLOR: "1",
-		},
+	const env = {
+		...process.env,
+		HOME: path.join(base, "home"),
+		PI_CODING_AGENT_DIR: agentDir,
+		PI_CODING_AGENT_SESSION_DIR: path.join(base, "sessions"),
+		NO_COLOR: "1",
 	};
+	for (const name of [
+		"PI_PROCESS_DOMAIN_ID",
+		"PI_PROCESS_DOMAIN_KEY",
+		"PI_PROCESS_DOMAIN_PROTOCOL",
+		"PI_PROCESS_DOMAIN_RESERVATION",
+		"PI_CONTINUE_WATCHDOG_ROOT_PID",
+	])
+		delete env[name];
+	return { agentDir, workspace, env };
 }
 
 export function assertStockPi() {
@@ -112,9 +120,13 @@ export async function installPackedArtifact({ base, agentDir }) {
 		);
 	const installRoot = path.join(base, "installed-artifact");
 	await mkdir(installRoot, { recursive: true });
+	const processDomainTarball = process.env.PI_PROCESS_DOMAIN_E2E_TARBALL;
+	const installTargets = processDomainTarball
+		? [`pi-process-domain@${processDomainTarball}`, tarball]
+		: [tarball];
 	const install = await runBoundedProcess(
 		"npm",
-		["install", "--ignore-scripts", "--prefix", installRoot, tarball],
+		["install", "--ignore-scripts", "--prefix", installRoot, ...installTargets],
 		{ timeoutMs: 60_000 },
 	);
 	if (install.status !== 0 || install.timedOut || install.error)
@@ -122,8 +134,26 @@ export async function installPackedArtifact({ base, agentDir }) {
 			`artifact install failed${install.timedOut ? " after timeout" : ""}:\n${install.stdout}\n${install.stderr}`,
 		);
 	const packagePath = await realpath(
-		path.join(installRoot, "node_modules", "pi-watchdog"),
+		path.join(installRoot, "node_modules", "pi-reflect-watchdog"),
 	);
+	if (processDomainTarball) {
+		const override = await runBoundedProcess(
+			"npm",
+			[
+				"install",
+				"--ignore-scripts",
+				"--no-save",
+				"--prefix",
+				packagePath,
+				processDomainTarball,
+			],
+			{ timeoutMs: 60_000 },
+		);
+		if (override.status !== 0 || override.timedOut || override.error)
+			throw new Error(
+				`process-domain override failed${override.timedOut ? " after timeout" : ""}:\n${override.stdout}\n${override.stderr}`,
+			);
+	}
 	await writeJson(path.join(agentDir, "settings.json"), {
 		packages: [packagePath],
 		defaultProjectTrust: "never",
@@ -361,10 +391,12 @@ export async function assertSingleWatchdogCommand(rpc, expectedPath) {
 	const response = await rpc.request({ type: "get_commands" }, 30_000);
 	if (!response.success) throw new Error(JSON.stringify(response));
 	const commands = response.data.commands.filter(
-		(command) => command.name === "watchdog",
+		(command) => command.name === "reflect-watchdog",
 	);
 	if (commands.length !== 1)
-		throw new Error(`Expected one watchdog command, got ${commands.length}`);
+		throw new Error(
+			`Expected one watchdog command, got ${commands.length}; commands=${JSON.stringify(response.data.commands.map((command) => command.name))}; stderr=${rpc.stderr}`,
+		);
 	const actual = await realpath(commands[0].sourceInfo.path);
 	const expected = await realpath(expectedPath);
 	if (actual !== expected)

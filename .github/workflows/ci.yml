@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pi-watchdog-${{ github.workflow }}-${{ github.ref }}
+  group: pi-reflect-watchdog-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
 
   promote-release:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'xz-dev/pi-watchdog'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'xz-dev/pi-reflect-watchdog'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -1,12 +1,9 @@
 import type { ActivitySnapshot, ActivityStatus } from "./activity.js";
 import { BUILT_IN_CONFIG, type WatchdogConfig } from "./config.js";
-import type {
-	PromptKind,
-	PromptTemplateOverrides,
-	PromptTemplates,
-} from "./prompts.js";
-
-export type WarningKind = PromptKind;
+export type WarningKind =
+	| "ROOT_LOOP_LIMIT"
+	| "DOMAIN_LOOP_LIMIT"
+	| "CONTINUOUS_DOMAIN_ACTIVE_TIME";
 
 export interface RuntimeLimits {
 	mainLoopLimit: number;
@@ -28,7 +25,6 @@ export interface TaskStatus {
 	observedChildSessions: number;
 	limits: RuntimeLimits;
 	configuredLimits: RuntimeLimits;
-	prompts: PromptTemplates;
 	latchedWarnings: WarningKind[];
 	/** True only while the root agent is running; drives root-only wall-clock warnings. */
 	rootActive: boolean;
@@ -41,7 +37,6 @@ export interface TaskStatus {
 export interface TaskControllerOptions
 	extends Partial<Omit<RuntimeLimits, "wallClockMinutes">> {
 	wallClockMinutes?: number;
-	prompts?: PromptTemplateOverrides;
 }
 
 const COVERAGE =
@@ -65,9 +60,7 @@ function positiveSafeInteger(
 
 export class TaskController {
 	private readonly configuredLimits: RuntimeLimits;
-	private readonly configuredPrompts: PromptTemplates;
 	private limits: RuntimeLimits;
-	private promptOverrides: PromptTemplateOverrides = {};
 	private epoch = 0;
 	private mainLoops = 0;
 	private activeLoops = 0;
@@ -100,7 +93,6 @@ export class TaskController {
 				BUILT_IN_CONFIG.wallClockMinutes,
 			),
 		};
-		this.configuredPrompts = { ...BUILT_IN_CONFIG.prompts, ...options.prompts };
 		this.limits = { ...this.configuredLimits };
 	}
 
@@ -117,7 +109,6 @@ export class TaskController {
 		this.runningObserverEpochs.clear();
 		this.latched.clear();
 		this.limits = { ...this.configuredLimits };
-		this.promptOverrides = {};
 		this.settledElapsedMs = 0;
 		const rootActive = rootRunning || this.rootRunActive;
 		this.pendingRootTask = !rootActive;
@@ -206,7 +197,6 @@ export class TaskController {
 		if (this.epoch === 0) return;
 		this.resetRuntime(now);
 		this.limits = { ...this.configuredLimits };
-		this.promptOverrides = {};
 	}
 
 	setLimits(
@@ -240,15 +230,6 @@ export class TaskController {
 		this.limits = { ...this.configuredLimits };
 		this.rearmBelowLimits(now);
 		return this.evaluate(now, true, resetWarningCycle);
-	}
-
-	setPromptOverride(kind: PromptKind, template: string): void {
-		this.promptOverrides[kind] = template;
-	}
-
-	resetPromptOverride(kind?: PromptKind): void {
-		if (kind === undefined) this.promptOverrides = {};
-		else delete this.promptOverrides[kind];
 	}
 
 	startRootActiveSegment(now: number): void {
@@ -308,7 +289,6 @@ export class TaskController {
 			observedChildSessions: this.observerEpochs.size,
 			limits: { ...this.limits },
 			configuredLimits: { ...this.configuredLimits },
-			prompts: { ...this.configuredPrompts, ...this.promptOverrides },
 			latchedWarnings: [...this.latched],
 			rootActive: this.rootActiveSince !== undefined,
 			activity: {
@@ -344,14 +324,14 @@ export class TaskController {
 
 	private rearmBelowLimits(now: number): void {
 		if (this.mainLoops < this.limits.mainLoopLimit)
-			this.latched.delete("mainLoopLimitReached");
+			this.latched.delete("ROOT_LOOP_LIMIT");
 		if (
 			this.mainLoops + this.observedChildLoops <
 			this.limits.observedTotalLoopLimit
 		)
-			this.latched.delete("observedTotalLoopLimitReached");
+			this.latched.delete("DOMAIN_LOOP_LIMIT");
 		if (this.elapsed(now) < this.wallClockLimitMs())
-			this.latched.delete("wallClockLimitReached");
+			this.latched.delete("CONTINUOUS_DOMAIN_ACTIVE_TIME");
 	}
 
 	private evaluate(
@@ -362,14 +342,14 @@ export class TaskController {
 		const warnings: WarningKind[] = [];
 		const total = this.mainLoops + this.observedChildLoops;
 		if (includeLoops && this.mainLoops >= this.limits.mainLoopLimit)
-			this.latch("mainLoopLimitReached", warnings);
+			this.latch("ROOT_LOOP_LIMIT", warnings);
 		if (includeLoops && total >= this.limits.observedTotalLoopLimit)
-			this.latch("observedTotalLoopLimitReached", warnings);
+			this.latch("DOMAIN_LOOP_LIMIT", warnings);
 		if (
 			this.rootActiveSince !== undefined &&
 			this.elapsed(now) >= this.wallClockLimitMs()
 		)
-			this.latch("wallClockLimitReached", warnings);
+			this.latch("CONTINUOUS_DOMAIN_ACTIVE_TIME", warnings);
 		if (warnings.length === 0) return transition();
 		const triggerStatus = this.status(now);
 		if (resetWarningCycle) this.resetWarningCycle(now);
@@ -410,6 +390,5 @@ export function controllerOptionsFromConfig(
 		mainLoopLimit: config.mainLoopLimit,
 		observedTotalLoopLimit: config.observedTotalLoopLimit,
 		wallClockMinutes: config.wallClockMinutes,
-		prompts: { ...config.prompts },
 	};
 }

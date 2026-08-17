@@ -45,7 +45,9 @@ async function waitForFile(file, timeoutMs = 2_000) {
 }
 
 test("cleanup manager preserves explicit process-server-temp order after assertion failure", async () => {
-	const temporary = await mkdtemp(path.join("/tmp", "pi-watchdog-cleanup-"));
+	const temporary = await mkdtemp(
+		path.join("/tmp", "pi-reflect-watchdog-cleanup-"),
+	);
 	const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
 		stdio: "ignore",
 	});
@@ -74,7 +76,10 @@ test("cleanup manager preserves explicit process-server-temp order after asserti
 });
 
 test("test resource stack closes child resources before removing its temporary root", async (t) => {
-	const resources = await createTestResources(t, "pi-watchdog-resource-stack-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-resource-stack-",
+	);
 	const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
 		stdio: "ignore",
 	});
@@ -106,7 +111,10 @@ test("RpcPi.close kills a detached launcher process group and its grandchild", {
 	timeout: 5_000,
 }, async (t) => {
 	if (process.platform === "win32") t.skip("POSIX process groups only");
-	const resources = await createTestResources(t, "pi-watchdog-process-tree-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-process-tree-",
+	);
 	const grandchildPidFile = path.join(resources.base, "grandchild.pid");
 	const launcher = [
 		"const { spawn } = require('node:child_process');",
@@ -142,7 +150,10 @@ test("bounded test commands kill their detached descendant tree on timeout", {
 		t.skip("POSIX process groups only");
 		return;
 	}
-	const resources = await createTestResources(t, "pi-watchdog-bounded-tree-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-bounded-tree-",
+	);
 	const grandchildPidFile = path.join(resources.base, "grandchild.pid");
 	const launcher = [
 		"const { spawn } = require('node:child_process');",

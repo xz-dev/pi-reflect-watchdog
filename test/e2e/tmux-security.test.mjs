@@ -17,7 +17,10 @@ async function missing(file) {
 
 test("tmux argv and environment preserve shell metacharacters literally", async (t) => {
 	assert.match(assertTmux(), /^tmux /);
-	const resources = await createTestResources(t, "pi-watchdog-tmux-security-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-tmux-security-",
+	);
 	const { base } = resources;
 	const marker = path.join(base, "marker");
 	const output = path.join(base, "output.json");
@@ -29,7 +32,7 @@ test("tmux argv and environment preserve shell metacharacters literally", async 
 		'double"quote',
 		"line one\nline two",
 	];
-	const name = `pi-watchdog-security-${process.pid}-${Date.now()}`;
+	const name = `pi-reflect-watchdog-security-${process.pid}-${Date.now()}`;
 	const tui = new TmuxPi({
 		name,
 		cwd: base,

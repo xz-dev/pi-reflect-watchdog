@@ -30,7 +30,10 @@ const thisFile = fileURLToPath(import.meta.url);
 const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
 
 async function createSourceFixture(t) {
-	const { base } = await createTestResources(t, "pi-watchdog-distribution-");
+	const { base } = await createTestResources(
+		t,
+		"pi-reflect-watchdog-distribution-",
+	);
 	const root = await createCompleteSourceFixture(base);
 	return { base, root };
 }
@@ -120,7 +123,7 @@ test("release validation rejects fixture root and ancestor without mutation", as
 	assert.equal(
 		JSON.parse(await readFile(path.join(fixture.root, "package.json"), "utf8"))
 			.name,
-		"pi-watchdog",
+		"pi-reflect-watchdog",
 	);
 });
 
@@ -134,7 +137,7 @@ test("side-effect-free path validation rejects the absolute filesystem root", as
 	assert.equal(
 		JSON.parse(await readFile(path.join(fixture.root, "package.json"), "utf8"))
 			.name,
-		"pi-watchdog",
+		"pi-reflect-watchdog",
 	);
 });
 
@@ -203,7 +206,7 @@ test("release tree is minimal, deterministic, and records source provenance", as
 	assert.deepEqual(
 		JSON.parse(await readFile(path.join(first, "provenance.json"), "utf8")),
 		{
-			owner: "pi-watchdog-release-tree-v1",
+			owner: "pi-reflect-watchdog-release-tree-v1",
 			source: "master",
 			commit: sourceCommit,
 		},

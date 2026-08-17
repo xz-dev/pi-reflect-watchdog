@@ -29,6 +29,14 @@ const DIST_FILES = [
 	"extension.js",
 	"hub.d.ts",
 	"hub.js",
+	"process-domain.d.ts",
+	"process-domain.js",
+	"reflection-history.d.ts",
+	"reflection-history.js",
+	"reflection-protocol.d.ts",
+	"reflection-protocol.js",
+	"reflection-timeline.d.ts",
+	"reflection-timeline.js",
 	"index.d.ts",
 	"index.js",
 	"prompts.d.ts",
@@ -37,7 +45,7 @@ const DIST_FILES = [
 	"widget.js",
 ];
 
-const RELEASE_OWNER = "pi-watchdog-release-tree-v1";
+const RELEASE_OWNER = "pi-reflect-watchdog-release-tree-v1";
 
 export const PACK_ALLOWLIST = [
 	...ROOT_FILES,
@@ -153,12 +161,12 @@ async function assertReplaceableReleaseOutput(outputDirectory) {
 		);
 	} catch {
 		throw new Error(
-			`Refusing to replace nonempty output without the pi-watchdog ownership sentinel: ${outputDirectory}`,
+			`Refusing to replace nonempty output without the pi-reflect-watchdog ownership sentinel: ${outputDirectory}`,
 		);
 	}
 	if (provenance?.owner !== RELEASE_OWNER) {
 		throw new Error(
-			`Refusing to replace nonempty output without the pi-watchdog ownership sentinel: ${outputDirectory}`,
+			`Refusing to replace nonempty output without the pi-reflect-watchdog ownership sentinel: ${outputDirectory}`,
 		);
 	}
 }

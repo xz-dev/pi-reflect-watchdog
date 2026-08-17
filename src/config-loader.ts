@@ -45,13 +45,13 @@ export async function loadRuntimeConfig(
 	agentDir = getAgentDir(),
 ): Promise<LoadedConfig> {
 	const global = await readConfig(
-		join(agentDir, "pi-watchdog.json"),
+		join(agentDir, "pi-reflect-watchdog.json"),
 		"global",
 		io,
 	);
 	const project = trusted
 		? await readConfig(
-				join(cwd, CONFIG_DIR_NAME, "pi-watchdog.json"),
+				join(cwd, CONFIG_DIR_NAME, "pi-reflect-watchdog.json"),
 				"project",
 				io,
 			)

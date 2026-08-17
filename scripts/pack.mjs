@@ -13,7 +13,9 @@ import {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = path.resolve(process.argv[2] ?? root);
-const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-watchdog-pack-"));
+const temporary = await mkdtemp(
+	path.join(os.tmpdir(), "pi-reflect-watchdog-pack-"),
+);
 try {
 	await createPackStage({ root, outputDirectory: temporary });
 	await assertAllowlist(temporary, PACK_ALLOWLIST);

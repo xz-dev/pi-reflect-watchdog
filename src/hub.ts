@@ -1,4 +1,4 @@
-export const HUB_SYMBOL = Symbol.for("pi-watchdog:hub:v1");
+export const HUB_SYMBOL = Symbol.for("pi-reflect-watchdog:hub:v1");
 
 export type RootPriority = 1 | 2;
 

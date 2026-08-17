@@ -30,7 +30,7 @@ async function commandNotifications(rpc, command) {
 	const start = rpc.events.length;
 	const response = await rpc.request({
 		type: "prompt",
-		message: `/watchdog ${command}`,
+		message: `/reflect-watchdog ${command}`,
 	});
 	assert.equal(response.success, true);
 	await new Promise((resolve) => setTimeout(resolve, 100));
@@ -93,7 +93,7 @@ function warningPlan({ requestIndex }) {
 							id: "watchdog-status-1",
 							type: "function",
 							function: {
-								name: "watchdog_control",
+								name: "reflect_watchdog_control",
 								arguments: '{"action":"status"}',
 							},
 						},
@@ -103,7 +103,15 @@ function warningPlan({ requestIndex }) {
 			finishReason: "tool_calls",
 		};
 	}
-	return { delay: 20, chunks: [{ content: "fixture complete" }] };
+	return {
+		delay: 20,
+		chunks: [
+			{
+				content:
+					"fixture complete\n<reflection><type>NO_ISSUE</type><reason>route is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
+			},
+		],
+	};
 }
 
 test("the installed packed tarball loads dist and commands never start a model turn", async (t) => {
@@ -148,14 +156,14 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 	assertStockPi();
 	const resources = await createTestResources(
 		t,
-		"pi-watchdog-provider-warning-",
+		"pi-reflect-watchdog-provider-warning-",
 	);
 	const isolated = await createIsolatedEnvironment(resources.base);
 	const artifact = await installPackedArtifact({
 		base: resources.base,
 		agentDir: isolated.agentDir,
 	});
-	await writeJson(path.join(isolated.agentDir, "pi-watchdog.json"), {
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		mainLoopLimit: 2,
 		observedTotalLoopLimit: 500,
 		wallClockMinutes: 30,
@@ -185,7 +193,7 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 	});
 	assert.equal(accepted.success, true);
 	await waitForProviderRequests(provider, 2);
-	const warningMarker = "[pi-watchdog: Main agent loop threshold reached]";
+	const warningMarker = "Trigger source(s): ROOT_LOOP_LIMIT";
 	const initialRequests = provider.requests.slice(0, 2);
 	for (const request of initialRequests) {
 		const messages = JSON.stringify(request.body.messages);
@@ -201,32 +209,22 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 	);
 	assert.match(
 		toolResult?.content ?? "",
-		/^watchdog status\nmain\/root loops:/,
-		"the second provider request consumes the real watchdog_control status result",
+		/^reflect_watchdog status\nmain\/root loops:/,
+		"the second provider request consumes the real reflect_watchdog_control status result",
 	);
 
-	const warning = await rpc.waitFor(
-		(message) =>
-			message.type === "extension_ui_request" &&
-			message.method === "notify" &&
-			/mainLoopLimitReached/.test(message.message ?? ""),
-	);
 	await waitForProviderRequests(provider, 3);
 	const continuation = provider.requests[2];
 	const continuationMessages = JSON.stringify(continuation.body.messages);
-	// This provider request is the authoritative agent-facing seam. The UI event
-	// above is only an ordering witness, not evidence of model delivery.
+	// This provider request is the authoritative agent-facing seam.
 	assert.match(
 		continuationMessages,
 		new RegExp(warningMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
 	);
-	assert.match(
-		continuationMessages,
-		/The main agent has completed 2 loops in the current task, reaching the configured limit of 2\./,
-	);
+	assert.match(continuationMessages, /Threshold snapshot: root=2\/2;/);
 	assert.ok(
-		continuation.startedAt >= warning.at,
-		"the continuation provider request starts after watchdog notification",
+		continuation.startedAt >= initialRequests[1].finishedAt,
+		"the reflection provider request starts after the ordinary tool round",
 	);
 	await waitForProviderResponse(continuation);
 	await rpc.waitFor((message) => message.type === "agent_settled");
@@ -247,14 +245,17 @@ test("stock Pi honors global and trusted-project watchdog config precedence", as
 		base: resources.base,
 		agentDir: isolated.agentDir,
 	});
-	await writeJson(path.join(isolated.agentDir, "pi-watchdog.json"), {
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		mainLoopLimit: 17,
 		observedTotalLoopLimit: 19,
 		wallClockMinutes: 23,
 	});
-	await writeJson(path.join(isolated.workspace, ".pi", "pi-watchdog.json"), {
-		mainLoopLimit: 29,
-	});
+	await writeJson(
+		path.join(isolated.workspace, ".pi", "pi-reflect-watchdog.json"),
+		{
+			mainLoopLimit: 29,
+		},
+	);
 
 	for (const [trustFlag, expected] of [
 		["--no-approve", "main=17"],
@@ -283,7 +284,10 @@ test("stock Pi honors global and trusted-project watchdog config precedence", as
 });
 
 test("stock Pi installs master and release from actual local Git remotes with exact source paths", async (t) => {
-	const resources = await createTestResources(t, "pi-watchdog-git-e2e-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-git-e2e-",
+	);
 	const fixture = await createGitFixture(resources.base);
 	resources.add(() => fixture.stop());
 	for (const [name, source, entry] of [
@@ -304,7 +308,7 @@ test("stock Pi installs master and release from actual local Git remotes with ex
 		await assertSingleWatchdogCommand(rpc, path.join(managed, entry));
 		const commands = await rpc.request({ type: "get_commands" });
 		const watchdog = commands.data.commands.find(
-			(command) => command.name === "watchdog",
+			(command) => command.name === "reflect-watchdog",
 		);
 		assert.equal(
 			await realpath(watchdog.sourceInfo.path),
@@ -327,7 +331,10 @@ test("stock Pi installs master and release from actual local Git remotes with ex
 });
 
 test("failed stock Git installation is bounded and resource cleanup removes its checkout and daemon", async (t) => {
-	const resources = await createTestResources(t, "pi-watchdog-git-failure-");
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-git-failure-",
+	);
 	const fixture = await createGitFixture(resources.base);
 	resources.add(() => fixture.stop());
 	const isolated = await createIsolatedEnvironment(resources.base, "invalid");
@@ -345,7 +352,7 @@ test("failed stock Git installation is bounded and resource cleanup removes its 
 	);
 	assert.match(
 		`${result.stdout}\n${result.stderr}`,
-		/pi-watchdog-e2e-not-a-real-package|E404|install failed/i,
+		/pi-reflect-watchdog-e2e-not-a-real-package|E404|install failed/i,
 	);
 	await resources.cleanup();
 	assert.equal(

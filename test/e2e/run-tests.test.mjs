@@ -25,7 +25,7 @@ test("forced E2E failure uses the standardized environment name and cleans its s
 }, async () => {
 	const before = new Set(
 		(await readdir(os.tmpdir())).filter((name) =>
-			name.startsWith("pi-watchdog-e2e-suite-"),
+			name.startsWith("pi-reflect-watchdog-e2e-suite-"),
 		),
 	);
 	let outcome;
@@ -52,7 +52,7 @@ test("forced E2E failure uses the standardized environment name and cleans its s
 		new RegExp(forcedFailureDiagnostic("build")),
 	);
 	const after = (await readdir(os.tmpdir())).filter((name) =>
-		name.startsWith("pi-watchdog-e2e-suite-"),
+		name.startsWith("pi-reflect-watchdog-e2e-suite-"),
 	);
 	for (const name of after.filter((name) => !before.has(name)))
 		assert.equal(
