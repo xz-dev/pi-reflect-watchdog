@@ -25,7 +25,7 @@ export function formatWidgetText(state) {
     const head = active.active
         ? `active ${formatDuration(active.elapsedMs)}/${active.loops} loops`
         : `idle · active ${formatDuration(active.elapsedMs)}/${active.loops} loops`;
-    return (`Watchdog | ${head}` +
+    return (`Reflect Watchdog | ${head}` +
         ` · task ${formatDuration(state.taskElapsedMs)}/${state.wallClockMinutes}m` +
         ` · root ${state.rootLoops}/${state.mainLoopLimit}` +
         ` · observed ${state.observedTotalLoops}/${state.observedTotalLoopLimit}`);
