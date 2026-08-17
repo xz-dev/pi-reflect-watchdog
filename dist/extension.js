@@ -717,7 +717,7 @@ export function createWatchdogExtension(overrides = {}) {
 }
 export default createWatchdogExtension();
 function commandIsCurrent(runtime, ctx) {
-    // Pi 0.82.1 deliberately wraps event and command contexts separately. The
+    // Pi wraps event and command contexts separately. The
     // session manager is the stable session-owned object shared by those
     // wrappers; pair it with the session ID and current hub token/generation.
     return (rootIsCurrent(runtime) &&
