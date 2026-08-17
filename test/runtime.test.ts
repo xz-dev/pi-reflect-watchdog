@@ -40,7 +40,7 @@ class Pi {
 		this.messages.push({ message, options });
 	}
 	async emit(name: string, event: any, ctx: any) {
-		await this.handlers.get(name)?.(event, ctx);
+		return await this.handlers.get(name)?.(event, ctx);
 	}
 }
 
@@ -338,9 +338,14 @@ test("NO_ISSUE persists one report and starts no ordinary follow-up turn", async
 	assert.ok(reflect);
 	await reflect.handler("", ctx);
 	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant(validNoIssue), ctx);
+	const replacement = await pi.emit(
+		"message_end",
+		assistant(validNoIssue),
+		ctx,
+	);
 	await pi.emit("turn_end", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(replacement.message.content, []);
 	assert.equal(pi.entries.length, 1);
 	assert.equal(pi.entries[0].data.decision.type, "NO_ISSUE");
 	assert.equal(pi.messages.length, 1);
@@ -353,9 +358,14 @@ test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", asy
 	assert.ok(reflect);
 	await reflect.handler("", ctx);
 	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant(validCorrection), ctx);
+	const replacement = await pi.emit(
+		"message_end",
+		assistant(validCorrection),
+		ctx,
+	);
 	await pi.emit("turn_end", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(replacement.message.content, []);
 	assert.equal(pi.entries.length, 1);
 	assert.equal(pi.entries[0].data.decision.type, "ROUTE_CORRECTION");
 	assert.equal(pi.messages.length, 2);
@@ -364,6 +374,7 @@ test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", asy
 		/Next step: use corrected route/,
 	);
 	assert.equal(pi.messages[1].options.triggerTurn, true);
+	assert.equal(pi.messages[1].options.deliverAs, "steer");
 });
 
 test("reflection and correction attempts do not re-trigger loop counting", async () => {

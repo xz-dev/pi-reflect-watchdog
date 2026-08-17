@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, realpath } from "node:fs/promises";
+import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { RELEASE_ALLOWLIST } from "../../scripts/distribution.mjs";
@@ -235,7 +235,131 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 		"the reset cycle lets the one-loop reflection settle without another warning",
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
-	assert.match(last.data.text, /fixture complete/);
+	assert.equal(
+		last.data.text ?? "",
+		"",
+		"the internal NO_ISSUE reflection response is not visible as assistant output",
+	);
+});
+
+test("packed stock Pi hides reflection XML and applies a correction without user input", {
+	timeout: 45_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-correction-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		mainLoopLimit: 100,
+		observedTotalLoopLimit: 500,
+		wallClockMinutes: 30,
+	});
+	const reflectionXml =
+		"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>pause</current_step><next_step>apply corrected route</next_step></reflection>";
+	const provider = await startFakeProvider({
+		responsePlan: ({ requestIndex }) => ({
+			delay: 20,
+			chunks: [
+				{
+					content:
+						requestIndex === 0
+							? reflectionXml
+							: "correction applied automatically",
+				},
+			],
+		}),
+	});
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		launcherArgs: [
+			"--mode",
+			"rpc",
+			"--no-tools",
+			"--provider",
+			"watchdog-fixture",
+			"--model",
+			"watchdog-fixture",
+		],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+
+	const accepted = await rpc.request({
+		type: "prompt",
+		message: "/reflect inspect the current route",
+	});
+	assert.equal(accepted.success, true);
+	await waitForProviderRequests(provider, 2);
+	await waitForProviderResponse(provider.requests[1]);
+	await rpc.waitFor((message) => message.type === "agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(
+		provider.requests.length,
+		2,
+		"the correction starts exactly one ordinary turn without a user prompt",
+	);
+	const continuationMessages = JSON.stringify(
+		provider.requests[1].body.messages,
+	);
+	assert.match(continuationMessages, /Next step: apply corrected route/);
+	assert.equal(
+		provider.requests[1].body.messages.some(
+			(message) => message.role === "assistant",
+		),
+		false,
+		"the internal reflection assistant is replaced before the next request",
+	);
+	assert.equal(
+		continuationMessages.includes(reflectionXml),
+		false,
+		"the raw reflection XML is absent from the next provider request",
+	);
+	const last = await rpc.request({ type: "get_last_assistant_text" });
+	assert.equal(last.data.text, "correction applied automatically");
+
+	const sessionDirectory = isolated.env.PI_CODING_AGENT_SESSION_DIR;
+	const sessionFiles = (await readdir(sessionDirectory, { recursive: true }))
+		.filter((entry) => entry.endsWith(".jsonl"))
+		.map((entry) => path.join(sessionDirectory, entry));
+	assert.equal(sessionFiles.length, 1);
+	const entries = (await readFile(sessionFiles[0], "utf8"))
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	const assistantText = entries
+		.filter(
+			(entry) =>
+				entry.type === "message" && entry.message?.role === "assistant",
+		)
+		.flatMap((entry) => entry.message.content ?? [])
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	assert.doesNotMatch(assistantText, /<reflection>/i);
+	assert.match(assistantText, /correction applied automatically/);
+	assert.equal(
+		entries.filter(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "pi-reflect-watchdog:inquiry:correction",
+		).length,
+		1,
+	);
 });
 
 test("stock Pi honors global and trusted-project watchdog config precedence", async (t) => {
