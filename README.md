@@ -95,7 +95,7 @@ pi install git:github.com/xz-dev/pi-reflect-watchdog@release
 
 Local development installs can use an absolute checkout path. Source installs load `src/extension.ts`; packed/release artifacts load `dist/extension.js`.
 
-`pi-extension-utils` is an exact Git dependency pinned to a full commit SHA. The extension uses its authenticated ZeroMQ transport, strict XML parser, and Pi inquiry correlation/folding APIs. The tracked `.npmrc` uses `allow-git=root` and `legacy-peer-deps=true`: only this package's reviewed direct Git dependency is admitted, while Pi peer packages remain host-provided. The package-owned `allowScripts` entry permits only `zeromq`.
+`pi-extension-utils` is an exact Git dependency pinned to a full commit SHA. The extension uses its authenticated loopback TCP transport, strict XML parser, and Pi inquiry correlation/folding APIs. The tracked `.npmrc` uses `allow-git=root` and `legacy-peer-deps=true`: only this package's reviewed direct Git dependency is admitted, while Pi peer packages remain host-provided. The transport is pure TypeScript over `node:net` and has no native install scripts.
 
 ## Development
 
