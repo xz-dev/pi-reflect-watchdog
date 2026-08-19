@@ -1,5 +1,5 @@
 import { BUILT_IN_CONFIG } from "./config.js";
-const COVERAGE = "Observable total includes the root and watchdog-enabled child sessions in this process; isolated, disabled, remote, and out-of-process sessions may be absent.";
+const COVERAGE = "All counters include the root and watchdog-enabled agent sessions in this process domain; isolated, disabled, remote, and out-of-process sessions may be absent.";
 function transition(warnings = [], triggerStatus) {
     return { warnings, triggerStatus };
 }
@@ -12,45 +12,36 @@ export class TaskController {
     configuredLimits;
     limits;
     epoch = 0;
-    mainLoops = 0;
+    rootLoops = 0;
+    otherAgentLoops = 0;
     activeLoops = 0;
-    observedChildLoops = 0;
+    activeElapsedMs = 0;
+    taskElapsedMs = 0;
+    taskCycleSince;
     observerEpochs = new Map();
     runningObserverEpochs = new Map();
     latched = new Set();
-    /** Root agent run may begin before Pi delivers the first root user message. */
     rootRunActive = false;
-    /** A root user task awaits its first root or observable-child participant. */
-    pendingRootTask = false;
-    /** Current epoch's active-window start; undefined when no participant runs. */
+    /** Start of the current aggregate-busy segment. */
     activeSince;
-    /** Root-only timer start; it freezes as soon as the root settles. */
-    rootActiveSince;
-    settledElapsedMs = 0;
+    /** Exact all-idle timestamp used by the strict greater-than gap guard. */
+    endLoopTime;
     constructor(options = {}) {
         this.configuredLimits = {
-            mainLoopLimit: positiveSafeInteger(options.mainLoopLimit, BUILT_IN_CONFIG.mainLoopLimit),
-            observedTotalLoopLimit: positiveSafeInteger(options.observedTotalLoopLimit, BUILT_IN_CONFIG.observedTotalLoopLimit),
-            wallClockMinutes: positiveSafeInteger(options.wallClockMinutes, BUILT_IN_CONFIG.wallClockMinutes),
+            rootLoopLimit: positiveSafeInteger(options.rootLoopLimit, BUILT_IN_CONFIG.rootLoopLimit),
+            allLoopLimit: positiveSafeInteger(options.allLoopLimit, BUILT_IN_CONFIG.allLoopLimit),
+            taskMinutes: positiveSafeInteger(options.taskMinutes, BUILT_IN_CONFIG.taskMinutes),
+            idleResetGapSeconds: positiveSafeInteger(options.idleResetGapSeconds, BUILT_IN_CONFIG.idleResetGapSeconds),
         };
         this.limits = { ...this.configuredLimits };
     }
     startRootTask(now, rootRunning = false) {
-        const snapshot = this.closeActivity(now);
         this.epoch += 1;
-        this.mainLoops = 0;
-        this.activeLoops = 0;
-        this.observedChildLoops = 0;
         this.observerEpochs.clear();
         this.runningObserverEpochs.clear();
-        this.latched.clear();
-        this.limits = { ...this.configuredLimits };
-        this.settledElapsedMs = 0;
-        const rootActive = rootRunning || this.rootRunActive;
-        this.pendingRootTask = !rootActive;
-        this.rootActiveSince = rootActive ? now : undefined;
-        this.activeSince = rootActive ? now : undefined;
-        return snapshot;
+        if (rootRunning || this.rootRunActive)
+            this.beginActivity(now);
+        return undefined;
     }
     bindObserver(observerId) {
         if (this.epoch === 0)
@@ -62,10 +53,7 @@ export class TaskController {
         if (this.observerEpochs.get(observerId) !== this.epoch)
             return;
         this.runningObserverEpochs.set(observerId, this.epoch);
-        if (this.activeSince === undefined) {
-            this.activeSince = now;
-            this.pendingRootTask = false;
-        }
+        this.beginActivity(now);
     }
     settleObserverRun(observerId, epoch, now) {
         if (epoch !== this.epoch ||
@@ -86,9 +74,10 @@ export class TaskController {
     completeRootTurn(now) {
         if (this.epoch === 0)
             return transition();
-        this.mainLoops += 1;
-        if (this.activeSince !== undefined)
-            this.activeLoops += 1;
+        this.rootLoops += 1;
+        this.activeLoops += 1;
+        if (this.activeSince === undefined)
+            this.beginActivity(now);
         return this.evaluate(now);
     }
     completeObserverTurn(observerId, epoch, now) {
@@ -96,32 +85,44 @@ export class TaskController {
             this.observerEpochs.get(observerId) !== epoch ||
             epoch !== this.epoch)
             return transition();
-        this.observedChildLoops += 1;
+        this.otherAgentLoops += 1;
+        this.activeLoops += 1;
         return this.evaluate(now);
     }
-    resetRuntime(now) {
+    /** Reset the task/root/all reminder cycle while preserving the active cycle. */
+    resetReminderCycle(_now) {
         if (this.epoch === 0)
             return;
-        this.mainLoops = 0;
-        this.observedChildLoops = 0;
+        this.rootLoops = 0;
+        this.otherAgentLoops = 0;
+        this.taskElapsedMs = 0;
+        if (this.activeSince !== undefined)
+            this.taskCycleSince = _now;
         this.latched.clear();
-        this.settledElapsedMs = 0;
-        if (this.rootActiveSince !== undefined)
-            this.rootActiveSince = now;
     }
     resetWarningCycle(now) {
         if (this.epoch === 0)
             return;
-        this.resetRuntime(now);
+        this.resetReminderCycle(now);
         this.limits = { ...this.configuredLimits };
     }
+    resetEveryCounter() {
+        this.rootLoops = 0;
+        this.otherAgentLoops = 0;
+        this.activeLoops = 0;
+        this.activeElapsedMs = 0;
+        this.taskElapsedMs = 0;
+        this.latched.clear();
+    }
     setLimits(limits, now, resetWarningCycle = false) {
-        if (limits.mainLoopLimit !== undefined)
-            this.limits.mainLoopLimit = positiveSafeInteger(limits.mainLoopLimit, this.limits.mainLoopLimit);
-        if (limits.observedTotalLoopLimit !== undefined)
-            this.limits.observedTotalLoopLimit = positiveSafeInteger(limits.observedTotalLoopLimit, this.limits.observedTotalLoopLimit);
-        if (limits.wallClockMinutes !== undefined)
-            this.limits.wallClockMinutes = positiveSafeInteger(limits.wallClockMinutes, this.limits.wallClockMinutes);
+        if (limits.rootLoopLimit !== undefined)
+            this.limits.rootLoopLimit = positiveSafeInteger(limits.rootLoopLimit, this.limits.rootLoopLimit);
+        if (limits.allLoopLimit !== undefined)
+            this.limits.allLoopLimit = positiveSafeInteger(limits.allLoopLimit, this.limits.allLoopLimit);
+        if (limits.taskMinutes !== undefined)
+            this.limits.taskMinutes = positiveSafeInteger(limits.taskMinutes, this.limits.taskMinutes);
+        if (limits.idleResetGapSeconds !== undefined)
+            this.limits.idleResetGapSeconds = positiveSafeInteger(limits.idleResetGapSeconds, this.limits.idleResetGapSeconds);
         this.rearmBelowLimits(now);
         return this.evaluate(now, true, resetWarningCycle);
     }
@@ -134,106 +135,101 @@ export class TaskController {
         if (this.rootRunActive)
             return;
         this.rootRunActive = true;
-        // A root start joins an already-active task (for example, while a bound
-        // child holds it open). A start after full quiescence is admission only;
-        // the following root user message establishes the next task.
-        if (this.activeSince !== undefined) {
-            this.rootActiveSince = now;
-            return;
-        }
-        if (!this.pendingRootTask)
-            return;
-        this.pendingRootTask = false;
-        this.rootActiveSince = now;
-        this.activeSince = now;
-        this.settledElapsedMs = 0;
+        this.beginActivity(now);
     }
     settleRootActiveSegment(now) {
         if (!this.rootRunActive)
             return undefined;
         this.rootRunActive = false;
-        if (this.rootActiveSince !== undefined) {
-            this.settledElapsedMs += Math.max(0, now - this.rootActiveSince);
-            this.rootActiveSince = undefined;
-        }
         return this.closeActivityIfIdle(now);
     }
     finalize() {
         this.epoch = 0;
-        this.mainLoops = 0;
+        this.rootLoops = 0;
+        this.otherAgentLoops = 0;
         this.activeLoops = 0;
-        this.observedChildLoops = 0;
+        this.activeElapsedMs = 0;
+        this.taskElapsedMs = 0;
         this.observerEpochs.clear();
         this.runningObserverEpochs.clear();
         this.latched.clear();
         this.rootRunActive = false;
-        this.pendingRootTask = false;
         this.activeSince = undefined;
-        this.rootActiveSince = undefined;
-        this.settledElapsedMs = 0;
+        this.endLoopTime = undefined;
+        this.taskCycleSince = undefined;
     }
-    evaluateWallClock(now) {
-        if (this.epoch === 0 || this.rootActiveSince === undefined)
+    evaluateTaskTime(now) {
+        if (this.epoch === 0 || this.activeSince === undefined)
             return transition();
         return this.evaluate(now, false);
     }
     status(now) {
         return {
             epoch: this.epoch,
-            mainLoops: this.mainLoops,
-            observedChildLoops: this.observedChildLoops,
-            observedTotalLoops: this.mainLoops + this.observedChildLoops,
-            observedChildSessions: this.observerEpochs.size,
+            rootLoops: this.rootLoops,
+            otherAgentLoops: this.otherAgentLoops,
+            allLoops: this.rootLoops + this.otherAgentLoops,
+            observableAgentSessions: this.observerEpochs.size,
             limits: { ...this.limits },
             configuredLimits: { ...this.configuredLimits },
             latchedWarnings: [...this.latched],
-            rootActive: this.rootActiveSince !== undefined,
+            rootActive: this.activeSince !== undefined,
             activity: {
                 active: this.activeSince !== undefined,
-                elapsedMs: this.activityElapsed(now),
-                loops: this.activeSince === undefined ? 0 : this.activeLoops,
+                elapsedMs: this.activeElapsed(now),
+                loops: this.activeLoops,
             },
-            wallClockElapsedMs: this.elapsed(now),
+            taskElapsedMs: this.taskElapsed(now),
             coverage: COVERAGE,
         };
     }
+    beginActivity(now) {
+        if (this.activeSince !== undefined)
+            return;
+        if (this.endLoopTime !== undefined &&
+            now > this.endLoopTime + this.limits.idleResetGapSeconds * 1_000)
+            this.resetEveryCounter();
+        this.endLoopTime = undefined;
+        this.activeSince = now;
+        this.taskCycleSince = now;
+    }
     closeActivityIfIdle(now) {
-        if (this.rootActiveSince !== undefined ||
-            this.runningObserverEpochs.size > 0)
+        if (this.rootRunActive || this.runningObserverEpochs.size > 0)
             return undefined;
         return this.closeActivity(now);
     }
     closeActivity(now) {
         if (this.activeSince === undefined)
             return undefined;
-        const snapshot = {
-            elapsedMs: this.activityElapsed(now),
+        const delta = Math.max(0, now - this.activeSince);
+        this.activeElapsedMs += delta;
+        this.taskElapsedMs += delta;
+        this.taskCycleSince = undefined;
+        this.activeSince = undefined;
+        this.endLoopTime = now;
+        return {
+            elapsedMs: this.activeElapsedMs,
             loops: this.activeLoops,
         };
-        this.activeSince = undefined;
-        this.activeLoops = 0;
-        this.pendingRootTask = false;
-        return snapshot;
     }
     rearmBelowLimits(now) {
-        if (this.mainLoops < this.limits.mainLoopLimit)
+        if (this.rootLoops < this.limits.rootLoopLimit)
             this.latched.delete("ROOT_LOOP_LIMIT");
-        if (this.mainLoops + this.observedChildLoops <
-            this.limits.observedTotalLoopLimit)
-            this.latched.delete("DOMAIN_LOOP_LIMIT");
-        if (this.elapsed(now) < this.wallClockLimitMs())
-            this.latched.delete("CONTINUOUS_DOMAIN_ACTIVE_TIME");
+        if (this.rootLoops + this.otherAgentLoops < this.limits.allLoopLimit)
+            this.latched.delete("ALL_LOOP_LIMIT");
+        if (this.taskElapsed(now) < this.taskLimitMs())
+            this.latched.delete("TASK_TIME_LIMIT");
     }
     evaluate(now, includeLoops = true, resetWarningCycle = true) {
         const warnings = [];
-        const total = this.mainLoops + this.observedChildLoops;
-        if (includeLoops && this.mainLoops >= this.limits.mainLoopLimit)
+        const total = this.rootLoops + this.otherAgentLoops;
+        if (includeLoops && this.rootLoops >= this.limits.rootLoopLimit)
             this.latch("ROOT_LOOP_LIMIT", warnings);
-        if (includeLoops && total >= this.limits.observedTotalLoopLimit)
-            this.latch("DOMAIN_LOOP_LIMIT", warnings);
-        if (this.rootActiveSince !== undefined &&
-            this.elapsed(now) >= this.wallClockLimitMs())
-            this.latch("CONTINUOUS_DOMAIN_ACTIVE_TIME", warnings);
+        if (includeLoops && total >= this.limits.allLoopLimit)
+            this.latch("ALL_LOOP_LIMIT", warnings);
+        if (this.activeSince !== undefined &&
+            this.taskElapsed(now) >= this.taskLimitMs())
+            this.latch("TASK_TIME_LIMIT", warnings);
         if (warnings.length === 0)
             return transition();
         const triggerStatus = this.status(now);
@@ -247,25 +243,25 @@ export class TaskController {
             warnings.push(kind);
         }
     }
-    wallClockLimitMs() {
-        return this.limits.wallClockMinutes * 60 * 1000;
+    taskLimitMs() {
+        return this.limits.taskMinutes * 60 * 1000;
     }
-    elapsed(now) {
-        return (this.settledElapsedMs +
-            (this.rootActiveSince === undefined
+    taskElapsed(now) {
+        return (this.taskElapsedMs +
+            (this.taskCycleSince === undefined
                 ? 0
-                : Math.max(0, now - this.rootActiveSince)));
+                : Math.max(0, now - this.taskCycleSince)));
     }
-    activityElapsed(now) {
-        return this.activeSince === undefined
-            ? 0
-            : Math.max(0, now - this.activeSince);
+    activeElapsed(now) {
+        return (this.activeElapsedMs +
+            (this.activeSince === undefined ? 0 : Math.max(0, now - this.activeSince)));
     }
 }
 export function controllerOptionsFromConfig(config) {
     return {
-        mainLoopLimit: config.mainLoopLimit,
-        observedTotalLoopLimit: config.observedTotalLoopLimit,
-        wallClockMinutes: config.wallClockMinutes,
+        rootLoopLimit: config.rootLoopLimit,
+        allLoopLimit: config.allLoopLimit,
+        taskMinutes: config.taskMinutes,
+        idleResetGapSeconds: config.idleResetGapSeconds,
     };
 }

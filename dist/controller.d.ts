@@ -1,10 +1,11 @@
 import type { ActivitySnapshot, ActivityStatus } from "./activity.js";
 import { type WatchdogConfig } from "./config.js";
-export type WarningKind = "ROOT_LOOP_LIMIT" | "DOMAIN_LOOP_LIMIT" | "CONTINUOUS_DOMAIN_ACTIVE_TIME";
+export type WarningKind = "ROOT_LOOP_LIMIT" | "ALL_LOOP_LIMIT" | "TASK_TIME_LIMIT";
 export interface RuntimeLimits {
-    mainLoopLimit: number;
-    observedTotalLoopLimit: number;
-    wallClockMinutes: number;
+    rootLoopLimit: number;
+    allLoopLimit: number;
+    taskMinutes: number;
+    idleResetGapSeconds: number;
 }
 export interface ControllerTransition {
     warnings: WarningKind[];
@@ -13,42 +14,40 @@ export interface ControllerTransition {
 }
 export interface TaskStatus {
     epoch: number;
-    mainLoops: number;
-    observedChildLoops: number;
-    observedTotalLoops: number;
-    observedChildSessions: number;
+    rootLoops: number;
+    otherAgentLoops: number;
+    allLoops: number;
+    observableAgentSessions: number;
     limits: RuntimeLimits;
     configuredLimits: RuntimeLimits;
     latchedWarnings: WarningKind[];
-    /** True only while the root agent is running; drives root-only wall-clock warnings. */
+    /** True while any observable agent is running ordinary work. */
     rootActive: boolean;
-    /** Root and bound-running child activity for the current root epoch. */
+    /** Frozen or live active-cycle aggregate, including all observable agents. */
     activity: ActivityStatus;
-    wallClockElapsedMs: number;
+    taskElapsedMs: number;
     coverage: string;
 }
-export interface TaskControllerOptions extends Partial<Omit<RuntimeLimits, "wallClockMinutes">> {
-    wallClockMinutes?: number;
+export interface TaskControllerOptions extends Partial<RuntimeLimits> {
 }
 export declare class TaskController {
     private readonly configuredLimits;
     private limits;
     private epoch;
-    private mainLoops;
+    private rootLoops;
+    private otherAgentLoops;
     private activeLoops;
-    private observedChildLoops;
+    private activeElapsedMs;
+    private taskElapsedMs;
+    private taskCycleSince;
     private observerEpochs;
     private runningObserverEpochs;
     private latched;
-    /** Root agent run may begin before Pi delivers the first root user message. */
     private rootRunActive;
-    /** A root user task awaits its first root or observable-child participant. */
-    private pendingRootTask;
-    /** Current epoch's active-window start; undefined when no participant runs. */
+    /** Start of the current aggregate-busy segment. */
     private activeSince;
-    /** Root-only timer start; it freezes as soon as the root settles. */
-    private rootActiveSince;
-    private settledElapsedMs;
+    /** Exact all-idle timestamp used by the strict greater-than gap guard. */
+    private endLoopTime;
     constructor(options?: TaskControllerOptions);
     startRootTask(now: number, rootRunning?: boolean): ActivitySnapshot | undefined;
     bindObserver(observerId: string): number;
@@ -57,22 +56,25 @@ export declare class TaskController {
     unbindObserver(observerId: string, now: number, epoch?: number): ActivitySnapshot | undefined;
     completeRootTurn(now: number): ControllerTransition;
     completeObserverTurn(observerId: string, epoch: number, now: number): ControllerTransition;
-    resetRuntime(now: number): void;
+    /** Reset the task/root/all reminder cycle while preserving the active cycle. */
+    resetReminderCycle(_now: number): void;
     private resetWarningCycle;
+    private resetEveryCounter;
     setLimits(limits: Partial<RuntimeLimits>, now: number, resetWarningCycle?: boolean): ControllerTransition;
     restoreConfiguredDefaults(now: number, resetWarningCycle?: boolean): ControllerTransition;
     startRootActiveSegment(now: number): void;
     settleRootActiveSegment(now: number): ActivitySnapshot | undefined;
     finalize(): void;
-    evaluateWallClock(now: number): ControllerTransition;
+    evaluateTaskTime(now: number): ControllerTransition;
     status(now: number): TaskStatus;
+    private beginActivity;
     private closeActivityIfIdle;
     private closeActivity;
     private rearmBelowLimits;
     private evaluate;
     private latch;
-    private wallClockLimitMs;
-    private elapsed;
-    private activityElapsed;
+    private taskLimitMs;
+    private taskElapsed;
+    private activeElapsed;
 }
 export declare function controllerOptionsFromConfig(config: WatchdogConfig): TaskControllerOptions;

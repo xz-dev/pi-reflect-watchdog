@@ -14,12 +14,14 @@ export interface ReflectionDecision {
     readonly nextStep: string;
 }
 export interface ReflectionThresholdSnapshot {
+    readonly activeMs: number;
+    readonly activeLoops: number;
+    readonly taskMs: number;
+    readonly taskMinutes: number;
     readonly rootLoops: number;
     readonly rootLoopLimit: number;
-    readonly domainLoops: number;
-    readonly domainLoopLimit: number;
-    readonly continuousDomainActiveMs: number;
-    readonly continuousDomainActiveMinutes: number;
+    readonly allLoops: number;
+    readonly allLoopLimit: number;
 }
 export interface ReflectionPromptContext {
     readonly semanticPrefix: string;
@@ -39,9 +41,6 @@ export type ReflectionValidation = {
     readonly valid: false;
     readonly error: string;
 };
-/** Extract one unique bare trailing reflection XML document, case-insensitively. */
-export declare function extractTrailingReflectionXml(text: string): string | null;
-/** Parse required case-insensitive tags while rejecting duplicate required fields. */
 export declare function parseReflectionXml(text: string): ReflectionValidation;
 /** Append all non-customizable facts and parser constraints to the semantic prefix. */
 export declare function buildReflectionPrompt(context: ReflectionPromptContext): string;

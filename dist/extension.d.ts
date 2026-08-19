@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type LoadedConfig } from "./config-loader.js";
+import { type FatalExitAdapter } from "./fatal-exit.js";
 import { type ReflectDomainCoordinator } from "./process-domain.js";
 type Timer = ReturnType<typeof setTimeout>;
 export type WatchdogTimerRole = "threshold" | "tui-refresh" | "rpc-status";
@@ -14,6 +15,7 @@ export interface RuntimeServices {
     clearTimeout(timer: Timer): void;
     loadConfig(cwd: string, trusted: boolean): Promise<LoadedConfig>;
     processDomain: ReflectDomainCoordinator;
+    fatalExit: FatalExitAdapter;
     /** Optional role-aware scheduling seam; production falls back to setTimeout. */
     scheduleTimer?(role: WatchdogTimerRole, callback: () => void, delay: number): Timer;
 }

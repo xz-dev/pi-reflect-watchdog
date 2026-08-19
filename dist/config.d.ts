@@ -1,7 +1,8 @@
 export interface WatchdogConfig {
-    mainLoopLimit: number;
-    observedTotalLoopLimit: number;
-    wallClockMinutes: number;
+    rootLoopLimit: number;
+    allLoopLimit: number;
+    taskMinutes: number;
+    idleResetGapSeconds: number;
     reflectionPrompt: string;
 }
 export type ConfigInput = Record<string, unknown>;

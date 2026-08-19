@@ -17,11 +17,11 @@ export interface WidgetTheme {
 export interface WidgetState {
     activity: ActivityStatus;
     taskElapsedMs: number;
-    wallClockMinutes: number;
+    taskMinutes: number;
     rootLoops: number;
-    mainLoopLimit: number;
-    observedTotalLoops: number;
-    observedTotalLoopLimit: number;
+    rootLoopLimit: number;
+    allLoops: number;
+    allLoopLimit: number;
 }
 /** Compact duration: seconds under a minute, then m+s, then h+m. */
 export declare function formatDuration(ms: number): string;

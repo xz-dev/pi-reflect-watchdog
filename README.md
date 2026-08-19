@@ -1,17 +1,19 @@
 # pi-reflect-watchdog
 
-`pi-reflect-watchdog` is a Pi extension that monitors long-running multi-agent work and asks the current root agent to reassess its route when exact loop or continuous-active thresholds are reached.
+`pi-reflect-watchdog` is a Pi extension that monitors long-running multi-agent work and asks the current root agent to reassess its route when exact active/task/root/all thresholds are reached.
 
 ## Runtime contract
 
 - A loop is one completed ordinary Pi `turn_end`, not a tool call, tool result, or message.
-- Built-in thresholds are 100 root loops, 500 process-domain loops, and 30 minutes of continuous aggregate active time.
-- `pi-process-domain` owns the exact cross-process counters. Every participating process atomically contributes completed turns; the root owns pause/reset/resume and active-time ticking.
-- Continuous active time advances by one fixed recursive `setTimeout` quantum while the broker reports any participant busy. Late callbacks add one quantum only, so host sleep is never backfilled.
-- Aggregate idle starts one fixed 10-second handoff grace. Activity returning within that generation continues the same active window; uninterrupted idle through the grace resets continuous active time.
-- Any threshold queues one reflection. Reasons crossed together are merged as `ROOT_LOOP_LIMIT`, `DOMAIN_LOOP_LIMIT`, and/or `CONTINUOUS_DOMAIN_ACTIVE_TIME`, with one pre-reset threshold snapshot.
-- `/reflect [supplement]` queues a manual `USER_REQUEST` reflection. Whitespace-only input means no supplement; nonblank text is persisted with the result.
-- All automatic and manual reflections use one serialized queue. While a reflection and its XML corrections run, broker counters and timers are paused; the reflection turns themselves are not counted. Completion resets and resumes the cycle.
+- Built-in thresholds are 100 root loops, 500 process-wide loops, and 30 minutes of aggregate active task time. The built-in idle reset gap is 60 seconds.
+- `active` time and `active loops` cover ordinary work by the root and every observable agent or subagent. `root` loops count only root turns; `all` loops count every observable ordinary turn.
+- `pi-reflect-watchdog` owns exact cross-process counters, activity state, certainty, generation, fences, reflection pause/resume, and active-time ticking. `pi-extension-utils` provides only authenticated transport, peer state, strict XML, and inquiry primitives.
+- Active and task time advance by one fixed recursive `setTimeout` quantum while any participant is busy. Late callbacks add one quantum only, so host sleep is never backfilled.
+- The all-idle edge has no debounce or grace period. It immediately freezes active/task time and records `the_end_loop_time`. Resuming at exactly the configured gap continues the same counters; only a strictly longer gap resets active time/loops and task/root/all counters before work resumes.
+- Any task/root/all threshold queues one reflection. Reasons crossed together are merged as `ROOT_LOOP_LIMIT`, `ALL_LOOP_LIMIT`, and/or `TASK_TIME_LIMIT`, with one pre-reset threshold snapshot. Acknowledging an automatic threshold resets task time plus root/all loops while preserving active time/loops.
+- `/reflect [supplement]` queues a manual `USER_REQUEST` reflection. Whitespace-only input means no supplement; nonblank text is persisted with the result. A manual reflection pauses counters but does not reset the task/root/all reminder cycle.
+- All automatic and manual reflections use one serialized queue. While a reflection and its XML corrections run, active/task/root/all counters and watchdog timers are paused; the reflection turns themselves are not counted. Completion resumes the appropriate cycle without self-counting.
+- Process exit or watchdog shutdown destroys all in-memory timer, counter, timestamp, and pause state. Persisted reflection history remains session data.
 
 The extension is not a subagent controller. It observes only processes that load it and join the inherited authenticated process domain.
 
@@ -23,7 +25,7 @@ The prompt is layered from:
 2. Global `getAgentDir()/pi-reflect-watchdog.json`.
 3. Trusted project `.pi/pi-reflect-watchdog.json`.
 
-Only the semantic prefix is configurable. The plugin always appends its local RFC3339 timestamp, trigger reasons, threshold snapshot, previous stored reflection, optional user supplement, shared tool budget, and XML contract.
+Only the semantic prefix is configurable. The plugin always appends its local RFC3339 timestamp, trigger reasons, active/task/root/all threshold snapshot, previous stored reflection, optional user supplement, shared tool budget, and XML contract.
 
 Each reflection may make at most 10 tool calls across all XML attempts; call 11 is blocked before execution. There are at most three total invalid XML attempts. The final non-thinking text is limited to 16,384 Unicode characters and must end with exactly one trailing block:
 
@@ -37,7 +39,7 @@ Each reflection may make at most 10 tool calls across all XML attempts; call 11 
 </reflection>
 ```
 
-Tag names and the `type` value are case-insensitive. `type`, `reason`, `done`, `current_step`, and `next_step` are unique, required, and non-empty. XML entities are decoded; duplicate roots or fields, attributes, malformed nesting, and oversized text are rejected.
+XML tag names and the `type` value are case-sensitive. `type`, `reason`, `done`, `current_step`, and `next_step` are the only fields; each is unique, required, and non-empty. XML 1.0 entities are decoded; duplicate roots or fields, attributes, malformed nesting, invalid characters, trailing prose, and oversized text are rejected.
 
 `NO_ISSUE` persists and renders one TUI report, then ends without another work turn. `ROUTE_CORRECTION` persists the same report first, sends its readable form to the agent, and starts one ordinary work turn.
 
@@ -47,14 +49,15 @@ Global and trusted-project files merge field-by-field over built-ins:
 
 ```json
 {
-  "mainLoopLimit": 100,
-  "observedTotalLoopLimit": 500,
-  "wallClockMinutes": 30,
+  "rootLoopLimit": 100,
+  "allLoopLimit": 500,
+  "taskMinutes": 30,
+  "idleResetGapSeconds": 60,
   "reflectionPrompt": "Reassess the current route using verified evidence."
 }
 ```
 
-Limits must be positive JavaScript safe integers. `reflectionPrompt` must be nonblank and within its configured Unicode bound. Unknown or invalid fields preserve the lower-precedence value and produce bounded diagnostics. The extension reads only `pi-reflect-watchdog.json`; it does not read the old `pi-watchdog.json` filename.
+Limits and the idle reset gap must be positive JavaScript safe integers. `reflectionPrompt` must be nonblank and within its configured Unicode bound. Unknown or invalid fields preserve the lower-precedence value and produce bounded diagnostics. The extension reads only `pi-reflect-watchdog.json`; it does not read the old `pi-watchdog.json` filename.
 
 ## Control plane
 
@@ -65,7 +68,7 @@ Root-only slash commands:
 /reflect-watchdog [status]
 /reflect-watchdog reset
 /reflect-watchdog limits
-/reflect-watchdog limits <root> <domain> <minutes>
+/reflect-watchdog limits <root> <all> <minutes> <idle-reset-seconds>
 /reflect-watchdog limits reset
 /reflect-timeline
 ```
@@ -82,7 +85,11 @@ There are no `/watchdog` or `watchdog_control` aliases.
 
 Reflection records are context-excluded custom entries on the current session branch. Each stores the plugin timestamp, all trigger reasons, threshold snapshot, optional supplement, validated decision, and formatted report.
 
-`/reflect-timeline` reads that branch. TUI mode opens a scrollable `ctx.ui.custom` view with arrow/j/k/PageUp/PageDown navigation. RPC, print, and JSON modes receive a bounded text notification. The below-editor TUI widget shows current broker-authoritative root loops, domain loops, and continuous active time.
+`/reflect-timeline` reads that branch. TUI mode opens a scrollable `ctx.ui.custom` view with arrow/j/k/PageUp/PageDown navigation. RPC, print, and JSON modes receive a bounded text notification. The below-editor TUI widget shows:
+
+```text
+Reflect Watchdog | active <time>/<all-loops> loops · task <time>/<limit> · root <loops>/<limit> · all <loops>/<limit>
+```
 
 ## Install
 
@@ -95,7 +102,7 @@ pi install git:github.com/xz-dev/pi-reflect-watchdog@release
 
 Local development installs can use an absolute checkout path. Source installs load `src/extension.ts`; packed/release artifacts load `dist/extension.js`.
 
-`pi-process-domain` is an exact Git dependency and must be pinned to a revision that exports the named cycle-counter API used by this extension.
+`pi-extension-utils` is an exact Git dependency pinned to a full commit SHA. The extension uses its authenticated loopback TCP transport, strict XML parser, and Pi inquiry correlation/folding APIs. The tracked `.npmrc` uses `allow-git=root` and `legacy-peer-deps=true`: only this package's reviewed direct Git dependency is admitted, while Pi peer packages remain host-provided. The transport is pure TypeScript over `node:net` and has no native install scripts.
 
 ## Development
 
@@ -110,6 +117,6 @@ npm run test:e2e
 
 ## Security
 
-Pi extensions execute with user permissions. Process-domain keys and reservation capabilities are bearer secrets and must not be logged. Project configuration is ignored unless Pi marks the project trusted. Do not put credentials in `reflectionPrompt` or `/reflect` supplements.
+Pi extensions execute with user permissions. Process-domain declarations contain bearer capabilities and must not be logged. Project configuration is ignored unless Pi marks the project trusted. Do not put credentials in `reflectionPrompt` or `/reflect` supplements.
 
 Licensed under the [BSD 3-Clause License](LICENSE).

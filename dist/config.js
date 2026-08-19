@@ -1,8 +1,9 @@
 import { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export const BUILT_IN_CONFIG = Object.freeze({
-    mainLoopLimit: 100,
-    observedTotalLoopLimit: 500,
-    wallClockMinutes: 30,
+    rootLoopLimit: 100,
+    allLoopLimit: 500,
+    taskMinutes: 30,
+    idleResetGapSeconds: 60,
     reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 });
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -40,9 +41,10 @@ export function validateConfig(source, value) {
         }
     }
     for (const key of [
-        "mainLoopLimit",
-        "observedTotalLoopLimit",
-        "wallClockMinutes",
+        "rootLoopLimit",
+        "allLoopLimit",
+        "taskMinutes",
+        "idleResetGapSeconds",
     ]) {
         if (input[key] === undefined)
             continue;
@@ -73,12 +75,14 @@ export function mergeConfig(global, project) {
     ];
     const config = { ...BUILT_IN_CONFIG };
     for (const { config: partial } of layers) {
-        if (partial.mainLoopLimit !== undefined)
-            config.mainLoopLimit = partial.mainLoopLimit;
-        if (partial.observedTotalLoopLimit !== undefined)
-            config.observedTotalLoopLimit = partial.observedTotalLoopLimit;
-        if (partial.wallClockMinutes !== undefined)
-            config.wallClockMinutes = partial.wallClockMinutes;
+        if (partial.rootLoopLimit !== undefined)
+            config.rootLoopLimit = partial.rootLoopLimit;
+        if (partial.allLoopLimit !== undefined)
+            config.allLoopLimit = partial.allLoopLimit;
+        if (partial.taskMinutes !== undefined)
+            config.taskMinutes = partial.taskMinutes;
+        if (partial.idleResetGapSeconds !== undefined)
+            config.idleResetGapSeconds = partial.idleResetGapSeconds;
         if (partial.reflectionPrompt !== undefined)
             config.reflectionPrompt = partial.reflectionPrompt;
     }

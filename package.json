@@ -13,7 +13,7 @@
     "url": "https://github.com/xz-dev/pi-reflect-watchdog/issues"
   },
   "engines": {
-    "node": ">=22.14.0"
+    "node": ">=22.19.0"
   },
   "keywords": [
     "pi-package",
@@ -41,6 +41,6 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
-    "pi-process-domain": "git+https://github.com/xz-dev/pi-process-domain.git#e0cdac6537cc11daeba0596833f6b441d887d92f"
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#a9043f0efef765789c221c1193373a8405792f1f"
   }
 }

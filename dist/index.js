@@ -7,5 +7,5 @@ export { createWatchdogExtension } from "./extension.js";
 export { HUB_SYMBOL, } from "./hub.js";
 export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export { formatHistoryResult, formatReflectionReport, MAX_HISTORY_RESULT_ITEMS, parseReflectionHistoryData, queryReflectionHistory, REFLECTION_HISTORY_ENTRY_TYPE, reflectionHistory, } from "./reflection-history.js";
-export { buildReflectionPrompt, buildReflectionReaskPrompt, extractTrailingReflectionXml, MAX_REFLECTION_REASKS, MAX_REFLECTION_TEXT_CHARACTERS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, } from "./reflection-protocol.js";
+export { buildReflectionPrompt, buildReflectionReaskPrompt, MAX_REFLECTION_REASKS, MAX_REFLECTION_TEXT_CHARACTERS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, } from "./reflection-protocol.js";
 export { createWatchdogWidget, formatDuration, formatWidgetText, WIDGET_KEY, } from "./widget.js";

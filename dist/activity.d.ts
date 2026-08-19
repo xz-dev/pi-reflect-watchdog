@@ -1,26 +1,10 @@
-/**
- * Root activity tracker: pairs root-only active time with completed root
- * turns inside the current automatic activity window.
- *
- * The window is deliberately separate from the watchdog's manual-reset cycle
- * counters. It resets only on automatic boundaries: the root agent settling,
- * or an interjecting/new root user message replacing a currently active
- * window. Threshold crossings and runtime controls never touch it.
- *
- * A root user message while idle arms the window so the next agent run
- * accrues from its agent_start; a root user message inside an active run
- * continues accruing (Pi emits no agent_start between a steering/interjected
- * message and the run that consumes it).
- *
- * All state is instance-scoped and every clock value comes from the caller,
- * so behavior is deterministic in tests.
- */
+/** Aggregate active-cycle projection used by the local status fallback. */
 export interface ActivityStatus {
-    /** True while the current window is accruing active time. */
+    /** True while the active cycle is currently accruing ordinary work. */
     active: boolean;
-    /** Root-only active milliseconds in the current window, excluding idle. */
+    /** Aggregate active milliseconds, frozen at the all-idle edge. */
     elapsedMs: number;
-    /** Completed root turns in the current window. */
+    /** Ordinary turns completed by every observable agent in the active cycle. */
     loops: number;
 }
 export interface ActivitySnapshot {
@@ -28,34 +12,26 @@ export interface ActivitySnapshot {
     loops: number;
 }
 export declare class RootActivityTracker {
+    private readonly idleResetGapSeconds;
     /** A root agent run is in flight (seen agent_start without a later settle). */
     private rootRunActive;
-    /** A root user message arrived while idle; the next run starts the window. */
+    /** A root user message arrived while idle; the next run resumes the cycle. */
     private pendingTask;
-    /** Start time of the current segment; undefined while no window is begun. */
     private activeSince;
-    private activeLoops;
+    private endLoopTime;
+    private elapsedMs;
+    private loops;
+    constructor(idleResetGapSeconds?: number);
     /**
-     * Record the start of a root agent run. A window armed by a root user
-     * message while idle begins accruing here; a run without a task (Pi emits
-     * agent_start before the first user message) begins nothing by itself.
+     * A user-armed run resumes the active cycle. Exactly the configured idle
+     * gap resumes; only a strictly longer gap starts a fresh active cycle.
      */
     beginRun(now: number): void;
-    /**
-     * A root user message starts (or interrupts) a task. When a begun window
-     * exists, it is reset and its snapshot returned; an interjection during an
-     * idle gap arms the next run and returns undefined.
-     */
+    /** A root user message arms work without resetting reminder counters. */
     startRootTask(now: number): ActivitySnapshot | undefined;
-    /** Count one completed root turn in the current window. */
     completeRootTurn(): void;
-    /**
-     * The root agent settled. A begun window is reset and its snapshot
-     * returned; a settle without a begun window returns undefined.
-     */
+    /** Freeze the active cycle immediately at the all-idle edge. */
     settle(now: number): ActivitySnapshot | undefined;
-    /** Drop all state without emitting anything (demotion/shutdown). */
     finalize(): void;
     status(now: number): ActivityStatus;
-    private snapshot;
 }

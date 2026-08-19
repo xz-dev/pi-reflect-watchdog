@@ -22,13 +22,10 @@ export function formatDuration(ms) {
 }
 export function formatWidgetText(state) {
     const active = state.activity;
-    const head = active.active
-        ? `active ${formatDuration(active.elapsedMs)}/${active.loops} loops`
-        : `idle · active ${formatDuration(active.elapsedMs)}/${active.loops} loops`;
-    return (`Reflect Watchdog | ${head}` +
-        ` · task ${formatDuration(state.taskElapsedMs)}/${state.wallClockMinutes}m` +
-        ` · root ${state.rootLoops}/${state.mainLoopLimit}` +
-        ` · observed ${state.observedTotalLoops}/${state.observedTotalLoopLimit}`);
+    return (`Reflect Watchdog | active ${formatDuration(active.elapsedMs)}/${active.loops} loops` +
+        ` · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
+        ` · root ${state.rootLoops}/${state.rootLoopLimit}` +
+        ` · all ${state.allLoops}/${state.allLoopLimit}`);
 }
 export function createWatchdogWidget(theme, state) {
     return {

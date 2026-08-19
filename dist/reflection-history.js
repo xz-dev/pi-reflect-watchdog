@@ -14,12 +14,14 @@ function isThresholds(value) {
     if (!isObject(value))
         return false;
     return [
+        "activeMs",
+        "activeLoops",
+        "taskMs",
+        "taskMinutes",
         "rootLoops",
         "rootLoopLimit",
-        "domainLoops",
-        "domainLoopLimit",
-        "continuousDomainActiveMs",
-        "continuousDomainActiveMinutes",
+        "allLoops",
+        "allLoopLimit",
     ].every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0);
 }
 export function parseReflectionHistoryData(value) {
@@ -31,8 +33,8 @@ export function parseReflectionHistoryData(value) {
         !Array.isArray(value.reasons) ||
         value.reasons.length === 0 ||
         !value.reasons.every((reason) => reason === "ROOT_LOOP_LIMIT" ||
-            reason === "DOMAIN_LOOP_LIMIT" ||
-            reason === "CONTINUOUS_DOMAIN_ACTIVE_TIME" ||
+            reason === "ALL_LOOP_LIMIT" ||
+            reason === "TASK_TIME_LIMIT" ||
             reason === "USER_REQUEST") ||
         !isThresholds(value.thresholds) ||
         !isDecision(value.decision) ||
@@ -82,7 +84,7 @@ export function formatReflectionReport(entry) {
         `Reflection · ${entry.decision.type}`,
         `Time: ${entry.timestamp}`,
         `Trigger: ${entry.reasons.join(", ")}`,
-        `Thresholds: root=${entry.thresholds.rootLoops}/${entry.thresholds.rootLoopLimit}; domain=${entry.thresholds.domainLoops}/${entry.thresholds.domainLoopLimit}; continuous-domain-active=${entry.thresholds.continuousDomainActiveMs}ms/${entry.thresholds.continuousDomainActiveMinutes}m`,
+        `Thresholds: active=${entry.thresholds.activeMs}ms/${entry.thresholds.activeLoops} loops; task=${entry.thresholds.taskMs}ms/${entry.thresholds.taskMinutes}m; root=${entry.thresholds.rootLoops}/${entry.thresholds.rootLoopLimit}; all=${entry.thresholds.allLoops}/${entry.thresholds.allLoopLimit}`,
         `User supplement: ${supplement ? supplement : "(none)"}`,
         `Reason: ${entry.decision.reason}`,
         `Done: ${entry.decision.done}`,
