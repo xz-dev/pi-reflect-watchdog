@@ -4,9 +4,10 @@ export type ReflectWatchdogCommand =
 	| { action: "limits-show" }
 	| {
 			action: "limits-set";
-			mainLoopLimit: number;
-			observedTotalLoopLimit: number;
-			wallClockMinutes: number;
+			rootLoopLimit: number;
+			allLoopLimit: number;
+			taskMinutes: number;
+			idleResetGapSeconds: number;
 	  }
 	| { action: "limits-reset" };
 
@@ -19,7 +20,7 @@ export const REFLECT_COMMAND = "reflect";
 export const REFLECT_TIMELINE_COMMAND = "reflect-timeline";
 
 export const REFLECT_WATCHDOG_USAGE =
-	"Usage: /reflect-watchdog [status|reset|limits [<main> <observed> <minutes>|reset]]";
+	"Usage: /reflect-watchdog [status|reset|limits [<root> <all> <minutes> <idle-reset-seconds>|reset]]";
 
 function positiveSafeInteger(token: string | undefined): number | undefined {
 	if (token === undefined || !/^\d+$/.test(token)) return undefined;
@@ -40,26 +41,27 @@ export function parseReflectWatchdogCommand(
 		if (words.length === 1) return { command: { action: "limits-show" } };
 		if (words.length === 2 && words[1] === "reset")
 			return { command: { action: "limits-reset" } };
-		if (words.length === 4) {
-			const [mainLoopLimit, observedTotalLoopLimit, wallClockMinutes] = words
-				.slice(1)
-				.map(positiveSafeInteger);
+		if (words.length === 5) {
+			const [rootLoopLimit, allLoopLimit, taskMinutes, idleResetGapSeconds] =
+				words.slice(1).map(positiveSafeInteger);
 			if (
-				mainLoopLimit !== undefined &&
-				observedTotalLoopLimit !== undefined &&
-				wallClockMinutes !== undefined
+				rootLoopLimit !== undefined &&
+				allLoopLimit !== undefined &&
+				taskMinutes !== undefined &&
+				idleResetGapSeconds !== undefined
 			)
 				return {
 					command: {
 						action: "limits-set",
-						mainLoopLimit,
-						observedTotalLoopLimit,
-						wallClockMinutes,
+						rootLoopLimit,
+						allLoopLimit,
+						taskMinutes,
+						idleResetGapSeconds,
 					},
 				};
 		}
 		return {
-			error: `Limits must use three positive safe integers. ${REFLECT_WATCHDOG_USAGE}`,
+			error: `Limits must use four positive safe integers. ${REFLECT_WATCHDOG_USAGE}`,
 		};
 	}
 	return {

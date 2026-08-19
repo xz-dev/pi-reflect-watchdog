@@ -37,15 +37,15 @@ test("idle state renders the meaningful zero line", () => {
 	const state: WidgetState = {
 		activity: { active: false, elapsedMs: 0, loops: 0 },
 		taskElapsedMs: 0,
-		wallClockMinutes: 30,
+		taskMinutes: 30,
 		rootLoops: 0,
-		mainLoopLimit: 100,
-		observedTotalLoops: 0,
-		observedTotalLoopLimit: 500,
+		rootLoopLimit: 100,
+		allLoops: 0,
+		allLoopLimit: 500,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | idle · active 0s/0 loops · task 0s/30m · root 0/100 · observed 0/500",
+		"Reflect Watchdog | active 0s/0 loops · task 0s/30m · root 0/100 · all 0/500",
 	);
 });
 
@@ -57,15 +57,15 @@ test("live state renders the exact approved example format", () => {
 			loops: 137,
 		},
 		taskElapsedMs: 12 * 60_000 + 40_000,
-		wallClockMinutes: 30,
+		taskMinutes: 30,
 		rootLoops: 37,
-		mainLoopLimit: 100,
-		observedTotalLoops: 128,
-		observedTotalLoopLimit: 500,
+		rootLoopLimit: 100,
+		allLoops: 128,
+		allLoopLimit: 500,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · all 128/500",
 	);
 });
 
@@ -74,17 +74,17 @@ test("component renders one truncated line through truncateToWidth", () => {
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
 		activity: { active: true, elapsedMs: 8_040_000, loops: 137 },
 		taskElapsedMs: 760_000,
-		wallClockMinutes: 30,
+		taskMinutes: 30,
 		rootLoops: 37,
-		mainLoopLimit: 100,
-		observedTotalLoops: 128,
-		observedTotalLoopLimit: 500,
+		rootLoopLimit: 100,
+		allLoops: 128,
+		allLoopLimit: 500,
 	}));
 	const full = widget.render(width);
 	assert.equal(full.length, 1);
 	assert.equal(
 		full[0],
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · observed 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · all 128/500",
 	);
 	width = 40;
 	const narrow = widget.render(width);
@@ -98,11 +98,11 @@ test("component re-reads live state on every render", () => {
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
 		activity: { active: true, elapsedMs: elapsed, loops: 1 },
 		taskElapsedMs: elapsed,
-		wallClockMinutes: 30,
+		taskMinutes: 30,
 		rootLoops: 1,
-		mainLoopLimit: 100,
-		observedTotalLoops: 1,
-		observedTotalLoopLimit: 500,
+		rootLoopLimit: 100,
+		allLoops: 1,
+		allLoopLimit: 500,
 	}));
 	assert.match(widget.render(200)[0], /active 1s\/1 loops/);
 	elapsed = 2_000;

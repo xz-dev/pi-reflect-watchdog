@@ -9,12 +9,12 @@ import {
 
 export const FATAL_EXIT_CODE = 78;
 
-const ACTIVITY_CHANNEL = "pi-reflect-watchdog.activity.v1";
-const LOOP_CHANNEL = "pi-reflect-watchdog.loop.v1";
-const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v1";
-const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v1";
+const ACTIVITY_CHANNEL = "pi-reflect-watchdog.activity.v2";
+const LOOP_CHANNEL = "pi-reflect-watchdog.loop.v2";
+const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v2";
+const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v2";
 const ACTIVE_TICK_MS = 1_000;
-const IDLE_GRACE_MS = 10_000;
+const IDLE_RESET_GAP_MS = 60_000;
 
 export type ReflectDomainFatalCode =
 	| ProcessDomainOpenErrorCode
@@ -58,10 +58,13 @@ export interface ReflectDomainCounters {
 	readonly generation: bigint;
 	readonly certain: boolean;
 	readonly anyBusy: boolean;
+	readonly endLoopTimeMs: bigint | null;
 	readonly fence: ReflectDomainFence;
-	readonly rootLoops: ReflectCounterValue;
-	readonly domainLoops: ReflectCounterValue;
 	readonly activeMs: ReflectCounterValue;
+	readonly activeLoops: ReflectCounterValue;
+	readonly taskMs: ReflectCounterValue;
+	readonly rootLoops: ReflectCounterValue;
+	readonly allLoops: ReflectCounterValue;
 }
 
 interface ActivityWire {
@@ -72,7 +75,7 @@ interface ActivityWire {
 interface LoopWire {
 	readonly revision: string;
 	readonly rootLoops: string;
-	readonly domainLoops: string;
+	readonly allLoops: string;
 }
 
 interface RevisionWire {
@@ -87,9 +90,12 @@ interface CountersWire {
 	readonly certain: boolean;
 	readonly paused: boolean;
 	readonly anyBusy: boolean;
-	readonly rootLoops: string;
-	readonly domainLoops: string;
+	readonly endLoopTimeMs: string | null;
 	readonly activeMs: string;
+	readonly activeLoops: string;
+	readonly taskMs: string;
+	readonly rootLoops: string;
+	readonly allLoops: string;
 	readonly activityRevisions: readonly RevisionWire[];
 	readonly loopRevisions: readonly RevisionWire[];
 }
@@ -99,7 +105,7 @@ interface PeerActivity {
 	activityRevision: bigint;
 	loopRevision: bigint;
 	rootLoops: bigint;
-	domainLoops: bigint;
+	allLoops: bigint;
 }
 
 interface Attachment {
@@ -119,10 +125,14 @@ export interface ReflectDomainCoordinator {
 	detach(instance: object): Promise<void>;
 	setBusy(instance: object, busy: boolean): Promise<void>;
 	recordRootLoop(): Promise<ReflectDomainCounters>;
-	recordDomainLoop(): Promise<ReflectDomainCounters>;
+	recordAllLoop(): Promise<ReflectDomainCounters>;
 	counters(): ReflectDomainCounters | undefined;
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
-	pauseAndReset(): Promise<ReflectDomainCounters | undefined>;
+	setIdleResetGapSeconds(seconds: number): void;
+	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
+	pauseForReflection(
+		resetReminderCycle: boolean,
+	): Promise<ReflectDomainCounters | undefined>;
 	resume(): Promise<void>;
 }
 
@@ -139,7 +149,8 @@ export interface ReflectDomainOptions {
 	readonly env?: NodeJS.ProcessEnv;
 	readonly clock?: ReflectDomainClock;
 	readonly activeTickMs?: number;
-	readonly idleGraceMs?: number;
+	readonly idleResetGapMs?: number;
+	readonly now?: () => number;
 }
 
 function counter(value = 0n, paused = false): ReflectCounterValue {
@@ -164,10 +175,13 @@ function zeroCounters(
 		generation,
 		certain: state.certain ?? false,
 		anyBusy: state.anyBusy ?? false,
+		endLoopTimeMs: null,
 		fence: { domainEpoch, generation },
-		rootLoops: counter(0n, paused),
-		domainLoops: counter(0n, paused),
 		activeMs: counter(0n, paused),
+		activeLoops: counter(0n, paused),
+		taskMs: counter(0n, paused),
+		rootLoops: counter(0n, paused),
+		allLoops: counter(0n, paused),
 	};
 }
 
@@ -181,12 +195,17 @@ function sameCounters(
 		left.generation === right.generation &&
 		left.certain === right.certain &&
 		left.anyBusy === right.anyBusy &&
+		left.endLoopTimeMs === right.endLoopTimeMs &&
+		left.activeMs.value === right.activeMs.value &&
+		left.activeMs.paused === right.activeMs.paused &&
+		left.activeLoops.value === right.activeLoops.value &&
+		left.activeLoops.paused === right.activeLoops.paused &&
+		left.taskMs.value === right.taskMs.value &&
+		left.taskMs.paused === right.taskMs.paused &&
 		left.rootLoops.value === right.rootLoops.value &&
 		left.rootLoops.paused === right.rootLoops.paused &&
-		left.domainLoops.value === right.domainLoops.value &&
-		left.domainLoops.paused === right.domainLoops.paused &&
-		left.activeMs.value === right.activeMs.value &&
-		left.activeMs.paused === right.activeMs.paused
+		left.allLoops.value === right.allLoops.value &&
+		left.allLoops.paused === right.allLoops.paused
 	);
 }
 
@@ -236,21 +255,21 @@ function parseActivity(
 function parseLoop(value: unknown): {
 	revision: bigint;
 	rootLoops: bigint;
-	domainLoops: bigint;
+	allLoops: bigint;
 } | null {
 	if (typeof value !== "object" || value === null) return null;
 	const wire = value as Partial<LoopWire>;
 	if (
 		!validRevision(wire.revision) ||
 		!validCounterValue(wire.rootLoops) ||
-		!validCounterValue(wire.domainLoops)
+		!validCounterValue(wire.allLoops)
 	)
 		return null;
 	const revision = BigInt(wire.revision);
 	const rootLoops = BigInt(wire.rootLoops);
-	const domainLoops = BigInt(wire.domainLoops);
-	if (domainLoops !== revision || rootLoops > domainLoops) return null;
-	return { revision, rootLoops, domainLoops };
+	const allLoops = BigInt(wire.allLoops);
+	if (allLoops !== revision || rootLoops > allLoops) return null;
+	return { revision, rootLoops, allLoops };
 }
 
 function parseCounters(
@@ -268,9 +287,12 @@ function parseCounters(
 		typeof wire.certain !== "boolean" ||
 		typeof wire.paused !== "boolean" ||
 		typeof wire.anyBusy !== "boolean" ||
-		!validCounterValue(wire.rootLoops) ||
-		!validCounterValue(wire.domainLoops) ||
+		(wire.endLoopTimeMs !== null && !validCounterValue(wire.endLoopTimeMs)) ||
 		!validCounterValue(wire.activeMs) ||
+		!validCounterValue(wire.activeLoops) ||
+		!validCounterValue(wire.taskMs) ||
+		!validCounterValue(wire.rootLoops) ||
+		!validCounterValue(wire.allLoops) ||
 		activityRevisions === null ||
 		loopRevisions === null
 	) {
@@ -284,10 +306,14 @@ function parseCounters(
 			generation,
 			certain: wire.certain,
 			anyBusy: wire.anyBusy,
+			endLoopTimeMs:
+				wire.endLoopTimeMs === null ? null : BigInt(wire.endLoopTimeMs),
 			fence: { domainEpoch: wire.domainEpoch, generation },
-			rootLoops: counter(BigInt(wire.rootLoops), wire.paused),
-			domainLoops: counter(BigInt(wire.domainLoops), wire.paused),
 			activeMs: counter(BigInt(wire.activeMs), wire.paused),
+			activeLoops: counter(BigInt(wire.activeLoops), wire.paused),
+			taskMs: counter(BigInt(wire.taskMs), wire.paused),
+			rootLoops: counter(BigInt(wire.rootLoops), wire.paused),
+			allLoops: counter(BigInt(wire.allLoops), wire.paused),
 		},
 		activityRevision: activityRevisions.get(nodeId) ?? 0n,
 		loopRevision: loopRevisions.get(nodeId) ?? 0n,
@@ -317,7 +343,8 @@ export function createReflectDomainCoordinator(
 			clearTimeout(handle),
 	};
 	const activeTickMs = options.activeTickMs ?? ACTIVE_TICK_MS;
-	const idleGraceMs = options.idleGraceMs ?? IDLE_GRACE_MS;
+	const now = options.now ?? Date.now;
+	let idleResetGapMs = options.idleResetGapMs ?? IDLE_RESET_GAP_MS;
 	const attachments = new Map<object, Attachment>();
 	const listeners = new Set<(counters: ReflectDomainCounters) => void>();
 	const peers = new Map<string, PeerActivity>();
@@ -333,7 +360,6 @@ export function createReflectDomainCoordinator(
 	let paused = false;
 	let transportHealthy = true;
 	let tick: ReturnType<typeof setTimeout> | undefined;
-	let idleGrace: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
 	let unsubscribeActivity: (() => void) | undefined;
 	let unsubscribeLoops: (() => void) | undefined;
@@ -346,7 +372,7 @@ export function createReflectDomainCoordinator(
 	let localActivityRevision = 0n;
 	let localLoopRevision = 0n;
 	let localRootLoops = 0n;
-	let localDomainLoops = 0n;
+	let localAllLoops = 0n;
 	let requiredActivityRevision = 0n;
 	let requiredLoopRevision = 0n;
 
@@ -441,9 +467,11 @@ export function createReflectDomainCoordinator(
 		const current = hostState ?? zeroCounters(paused);
 		return {
 			...current,
-			rootLoops: counter(current.rootLoops.value, paused),
-			domainLoops: counter(current.domainLoops.value, paused),
 			activeMs: counter(current.activeMs.value, paused),
+			activeLoops: counter(current.activeLoops.value, paused),
+			taskMs: counter(current.taskMs.value, paused),
+			rootLoops: counter(current.rootLoops.value, paused),
+			allLoops: counter(current.allLoops.value, paused),
 		};
 	};
 
@@ -458,11 +486,12 @@ export function createReflectDomainCoordinator(
 
 	const publishHostNow = async (): Promise<void> => {
 		if (!rootProcess || node === undefined) return;
+		const currentNode = node;
 		const current = hostCounters();
 		const publishedStateRevision = hostStateRevision;
 		snapshotRevision += 1n;
 		snapshotGeneration += 1n;
-		const domainEpoch = node.declaration.domainId;
+		const domainEpoch = currentNode.declaration.domainId;
 		const counters: ReflectDomainCounters = {
 			...current,
 			domainEpoch,
@@ -485,13 +514,25 @@ export function createReflectDomainCoordinator(
 			certain: counters.certain,
 			paused,
 			anyBusy: counters.anyBusy,
-			rootLoops: counters.rootLoops.value.toString(),
-			domainLoops: counters.domainLoops.value.toString(),
+			endLoopTimeMs: counters.endLoopTimeMs?.toString() ?? null,
 			activeMs: counters.activeMs.value.toString(),
+			activeLoops: counters.activeLoops.value.toString(),
+			taskMs: counters.taskMs.value.toString(),
+			rootLoops: counters.rootLoops.value.toString(),
+			allLoops: counters.allLoops.value.toString(),
 			activityRevisions: revisionMap(activityRevisions),
 			loopRevisions: revisionMap(loopRevisions),
 		};
-		await node.broadcast(COUNTERS_CHANNEL, message);
+		const targets = [...peers.keys()].filter((nodeId) =>
+			currentNode
+				.peers()
+				.some((peer) => peer.nodeId === nodeId && peer.status === "online"),
+		);
+		await Promise.all(
+			targets.map((nodeId) =>
+				currentNode.send(nodeId, COUNTERS_CHANNEL, message),
+			),
+		);
 		transportHealthy = true;
 		if (publishedStateRevision === hostStateRevision) notify(counters);
 	};
@@ -525,10 +566,12 @@ export function createReflectDomainCoordinator(
 			activity.revision <= current.activityRevision
 		)
 			return;
+		const wasBusy = hostBusy();
 		current.busy = activity.busy;
 		current.activityRevision = activity.revision;
 		hostStateRevision += 1n;
 		uncertainPeers.delete(message.senderId);
+		applyAggregateBusyTransition(wasBusy, hostBusy());
 		void publishHost()
 			.then(updateHostTimers)
 			.catch(() => {});
@@ -547,40 +590,62 @@ export function createReflectDomainCoordinator(
 			current === undefined ||
 			loop.revision <= current.loopRevision ||
 			loop.rootLoops < current.rootLoops ||
-			loop.domainLoops < current.domainLoops
+			loop.allLoops < current.allLoops
 		)
 			return;
 		const rootDelta = loop.rootLoops - current.rootLoops;
-		const domainDelta = loop.domainLoops - current.domainLoops;
+		const allDelta = loop.allLoops - current.allLoops;
 		current.loopRevision = loop.revision;
 		current.rootLoops = loop.rootLoops;
-		current.domainLoops = loop.domainLoops;
+		current.allLoops = loop.allLoops;
 		hostStateRevision += 1n;
 		if (!paused) {
 			const currentCounters = hostCounters();
 			hostState = {
 				...currentCounters,
-				rootLoops: counter(currentCounters.rootLoops.value + rootDelta, paused),
-				domainLoops: counter(
-					currentCounters.domainLoops.value + domainDelta,
+				activeLoops: counter(
+					currentCounters.activeLoops.value + allDelta,
 					paused,
 				),
+				rootLoops: counter(currentCounters.rootLoops.value + rootDelta, paused),
+				allLoops: counter(currentCounters.allLoops.value + allDelta, paused),
 			};
 		}
 		void publishHost().catch(() => {});
 	};
 
-	const clearIdleGrace = (): void => {
-		if (idleGrace !== undefined) clock.clearTimeout(idleGrace);
-		idleGrace = undefined;
-	};
+	const clearEveryCounter = (current: ReflectDomainCounters) => ({
+		...current,
+		endLoopTimeMs: null,
+		activeMs: counter(0n, paused),
+		activeLoops: counter(0n, paused),
+		taskMs: counter(0n, paused),
+		rootLoops: counter(0n, paused),
+		allLoops: counter(0n, paused),
+	});
 
-	const resetContinuousActive = (): void => {
-		if (!rootProcess || paused) return;
+	const clearReminderCounters = (current: ReflectDomainCounters) => ({
+		...current,
+		taskMs: counter(0n, paused),
+		rootLoops: counter(0n, paused),
+		allLoops: counter(0n, paused),
+	});
+
+	const applyAggregateBusyTransition = (
+		wasBusy: boolean,
+		isBusy: boolean,
+	): void => {
+		if (!rootProcess || paused || wasBusy === isBusy) return;
 		const current = hostCounters();
-		hostStateRevision += 1n;
-		hostState = { ...current, activeMs: counter(0n, paused) };
-		void publishHost().catch(() => {});
+		if (!isBusy) {
+			hostState = { ...current, anyBusy: false, endLoopTimeMs: BigInt(now()) };
+			return;
+		}
+		const gapExceeded =
+			current.endLoopTimeMs !== null &&
+			BigInt(now()) > current.endLoopTimeMs + BigInt(idleResetGapMs);
+		const resumed = gapExceeded ? clearEveryCounter(current) : current;
+		hostState = { ...resumed, anyBusy: true, endLoopTimeMs: null };
 	};
 
 	const scheduleTick = (): void => {
@@ -589,43 +654,27 @@ export function createReflectDomainCoordinator(
 		tick = clock.setTimeout(() => {
 			tick = undefined;
 			if (!rootProcess || paused || !hostCertain()) return;
-			if (hostBusy()) {
-				const current = hostCounters();
-				hostStateRevision += 1n;
-				hostState = {
-					...current,
-					activeMs: counter(
-						current.activeMs.value + BigInt(activeTickMs),
-						paused,
-					),
-				};
-				void publishHost().catch(() => {});
-				scheduleTick();
-				return;
-			}
-			startIdleGrace();
+			if (!hostBusy()) return;
+			const current = hostCounters();
+			hostStateRevision += 1n;
+			hostState = {
+				...current,
+				activeMs: counter(
+					current.activeMs.value + BigInt(activeTickMs),
+					paused,
+				),
+				taskMs: counter(current.taskMs.value + BigInt(activeTickMs), paused),
+			};
+			void publishHost().catch(() => {});
+			scheduleTick();
+			return;
 		}, activeTickMs);
 		tick.unref?.();
-	};
-
-	const startIdleGrace = (): void => {
-		if (!rootProcess || paused || idleGrace !== undefined) return;
-		idleGrace = clock.setTimeout(() => {
-			idleGrace = undefined;
-			if (!rootProcess || paused || !hostCertain()) return;
-			if (hostBusy()) {
-				scheduleTick();
-				return;
-			}
-			resetContinuousActive();
-		}, idleGraceMs);
-		idleGrace.unref?.();
 	};
 
 	const updateHostTimers = (): void => {
 		if (!rootProcess || paused || !hostCertain()) return;
 		if (hostBusy()) {
-			clearIdleGrace();
 			scheduleTick();
 			return;
 		}
@@ -633,7 +682,6 @@ export function createReflectDomainCoordinator(
 			clock.clearTimeout(tick);
 			tick = undefined;
 		}
-		startIdleGrace();
 	};
 
 	const handleTransportEvent = (event: ProcessDomainEvent): void => {
@@ -650,6 +698,7 @@ export function createReflectDomainCoordinator(
 			}
 			return;
 		}
+		const wasBusy = hostBusy();
 		if (event.peer.status === "online") {
 			if (peers.has(event.peer.nodeId)) return;
 			peers.set(event.peer.nodeId, {
@@ -657,7 +706,7 @@ export function createReflectDomainCoordinator(
 				activityRevision: 0n,
 				loopRevision: 0n,
 				rootLoops: 0n,
-				domainLoops: 0n,
+				allLoops: 0n,
 			});
 			uncertainPeers.add(event.peer.nodeId);
 		} else {
@@ -665,12 +714,13 @@ export function createReflectDomainCoordinator(
 			uncertainPeers.add(event.peer.nodeId);
 		}
 		hostStateRevision += 1n;
+		applyAggregateBusyTransition(wasBusy, hostBusy());
 		void publishHost().catch(() => {});
 		updateHostTimers();
 	};
 
 	const queueWrite = (
-		kind: "activity" | "root-loop" | "domain-loop",
+		kind: "activity" | "root-loop" | "all-loop",
 	): Promise<void> => {
 		const clientWrite =
 			node !== undefined && !rootProcess
@@ -685,7 +735,7 @@ export function createReflectDomainCoordinator(
 							revision: ++localLoopRevision,
 							rootLoops:
 								kind === "root-loop" ? ++localRootLoops : localRootLoops,
-							domainLoops: ++localDomainLoops,
+							allLoops: ++localAllLoops,
 						}
 				: undefined;
 		if (clientWrite?.kind === "activity") {
@@ -709,7 +759,7 @@ export function createReflectDomainCoordinator(
 				await node.send(node.declaration.hostNodeId, LOOP_CHANNEL, {
 					revision: clientWrite.revision.toString(),
 					rootLoops: clientWrite.rootLoops.toString(),
-					domainLoops: clientWrite.domainLoops.toString(),
+					allLoops: clientWrite.allLoops.toString(),
 				} satisfies LoopWire);
 			} catch (error) {
 				reportFatal(
@@ -728,7 +778,7 @@ export function createReflectDomainCoordinator(
 		const target = node.declaration.hostNodeId;
 		const revision = localLoopRevision;
 		const rootLoops = localRootLoops;
-		const domainLoops = localDomainLoops;
+		const allLoops = localAllLoops;
 		requiredLoopRevision = revision;
 		markClientUncertain();
 		return queueTransport(async () => {
@@ -737,7 +787,7 @@ export function createReflectDomainCoordinator(
 				await node.send(target, LOOP_CHANNEL, {
 					revision: revision.toString(),
 					rootLoops: rootLoops.toString(),
-					domainLoops: domainLoops.toString(),
+					allLoops: allLoops.toString(),
 				} satisfies LoopWire);
 			} catch (error) {
 				reportFatal(
@@ -790,9 +840,11 @@ export function createReflectDomainCoordinator(
 				);
 				unsubscribeLoops = opened.subscribe(LOOP_CHANNEL, applyHostLoop);
 				unsubscribeLeave = opened.subscribe(LEAVE_CHANNEL, (message) => {
+					const wasBusy = hostBusy();
 					if (!peers.delete(message.senderId)) return;
 					uncertainPeers.delete(message.senderId);
 					hostStateRevision += 1n;
+					applyAggregateBusyTransition(wasBusy, hostBusy());
 					void publishHost()
 						.then(updateHostTimers)
 						.catch(() => {});
@@ -905,7 +957,6 @@ export function createReflectDomainCoordinator(
 				unsubscribeCounters = undefined;
 				unsubscribeLeave = undefined;
 				if (tick !== undefined) clock.clearTimeout(tick);
-				clearIdleGrace();
 				tick = undefined;
 				const closing = node;
 				node = undefined;
@@ -925,7 +976,7 @@ export function createReflectDomainCoordinator(
 				localActivityRevision = 0n;
 				localLoopRevision = 0n;
 				localRootLoops = 0n;
-				localDomainLoops = 0n;
+				localAllLoops = 0n;
 				requiredActivityRevision = 0n;
 				requiredLoopRevision = 0n;
 				await closing?.close();
@@ -933,9 +984,13 @@ export function createReflectDomainCoordinator(
 		},
 		async setBusy(instance, busy) {
 			const attachment = attachments.get(instance);
-			if (attachment === undefined) return;
+			if (attachment === undefined || attachment.busy === busy) return;
+			const wasBusy = rootProcess && hostBusy();
 			attachment.busy = busy;
-			if (rootProcess) hostStateRevision += 1n;
+			if (rootProcess) {
+				hostStateRevision += 1n;
+				applyAggregateBusyTransition(wasBusy, hostBusy());
+			}
 			await queueWrite("activity");
 			if (rootProcess) {
 				await publishHost();
@@ -951,17 +1006,17 @@ export function createReflectDomainCoordinator(
 			hostStateRevision += 1n;
 			hostState = {
 				...current,
+				activeLoops: counter(current.activeLoops.value + 1n, false),
 				rootLoops: counter(current.rootLoops.value + 1n, false),
-				domainLoops: counter(current.domainLoops.value + 1n, false),
-				activeMs: counter(current.activeMs.value, false),
+				allLoops: counter(current.allLoops.value + 1n, false),
 			};
 			await publishHost();
 			updateHostTimers();
 			return countersValue ?? hostCounters();
 		},
-		async recordDomainLoop() {
+		async recordAllLoop() {
 			if (!rootProcess) {
-				await queueWrite("domain-loop");
+				await queueWrite("all-loop");
 				return countersValue ?? zeroCounters(true);
 			}
 			if (paused) return hostCounters();
@@ -969,7 +1024,8 @@ export function createReflectDomainCoordinator(
 			hostStateRevision += 1n;
 			hostState = {
 				...current,
-				domainLoops: counter(current.domainLoops.value + 1n, false),
+				activeLoops: counter(current.activeLoops.value + 1n, false),
+				allLoops: counter(current.allLoops.value + 1n, false),
 			};
 			await publishHost();
 			return countersValue ?? hostCounters();
@@ -981,20 +1037,35 @@ export function createReflectDomainCoordinator(
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		async pauseAndReset() {
+		setIdleResetGapSeconds(seconds) {
+			if (Number.isSafeInteger(seconds) && seconds > 0)
+				idleResetGapMs = seconds * 1_000;
+		},
+		async resetReminderCycle() {
+			if (!rootProcess || countersValue === undefined) return countersValue;
+			hostStateRevision += 1n;
+			hostState = clearReminderCounters(hostCounters());
+			await publishHost();
+			return countersValue;
+		},
+		async pauseForReflection(resetReminderCycle) {
 			if (!rootProcess || countersValue === undefined) return countersValue;
 			paused = true;
 			if (tick !== undefined) clock.clearTimeout(tick);
 			tick = undefined;
-			clearIdleGrace();
 			hostStateRevision += 1n;
-			hostState = zeroCounters(true, {
-				domainEpoch: countersValue.domainEpoch,
-				revision: countersValue.revision,
-				generation: countersValue.generation,
-				certain: countersValue.certain,
-				anyBusy: countersValue.anyBusy,
-			});
+			const current = hostCounters();
+			const reset = resetReminderCycle
+				? clearReminderCounters(current)
+				: current;
+			hostState = {
+				...reset,
+				activeMs: counter(current.activeMs.value, true),
+				activeLoops: counter(current.activeLoops.value, true),
+				taskMs: counter(reset.taskMs.value, true),
+				rootLoops: counter(reset.rootLoops.value, true),
+				allLoops: counter(reset.allLoops.value, true),
+			};
 			await publishHost();
 			return countersValue;
 		},
@@ -1002,13 +1073,16 @@ export function createReflectDomainCoordinator(
 			if (!rootProcess || countersValue === undefined) return;
 			paused = false;
 			hostStateRevision += 1n;
-			hostState = zeroCounters(false, {
-				domainEpoch: countersValue.domainEpoch,
-				revision: countersValue.revision,
-				generation: countersValue.generation,
-				certain: countersValue.certain,
-				anyBusy: countersValue.anyBusy,
-			});
+			const current = hostCounters();
+			hostState = {
+				...current,
+				endLoopTimeMs: hostBusy() ? null : BigInt(now()),
+				activeMs: counter(current.activeMs.value, false),
+				activeLoops: counter(current.activeLoops.value, false),
+				taskMs: counter(current.taskMs.value, false),
+				rootLoops: counter(current.rootLoops.value, false),
+				allLoops: counter(current.allLoops.value, false),
+			};
 			await publishHost();
 			updateHostTimers();
 		},

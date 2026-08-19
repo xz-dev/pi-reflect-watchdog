@@ -6,14 +6,14 @@ test("loads global and trusted project configuration with independent reflection
 	const files = new Map([
 		[
 			"/agent/pi-reflect-watchdog.json",
-			JSON.stringify({ mainLoopLimit: 120, reflectionPrompt: "global" }),
+			JSON.stringify({ rootLoopLimit: 120, reflectionPrompt: "global" }),
 		],
 		[
 			"/work/.pi/pi-reflect-watchdog.json",
 			JSON.stringify({
-				observedTotalLoopLimit: 700,
+				allLoopLimit: 700,
 				reflectionPrompt: "project",
-				wallClockMinutes: 0,
+				taskMinutes: 0,
 			}),
 		],
 	]);
@@ -26,12 +26,12 @@ test("loads global and trusted project configuration with independent reflection
 		},
 	};
 	const trusted = await loadRuntimeConfig("/work", true, io, "/agent");
-	assert.equal(trusted.config.mainLoopLimit, 120);
-	assert.equal(trusted.config.observedTotalLoopLimit, 700);
+	assert.equal(trusted.config.rootLoopLimit, 120);
+	assert.equal(trusted.config.allLoopLimit, 700);
 	assert.equal(trusted.config.reflectionPrompt, "project");
 	assert.equal(trusted.diagnostics.length, 1);
 	const untrusted = await loadRuntimeConfig("/work", false, io, "/agent");
-	assert.equal(untrusted.config.observedTotalLoopLimit, 500);
+	assert.equal(untrusted.config.allLoopLimit, 500);
 });
 
 test("malformed and inaccessible configuration stay bounded and nonfatal", async () => {

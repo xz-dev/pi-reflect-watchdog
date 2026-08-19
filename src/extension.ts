@@ -82,7 +82,7 @@ const REFLECTION_ENTRY_TYPE = REFLECTION_HISTORY_ENTRY_TYPE;
 type Timer = ReturnType<typeof setTimeout>;
 
 // Node clamps any setTimeout delay above 2^31-1 ms to 1 ms, which would fire
-// the wall-clock threshold far too early. Large valid limits are instead
+// the task threshold far too early. Large valid limits are instead
 // scheduled as capped chunks that recompute the exact remaining delay.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -243,7 +243,15 @@ function deactivate(runtime: Runtime, services: RuntimeServices): void {
 	runtime.domainCounterUnsubscribe = undefined;
 	if (runtime.domainAttached) {
 		runtime.domainAttached = false;
-		void services.processDomain.detach(runtime).catch(() => {});
+		const detach = (): void => {
+			void services.processDomain.detach(runtime).catch(() => {});
+		};
+		if (runtime.pausedForReflection)
+			void services.processDomain
+				.resume()
+				.catch(() => {})
+				.finally(detach);
+		else detach();
 	}
 	runtime.domainCounters = undefined;
 	runtime.runActivity = "pending";
@@ -274,7 +282,7 @@ function statusLine(
 	status: TaskStatus,
 	counters?: ReflectDomainCounters,
 ): string {
-	return `WD main ${safeCounterNumber(counters?.rootLoops.value ?? BigInt(status.mainLoops))}/${status.limits.mainLoopLimit} · observed ${safeCounterNumber(counters?.domainLoops.value ?? BigInt(status.observedTotalLoops))}/${status.limits.observedTotalLoopLimit} · ${elapsed(safeCounterNumber(counters?.activeMs.value ?? BigInt(status.wallClockElapsedMs)))}/${status.limits.wallClockMinutes}m`;
+	return `WD active ${safeCounterNumber(counters?.activeLoops.value ?? BigInt(status.activity.loops))} loops · task ${elapsed(safeCounterNumber(counters?.taskMs.value ?? BigInt(status.taskElapsedMs)))}/${status.limits.taskMinutes}m · root ${safeCounterNumber(counters?.rootLoops.value ?? BigInt(status.rootLoops))}/${status.limits.rootLoopLimit} · all ${safeCounterNumber(counters?.allLoops.value ?? BigInt(status.allLoops))}/${status.limits.allLoopLimit}`;
 }
 
 function widgetState(
@@ -288,19 +296,27 @@ function widgetState(
 	const status = runtime.controller.status(now);
 	const counters = runtime.domainCounters;
 	return {
-		activity: status.activity,
+		activity: {
+			active: counters?.anyBusy ?? status.activity.active,
+			elapsedMs: safeCounterNumber(
+				counters?.activeMs.value ?? BigInt(status.activity.elapsedMs),
+			),
+			loops: safeCounterNumber(
+				counters?.activeLoops.value ?? BigInt(status.activity.loops),
+			),
+		},
 		taskElapsedMs: safeCounterNumber(
-			counters?.activeMs.value ?? BigInt(status.wallClockElapsedMs),
+			counters?.taskMs.value ?? BigInt(status.taskElapsedMs),
 		),
-		wallClockMinutes: status.limits.wallClockMinutes,
+		taskMinutes: status.limits.taskMinutes,
 		rootLoops: safeCounterNumber(
-			counters?.rootLoops.value ?? BigInt(status.mainLoops),
+			counters?.rootLoops.value ?? BigInt(status.rootLoops),
 		),
-		mainLoopLimit: status.limits.mainLoopLimit,
-		observedTotalLoops: safeCounterNumber(
-			counters?.domainLoops.value ?? BigInt(status.observedTotalLoops),
+		rootLoopLimit: status.limits.rootLoopLimit,
+		allLoops: safeCounterNumber(
+			counters?.allLoops.value ?? BigInt(status.allLoops),
 		),
-		observedTotalLoopLimit: status.limits.observedTotalLoopLimit,
+		allLoopLimit: status.limits.allLoopLimit,
 	};
 }
 
@@ -352,17 +368,17 @@ function clearWidget(runtime: Runtime): void {
 		runtime.ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
-// The reset notification is user-only TUI output. Pi exposes no reliable
+// The freeze notification is user-only TUI output. Pi exposes no reliable
 // public user-abort provenance at agent_settled, so the wording stays
 // neutral and the line never enters the model context or triggers a turn.
-function emitResetNotification(
+function emitActiveCycleFrozenNotification(
 	runtime: Runtime,
 	snapshot: { elapsedMs: number; loops: number } | undefined,
 ): void {
 	if (snapshot === undefined || !rootIsCurrent(runtime)) return;
 	if (runtime.ctx.mode !== "tui") return;
 	runtime.ctx.ui.notify(
-		`Watchdog reset | active ${formatDuration(snapshot.elapsedMs)}/${snapshot.loops} loops`,
+		`Watchdog active frozen | active ${formatDuration(snapshot.elapsedMs)}/${snapshot.loops} loops`,
 		"info",
 	);
 }
@@ -396,14 +412,13 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 	const scheduleWallClock = (): void => {
 		const status = runtime.controller.status(services.now());
 		if (!status.rootActive) return;
-		const remaining =
-			status.limits.wallClockMinutes * 60_000 - status.wallClockElapsedMs;
+		const remaining = status.limits.taskMinutes * 60_000 - status.taskElapsedMs;
 		if (remaining <= 0) {
 			// Already at or beyond the boundary (a rearmed limit can land there):
 			// evaluate exactly once instead of scheduling a zero-delay timer.
 			deliverWarnings(
 				runtime,
-				runtime.controller.evaluateWallClock(services.now()),
+				runtime.controller.evaluateTaskTime(services.now()),
 				services,
 			);
 			return;
@@ -417,7 +432,7 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 				runtime.timer = undefined;
 				const delivered = deliverWarnings(
 					runtime,
-					runtime.controller.evaluateWallClock(services.now()),
+					runtime.controller.evaluateTaskTime(services.now()),
 					services,
 				);
 				// A warning reset creates a fresh timer lifecycle. Only an early or
@@ -473,16 +488,18 @@ function thresholdSnapshot(
 	counters?: ReflectDomainCounters,
 ): ReflectionThresholdSnapshot {
 	return {
-		rootLoops: Number(counters?.rootLoops.value ?? BigInt(status.mainLoops)),
-		rootLoopLimit: status.limits.mainLoopLimit,
-		domainLoops: Number(
-			counters?.domainLoops.value ?? BigInt(status.observedTotalLoops),
+		activeMs: Number(
+			counters?.activeMs.value ?? BigInt(status.activity.elapsedMs),
 		),
-		domainLoopLimit: status.limits.observedTotalLoopLimit,
-		continuousDomainActiveMs: Number(
-			counters?.activeMs.value ?? BigInt(status.wallClockElapsedMs),
+		activeLoops: Number(
+			counters?.activeLoops.value ?? BigInt(status.activity.loops),
 		),
-		continuousDomainActiveMinutes: status.limits.wallClockMinutes,
+		taskMs: Number(counters?.taskMs.value ?? BigInt(status.taskElapsedMs)),
+		taskMinutes: status.limits.taskMinutes,
+		rootLoops: Number(counters?.rootLoops.value ?? BigInt(status.rootLoops)),
+		rootLoopLimit: status.limits.rootLoopLimit,
+		allLoops: Number(counters?.allLoops.value ?? BigInt(status.allLoops)),
+		allLoopLimit: status.limits.allLoopLimit,
 	};
 }
 
@@ -492,24 +509,21 @@ function domainThresholdReasons(
 ): ReflectionTriggerReason[] {
 	if (
 		!counters.certain ||
+		counters.taskMs.paused ||
 		counters.rootLoops.paused ||
-		counters.domainLoops.paused ||
-		counters.activeMs.paused
+		counters.allLoops.paused ||
+		counters.activeMs.paused ||
+		counters.activeLoops.paused
 	)
 		return [];
 	const status = runtime.controller.status(Date.now());
 	const reasons: ReflectionTriggerReason[] = [];
-	if (counters.rootLoops.value >= BigInt(status.limits.mainLoopLimit))
+	if (counters.rootLoops.value >= BigInt(status.limits.rootLoopLimit))
 		reasons.push("ROOT_LOOP_LIMIT");
-	if (
-		counters.domainLoops.value >= BigInt(status.limits.observedTotalLoopLimit)
-	)
-		reasons.push("DOMAIN_LOOP_LIMIT");
-	if (
-		counters.activeMs.value >=
-		BigInt(status.limits.wallClockMinutes) * 60_000n
-	)
-		reasons.push("CONTINUOUS_DOMAIN_ACTIVE_TIME");
+	if (counters.allLoops.value >= BigInt(status.limits.allLoopLimit))
+		reasons.push("ALL_LOOP_LIMIT");
+	if (counters.taskMs.value >= BigInt(status.limits.taskMinutes) * 60_000n)
+		reasons.push("TASK_TIME_LIMIT");
 	return reasons;
 }
 
@@ -552,6 +566,23 @@ function sendActiveReflection(runtime: Runtime): void {
 	active.inquiry.send(runtime.pi, content, active.reasks + 1);
 }
 
+function failReflectionBeforeSend(
+	runtime: Runtime,
+	services: RuntimeServices,
+	message: string,
+): void {
+	runtime.activeReflection = undefined;
+	runtime.reflectionQueue = [];
+	runtime.pausedForReflection = false;
+	runtime.resumeAfterReflectionTurn = false;
+	void services.processDomain.resume().catch(() => {});
+	if (rootIsCurrent(runtime)) {
+		runtime.ctx.ui.notify(message, "warning");
+		scheduleTimers(runtime, services);
+		updateStatus(runtime, services);
+	}
+}
+
 function beginNextReflection(
 	runtime: Runtime,
 	services: RuntimeServices,
@@ -570,13 +601,15 @@ function beginNextReflection(
 	clearTimers(runtime, services);
 	runtime.pausedForReflection = true;
 	runtime.resumeAfterReflectionTurn = false;
-	void services.processDomain.pauseAndReset().then(
+	const resetReminderCycle = !pending.reasons.includes("USER_REQUEST");
+	if (resetReminderCycle) runtime.controller.resetReminderCycle(services.now());
+	void services.processDomain.pauseForReflection(resetReminderCycle).then(
 		(counters) => {
 			if (counters !== undefined) runtime.domainCounters = counters;
 			sendActiveReflection(runtime);
 		},
 		() =>
-			finalizeReflection(
+			failReflectionBeforeSend(
 				runtime,
 				services,
 				"Reflection failed: process-domain counter pause/reset failed.",
@@ -812,8 +845,18 @@ export function createWatchdogExtension(
 						"warning",
 					);
 				});
+				if (
+					runtime.state !== "root" ||
+					!isCurrentRoot(hub, runtime.token, claim.root.generation)
+				) {
+					await services.processDomain.detach(runtime).catch(() => {});
+					return;
+				}
 				initialAttachComplete = true;
 				runtime.domainAttached = true;
+				services.processDomain.setIdleResetGapSeconds(
+					loaded.config.idleResetGapSeconds,
+				);
 				runtime.domainCounters = services.processDomain.counters();
 				if (services.processDomain.rootProcess) {
 					runtime.domainCounterUnsubscribe = services.processDomain.subscribe(
@@ -897,7 +940,7 @@ export function createWatchdogExtension(
 					services.now(),
 					runtime.controller.status(services.now()).rootActive,
 				);
-				emitResetNotification(runtime, snapshot);
+				emitActiveCycleFrozenNotification(runtime, snapshot);
 				scheduleTimers(runtime, services);
 				updateStatus(runtime, services);
 				return;
@@ -914,8 +957,8 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("agent_start", () => {
-			// The run source is not present on agent_start. Keep an existing
-			// classification across provider retries; only a fully settled run resets it.
+			if (!runtime.pausedForReflection && runtime.runActivity === "pending")
+				classifyWork();
 		});
 		pi.on("agent_settled", () => {
 			const completedActivity = runtime.runActivity;
@@ -923,6 +966,28 @@ export function createWatchdogExtension(
 			if (runtime.pausedForReflection) {
 				if (runtime.domainAttached)
 					void services.processDomain.setBusy(runtime, false).catch(() => {});
+				if (rootIsCurrent(runtime)) {
+					const snapshot = runtime.controller.settleRootActiveSegment(
+						services.now(),
+					);
+					emitActiveCycleFrozenNotification(runtime, snapshot);
+				}
+				if (
+					runtime.activeReflection !== undefined &&
+					!runtime.resumeAfterReflectionTurn
+				) {
+					runtime.activeReflection = undefined;
+					runtime.reflectionQueue = [];
+					runtime.ctx?.ui.notify(
+						"Reflection aborted before a valid response; watchdog counters resumed.",
+						"warning",
+					);
+					void services.processDomain.resume().finally(() => {
+						runtime.pausedForReflection = false;
+						scheduleTimers(runtime, services);
+					});
+					return;
+				}
 				if (runtime.resumeAfterReflectionTurn) {
 					runtime.resumeAfterReflectionTurn = false;
 					void services.processDomain.resume().finally(() => {
@@ -939,7 +1004,7 @@ export function createWatchdogExtension(
 				const snapshot = runtime.controller.settleRootActiveSegment(
 					services.now(),
 				);
-				emitResetNotification(runtime, snapshot);
+				emitActiveCycleFrozenNotification(runtime, snapshot);
 				scheduleTimers(runtime, services);
 				updateStatus(runtime, services);
 				return;
@@ -959,7 +1024,7 @@ export function createWatchdogExtension(
 				binding.taskEpoch,
 				services.now(),
 			);
-			emitResetNotification(root, snapshot);
+			emitActiveCycleFrozenNotification(root, snapshot);
 			scheduleTimers(root, services);
 			updateStatus(root, services);
 		});
@@ -1033,7 +1098,7 @@ export function createWatchdogExtension(
 				return;
 			}
 			if (runtime.domainAttached)
-				void services.processDomain.recordDomainLoop().catch(() => {});
+				void services.processDomain.recordAllLoop().catch(() => {});
 			const root = getHub<Runtime>().root?.value;
 			const binding = runtime.observerBinding;
 			if (
@@ -1082,7 +1147,7 @@ export function createWatchdogExtension(
 						services.now(),
 						binding.taskEpoch,
 					);
-					emitResetNotification(root, snapshot);
+					emitActiveCycleFrozenNotification(root, snapshot);
 					scheduleTimers(root, services);
 					updateStatus(root, services);
 				}
@@ -1121,16 +1186,16 @@ function userStatusText(runtime: Runtime, services: RuntimeServices): string {
 	if (!status) return "Watchdog is not active for this session.";
 	return [
 		"Watchdog status",
-		`root/main loops: ${status.mainLoops}`,
-		`observed child loops: ${status.observedChildLoops}`,
-		`observed child sessions: ${status.observedChildSessions}`,
-		`observable total loops: ${status.observedTotalLoops}`,
-		`task-cycle wall time: ${elapsed(status.wallClockElapsedMs)}`,
-		`limits: main=${status.limits.mainLoopLimit}; observed-total=${status.limits.observedTotalLoopLimit}; wall-clock=${status.limits.wallClockMinutes}m`,
-		`configured defaults: main=${status.configuredLimits.mainLoopLimit}; observed-total=${status.configuredLimits.observedTotalLoopLimit}; wall-clock=${status.configuredLimits.wallClockMinutes}m`,
+		`root loops: ${status.rootLoops}`,
+		`other agent loops: ${status.otherAgentLoops}`,
+		`observable agent sessions: ${status.observableAgentSessions}`,
+		`all loops: ${status.allLoops}`,
+		`active window: ${formatDuration(status.activity.elapsedMs)}/${status.activity.loops} loops`,
+		`task time: ${elapsed(status.taskElapsedMs)}`,
+		`limits: root=${status.limits.rootLoopLimit}; all=${status.limits.allLoopLimit}; task=${status.limits.taskMinutes}m; idle-reset-gap=${status.limits.idleResetGapSeconds}s`,
+		`configured defaults: root=${status.configuredLimits.rootLoopLimit}; all=${status.configuredLimits.allLoopLimit}; task=${status.configuredLimits.taskMinutes}m; idle-reset-gap=${status.configuredLimits.idleResetGapSeconds}s`,
 		`latched warnings: ${status.latchedWarnings.join(", ") || "none"}`,
 		`coverage: ${status.coverage}`,
-		`active window: ${formatDuration(status.activity.elapsedMs)}/${status.activity.loops} root loops`,
 	].join("\n");
 }
 
@@ -1176,7 +1241,11 @@ function registerWatchdogCommand(
 					notifyCommand(ctx, userStatusText(runtime, services));
 					return;
 				case "reset":
-					runtime.controller.resetRuntime(current);
+					runtime.controller.resetReminderCycle(current);
+					await services.processDomain
+						.resetReminderCycle()
+						.catch(() => undefined);
+					runtime.domainCounters = services.processDomain.counters();
 					scheduleTimers(runtime, services);
 					updateStatus(runtime, services);
 					notifyCommand(
@@ -1192,6 +1261,9 @@ function registerWatchdogCommand(
 						parsed.command,
 						current,
 					);
+					services.processDomain.setIdleResetGapSeconds(
+						parsed.command.idleResetGapSeconds,
+					);
 					scheduleTimers(runtime, services);
 					notifyCommandWarnings(ctx, transition.warnings);
 					updateStatus(runtime, services);
@@ -1201,6 +1273,11 @@ function registerWatchdogCommand(
 				case "limits-reset": {
 					const transition =
 						runtime.controller.restoreConfiguredDefaults(current);
+					const configured =
+						runtime.controller.status(current).configuredLimits;
+					services.processDomain.setIdleResetGapSeconds(
+						configured.idleResetGapSeconds,
+					);
 					scheduleTimers(runtime, services);
 					notifyCommandWarnings(ctx, transition.warnings);
 					updateStatus(runtime, services);
@@ -1333,13 +1410,16 @@ function registerControlTool(
 		],
 		parameters: Type.Object({
 			action: StringEnum(["status", "reset", "set_limits", "restore_defaults"]),
-			mainLoopLimit: Type.Optional(
+			rootLoopLimit: Type.Optional(
 				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
 			),
-			observedTotalLoopLimit: Type.Optional(
+			allLoopLimit: Type.Optional(
 				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
 			),
-			wallClockMinutes: Type.Optional(
+			taskMinutes: Type.Optional(
+				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+			),
+			idleResetGapSeconds: Type.Optional(
 				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
 			),
 		}),
@@ -1350,12 +1430,18 @@ function registerControlTool(
 				);
 			const current = services.now();
 			let transition: ControllerTransition = { warnings: [] };
-			if (params.action === "reset") runtime.controller.resetRuntime(current);
-			else if (params.action === "set_limits") {
+			if (params.action === "reset") {
+				runtime.controller.resetReminderCycle(current);
+				await services.processDomain
+					.resetReminderCycle()
+					.catch(() => undefined);
+				runtime.domainCounters = services.processDomain.counters();
+			} else if (params.action === "set_limits") {
 				const limits = {
-					mainLoopLimit: params.mainLoopLimit,
-					observedTotalLoopLimit: params.observedTotalLoopLimit,
-					wallClockMinutes: params.wallClockMinutes,
+					rootLoopLimit: params.rootLoopLimit,
+					allLoopLimit: params.allLoopLimit,
+					taskMinutes: params.taskMinutes,
+					idleResetGapSeconds: params.idleResetGapSeconds,
 				};
 				const values = Object.values(limits).filter(
 					(value) => value !== undefined,
@@ -1369,11 +1455,20 @@ function registerControlTool(
 						"set_limits accepts only positive safe integer limits",
 					);
 				transition = runtime.controller.setLimits(limits, current, true);
-			} else if (params.action === "restore_defaults")
+				if (limits.idleResetGapSeconds !== undefined)
+					services.processDomain.setIdleResetGapSeconds(
+						limits.idleResetGapSeconds,
+					);
+			} else if (params.action === "restore_defaults") {
 				transition = runtime.controller.restoreConfiguredDefaults(
 					current,
 					true,
 				);
+				services.processDomain.setIdleResetGapSeconds(
+					runtime.controller.status(current).configuredLimits
+						.idleResetGapSeconds,
+				);
+			}
 			if (!deliverWarnings(runtime, transition, services))
 				scheduleTimers(runtime, services);
 			updateStatus(runtime, services);
@@ -1382,7 +1477,7 @@ function registerControlTool(
 				content: [
 					{
 						type: "text",
-						text: `reflect_watchdog ${params.action}\nmain/root loops: ${status.mainLoops}\nobserved child loops: ${status.observedChildLoops}\nobserved child sessions: ${status.observedChildSessions}\nobserved total loops: ${status.observedTotalLoops}\nlimits: main=${status.limits.mainLoopLimit}; observed-total=${status.limits.observedTotalLoopLimit}; wall-clock=${status.limits.wallClockMinutes}m\nwall-clock elapsed: ${elapsed(status.wallClockElapsedMs)}\nroot active: ${status.rootActive}\nlatched warnings: ${status.latchedWarnings.join(", ") || "none"}\ncoverage: ${status.coverage}`,
+						text: `reflect_watchdog ${params.action}\nroot loops: ${status.rootLoops}\nother agent loops: ${status.otherAgentLoops}\nobservable agent sessions: ${status.observableAgentSessions}\nall loops: ${status.allLoops}\nlimits: root=${status.limits.rootLoopLimit}; all=${status.limits.allLoopLimit}; task=${status.limits.taskMinutes}m; idle-reset-gap=${status.limits.idleResetGapSeconds}s\ntask elapsed: ${elapsed(status.taskElapsedMs)}\nroot active: ${status.rootActive}\nlatched warnings: ${status.latchedWarnings.join(", ") || "none"}\ncoverage: ${status.coverage}`,
 					},
 				],
 				details: status,

@@ -181,7 +181,7 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 		env,
 		open,
 		activeTickMs: 100,
-		idleGraceMs: 300,
+		idleResetGapMs: 300,
 	});
 	const instance = {};
 	await root.attach(instance, () => {});
@@ -198,11 +198,11 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 	);
 
 	await child.command("root-loop");
-	await child.command("domain-loop");
+	await child.command("all-loop");
 	await waitFor(
 		() =>
 			root.counters()?.rootLoops.value === 1n &&
-			root.counters()?.domainLoops.value === 2n,
+			root.counters()?.allLoops.value === 2n,
 		"cross-process loop aggregation",
 	);
 
@@ -232,25 +232,36 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 		"active tick resumes after recovery",
 	);
 
-	const reset = await root.pauseAndReset();
+	const activeBeforeReflection = root.counters()?.activeMs.value;
+	const reset = await root.pauseForReflection(true);
 	assert.equal(reset?.rootLoops.value, 0n);
-	assert.equal(reset?.domainLoops.value, 0n);
-	assert.equal(reset?.activeMs.value, 0n);
+	assert.equal(reset?.allLoops.value, 0n);
+	assert.equal(reset?.taskMs.value, 0n);
+	assert.equal(reset?.activeMs.value, activeBeforeReflection);
+	assert.equal(reset?.activeLoops.value, 2n);
 	assert.equal(reset?.rootLoops.paused, true);
-	await child.command("domain-loop");
+	await child.command("all-loop");
 	await new Promise((resolve) => setTimeout(resolve, 100));
-	assert.equal(root.counters()?.domainLoops.value, 0n);
+	assert.equal(root.counters()?.allLoops.value, 0n);
+	assert.equal(root.counters()?.activeLoops.value, 2n);
 	await root.resume();
 	await child.command("idle");
-	await child.command("domain-loop");
+	await child.command("all-loop");
 	await waitFor(
-		() => root.counters()?.domainLoops.value === 1n,
+		() =>
+			root.counters()?.allLoops.value === 1n &&
+			root.counters()?.activeLoops.value === 3n,
 		"post-resume loop",
 	);
 
+	const revisionBeforeLeave = root.counters()?.revision;
 	await child.stop();
 	await waitFor(
-		() => root.counters()?.certain === true,
+		() =>
+			root.counters()?.certain === true &&
+			revisionBeforeLeave !== undefined &&
+			root.counters()?.revision > revisionBeforeLeave,
 		"graceful child leave",
+		10_000,
 	);
 });

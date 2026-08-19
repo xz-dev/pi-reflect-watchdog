@@ -80,15 +80,19 @@ const counters: ReflectDomainCounters = {
 	generation: 1n,
 	certain: true,
 	anyBusy: false,
+	endLoopTimeMs: null,
 	fence: { domainEpoch: "domain", generation: 1n },
-	rootLoops: counter(),
-	domainLoops: counter(),
 	activeMs: counter(),
+	activeLoops: counter(),
+	taskMs: counter(),
+	rootLoops: counter(),
+	allLoops: counter(),
 };
 
 function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
 	let rootLoops = 0n;
-	let domainLoops = 0n;
+	let allLoops = 0n;
+	let activeLoops = 0n;
 	let snapshot = counters;
 	const listeners = new Set<(value: ReflectDomainCounters) => void>();
 	return {
@@ -100,25 +104,31 @@ function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
 		},
 		async recordRootLoop() {
 			rootLoops += 1n;
-			domainLoops += 1n;
+			allLoops += 1n;
+			activeLoops += 1n;
 			snapshot = {
 				...snapshot,
 				rootLoops: { ...snapshot.rootLoops, value: rootLoops },
-				domainLoops: { ...snapshot.domainLoops, value: domainLoops },
+				allLoops: { ...snapshot.allLoops, value: allLoops },
+				activeLoops: { ...snapshot.activeLoops, value: activeLoops },
 			};
 			for (const listener of listeners) listener(snapshot);
 			return snapshot;
 		},
-		async recordDomainLoop() {
-			return counters;
+		async recordAllLoop() {
+			return snapshot;
 		},
 		counters: () => snapshot,
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		async pauseAndReset() {
-			return counters;
+		setIdleResetGapSeconds() {},
+		async resetReminderCycle() {
+			return snapshot;
+		},
+		async pauseForReflection() {
+			return snapshot;
 		},
 		async resume() {},
 	};
@@ -152,9 +162,10 @@ function install() {
 		processDomain: fakeDomain(activityWrites),
 		loadConfig: async () => ({
 			config: {
-				mainLoopLimit: 2,
-				observedTotalLoopLimit: 3,
-				wallClockMinutes: 30,
+				rootLoopLimit: 2,
+				allLoopLimit: 3,
+				taskMinutes: 30,
+				idleResetGapSeconds: 60,
 				reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 			},
 			diagnostics: [],

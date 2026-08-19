@@ -15,7 +15,7 @@ import {
 	writeJson,
 } from "../../scripts/e2e/harness.mjs";
 
-async function setup(t, { wallClockMinutes = 30, ...providerOptions } = {}) {
+async function setup(t, { taskMinutes = 30, ...providerOptions } = {}) {
 	const resources = await createTestResources(
 		t,
 		"pi-reflect-watchdog-lifecycle-",
@@ -27,7 +27,7 @@ async function setup(t, { wallClockMinutes = 30, ...providerOptions } = {}) {
 		agentDir: isolated.agentDir,
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
-		wallClockMinutes,
+		taskMinutes,
 	});
 	const provider = await startFakeProvider(providerOptions);
 	resources.add(() => provider.close());
@@ -68,7 +68,7 @@ test("the real one-minute wall warning steers exactly once while active", {
 	timeout: 120_000,
 }, async (t) => {
 	const { rpc, provider } = await setup(t, {
-		wallClockMinutes: 1,
+		taskMinutes: 1,
 		responsePlan: ({ requestIndex }) => {
 			if (requestIndex === 0)
 				return {
@@ -130,7 +130,7 @@ test("the real one-minute wall warning steers exactly once while active", {
 	await new Promise((resolve) => setTimeout(resolve, 1_250));
 	const reflectionRequests = provider.requests.filter((request) =>
 		JSON.stringify(request.body.messages).includes(
-			"Trigger source(s): CONTINUOUS_DOMAIN_ACTIVE_TIME",
+			"Trigger source(s): TASK_TIME_LIMIT",
 		),
 	);
 	assert.equal(
@@ -139,11 +139,8 @@ test("the real one-minute wall warning steers exactly once while active", {
 		"continuous threshold triggers once",
 	);
 	const reflectionMessages = JSON.stringify(provider.requests[1].body.messages);
-	assert.match(
-		reflectionMessages,
-		/Trigger source\(s\): CONTINUOUS_DOMAIN_ACTIVE_TIME/,
-	);
-	assert.match(reflectionMessages, /continuous-domain-active=60000ms\/1m/i);
+	assert.match(reflectionMessages, /Trigger source\(s\): TASK_TIME_LIMIT/);
+	assert.match(reflectionMessages, /task=60000ms\/1m/i);
 	assert.ok(
 		provider.requests[1].finishedAt,
 		"reflection response was fully consumed",

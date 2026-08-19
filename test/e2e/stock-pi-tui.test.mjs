@@ -25,7 +25,7 @@ function count(text, pattern) {
 	return [...text.matchAll(pattern)].length;
 }
 
-test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
+test("stock Pi TUI renders, ticks, commands, and active-freeze semantics", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -62,7 +62,9 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		],
 	});
 	resources.add(() => tui.close());
-	await tui.waitFor(/Reflect Watchdog \| idle/);
+	await tui.waitFor(
+		/Reflect Watchdog \| active 0s\/0 loops · task 0s\/30m · root 0\/100 · all 0\/500/,
+	);
 
 	tui.send("First real turn");
 	const first = await tui.waitFor(/Reflect Watchdog \| active \d+s\/0 loops/);
@@ -73,13 +75,13 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		"below-editor active time redraws about once per second",
 	);
 	const settled = await tui.waitFor(
-		/Watchdog reset \| active .*\/1 loops/,
+		/Watchdog active frozen \| active .*\/1 loops/,
 		12_000,
 	);
 	assert.equal(
-		count(settled, /Watchdog reset \| active /g),
+		count(settled, /Watchdog active frozen \| active /g),
 		1,
-		"automatic settle notification appears once",
+		"automatic settle freeze notification appears once",
 	);
 
 	tui.send("/reflect-watchdog status");
@@ -89,20 +91,20 @@ test("stock Pi TUI renders, ticks, commands, and automatic reset semantics", {
 		/Watchdog task cycle reset\. Active window is unchanged\./,
 	);
 	assert.equal(
-		count(manual, /Watchdog reset \| active /g),
+		count(manual, /Watchdog active frozen \| active /g),
 		0,
-		"manual reset emits no automatic reset notification",
+		"manual reset emits no automatic freeze notification",
 	);
 
 	tui.send("Second real turn");
 	const twice = await tui.waitFor(
-		/Watchdog reset \| active .*\/1 loops/,
+		/Watchdog active frozen \| active .*\/2 loops/,
 		12_000,
 	);
 	assert.equal(
-		count(twice, /Watchdog reset \| active /g),
+		count(twice, /Watchdog active frozen \| active /g),
 		1,
-		"the next settle emits exactly one automatic notification",
+		"the next settle emits exactly one freeze notification while preserving the active cycle",
 	);
 
 	tui.key("C-d");

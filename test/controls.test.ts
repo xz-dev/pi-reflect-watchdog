@@ -3,12 +3,13 @@ import test from "node:test";
 import { parseReflectWatchdogCommand } from "../src/controls.js";
 
 test("reflect-watchdog parser accepts only status/reset/limits controls", () => {
-	assert.deepEqual(parseReflectWatchdogCommand("  limits  1 2 3 "), {
+	assert.deepEqual(parseReflectWatchdogCommand("  limits  1 2 3 60 "), {
 		command: {
 			action: "limits-set",
-			mainLoopLimit: 1,
-			observedTotalLoopLimit: 2,
-			wallClockMinutes: 3,
+			rootLoopLimit: 1,
+			allLoopLimit: 2,
+			taskMinutes: 3,
+			idleResetGapSeconds: 60,
 		},
 	});
 	assert.deepEqual(parseReflectWatchdogCommand("status"), {
@@ -18,5 +19,5 @@ test("reflect-watchdog parser accepts only status/reset/limits controls", () => 
 		command: { action: "reset" },
 	});
 	assert.ok("error" in parseReflectWatchdogCommand("prompt main"));
-	assert.ok("error" in parseReflectWatchdogCommand("limits 0 2 3"));
+	assert.ok("error" in parseReflectWatchdogCommand("limits 0 2 3 60"));
 });

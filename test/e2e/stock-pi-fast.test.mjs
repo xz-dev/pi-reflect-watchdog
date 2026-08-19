@@ -150,7 +150,7 @@ test("the installed packed tarball loads dist and commands never start a model t
 	}
 });
 
-test("packed stock Pi sends a main-loop warning to its continuation provider request", {
+test("packed stock Pi sends a root-loop reflection to its continuation provider request", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -164,9 +164,9 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 		agentDir: isolated.agentDir,
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
-		mainLoopLimit: 2,
-		observedTotalLoopLimit: 500,
-		wallClockMinutes: 30,
+		rootLoopLimit: 2,
+		allLoopLimit: 500,
+		taskMinutes: 30,
 	});
 	const provider = await startFakeProvider({ responsePlan: warningPlan });
 	resources.add(() => provider.close());
@@ -209,7 +209,7 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 	);
 	assert.match(
 		toolResult?.content ?? "",
-		/^reflect_watchdog status\nmain\/root loops:/,
+		/^reflect_watchdog status\nroot loops:/,
 		"the second provider request consumes the real reflect_watchdog_control status result",
 	);
 
@@ -221,7 +221,10 @@ test("packed stock Pi sends a main-loop warning to its continuation provider req
 		continuationMessages,
 		new RegExp(warningMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
 	);
-	assert.match(continuationMessages, /Threshold snapshot: root=2\/2;/);
+	assert.match(
+		continuationMessages,
+		/Threshold snapshot: active=\d+ms\/2 loops; task=\d+ms\/30m; root=2\/2; all=2\/500/,
+	);
 	assert.ok(
 		continuation.startedAt >= initialRequests[1].finishedAt,
 		"the reflection provider request starts after the ordinary tool round",
@@ -256,9 +259,9 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 		agentDir: isolated.agentDir,
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
-		mainLoopLimit: 100,
-		observedTotalLoopLimit: 500,
-		wallClockMinutes: 30,
+		rootLoopLimit: 100,
+		allLoopLimit: 500,
+		taskMinutes: 30,
 	});
 	const reflectionXml =
 		"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>pause</current_step><next_step>apply corrected route</next_step></reflection>";
@@ -370,14 +373,14 @@ test("stock Pi honors global and trusted-project watchdog config precedence", as
 		agentDir: isolated.agentDir,
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
-		mainLoopLimit: 17,
-		observedTotalLoopLimit: 19,
-		wallClockMinutes: 23,
+		rootLoopLimit: 17,
+		allLoopLimit: 19,
+		taskMinutes: 23,
 	});
 	await writeJson(
 		path.join(isolated.workspace, ".pi", "pi-reflect-watchdog.json"),
 		{
-			mainLoopLimit: 29,
+			rootLoopLimit: 29,
 		},
 	);
 
@@ -398,11 +401,11 @@ test("stock Pi honors global and trusted-project watchdog config precedence", as
 		const notifications = await commandNotifications(rpc, "status");
 		assert.match(
 			notifications.map((message) => message.message).join("\n"),
-			new RegExp(expected),
+			new RegExp(`root=${expected.split("=")[1]}`),
 		);
 		assert.match(
 			notifications.map((message) => message.message).join("\n"),
-			/observed-total=19; wall-clock=23m/,
+			/all=19; task=23m/,
 		);
 	}
 });

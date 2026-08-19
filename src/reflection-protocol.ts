@@ -23,12 +23,14 @@ export interface ReflectionDecision {
 }
 
 export interface ReflectionThresholdSnapshot {
+	readonly activeMs: number;
+	readonly activeLoops: number;
+	readonly taskMs: number;
+	readonly taskMinutes: number;
 	readonly rootLoops: number;
 	readonly rootLoopLimit: number;
-	readonly domainLoops: number;
-	readonly domainLoopLimit: number;
-	readonly continuousDomainActiveMs: number;
-	readonly continuousDomainActiveMinutes: number;
+	readonly allLoops: number;
+	readonly allLoopLimit: number;
 }
 
 export interface ReflectionPromptContext {
@@ -107,7 +109,7 @@ export function buildReflectionPrompt(
 		{ name: "current_step", value: "current work" },
 		{ name: "next_step", value: "correct next step" },
 	]);
-	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; domain=${context.thresholds.domainLoops}/${context.thresholds.domainLoopLimit}; continuous-domain-active=${context.thresholds.continuousDomainActiveMs}ms/${context.thresholds.continuousDomainActiveMinutes}m\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one trailing <reflection>...</reflection> XML block. XML names are case-sensitive. The block must contain exactly these five unique, non-empty fields in any order: type, reason, done, current_step, next_step. The type must be NO_ISSUE or ROUTE_CORRECTION. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Example:\n${example}\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement:\n${buildXmlDocument("supplement", [{ name: "text", value: supplement ?? "none" }])}`;
+	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: active=${context.thresholds.activeMs}ms/${context.thresholds.activeLoops} loops; task=${context.thresholds.taskMs}ms/${context.thresholds.taskMinutes}m; root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; all=${context.thresholds.allLoops}/${context.thresholds.allLoopLimit}\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one trailing <reflection>...</reflection> XML block. XML names are case-sensitive. The block must contain exactly these five unique, non-empty fields in any order: type, reason, done, current_step, next_step. The type must be NO_ISSUE or ROUTE_CORRECTION. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Example:\n${example}\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement:\n${buildXmlDocument("supplement", [{ name: "text", value: supplement ?? "none" }])}`;
 }
 
 export function buildReflectionReaskPrompt(error: string): string {

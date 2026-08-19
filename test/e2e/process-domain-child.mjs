@@ -17,7 +17,7 @@ const coordinator = createReflectDomainCoordinator({
 	env,
 	open,
 	activeTickMs: 100,
-	idleGraceMs: 300,
+	idleResetGapMs: 300,
 });
 const instance = {};
 
@@ -56,8 +56,8 @@ process.on("message", async (message) => {
 				await coordinator.recordRootLoop();
 				reply(id, true);
 				break;
-			case "domain-loop":
-				await coordinator.recordDomainLoop();
+			case "all-loop":
+				await coordinator.recordAllLoop();
 				reply(id, true);
 				break;
 			case "counters":
@@ -66,7 +66,10 @@ process.on("message", async (message) => {
 			case "shutdown":
 				await coordinator.detach(instance);
 				reply(id, true);
-				process.disconnect?.();
+				// Give the authenticated leave frame a short, explicit flush window
+				// before this helper exits; process shutdown must not make delivery
+				// depend on IPC/teardown scheduling races.
+				setTimeout(() => process.disconnect?.(), 50);
 				break;
 			default:
 				throw new Error(`unknown command: ${command}`);

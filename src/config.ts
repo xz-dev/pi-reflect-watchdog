@@ -1,9 +1,10 @@
 import { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 
 export interface WatchdogConfig {
-	mainLoopLimit: number;
-	observedTotalLoopLimit: number;
-	wallClockMinutes: number;
+	rootLoopLimit: number;
+	allLoopLimit: number;
+	taskMinutes: number;
+	idleResetGapSeconds: number;
 	reflectionPrompt: string;
 }
 
@@ -25,9 +26,10 @@ export interface MergeConfigResult {
 }
 
 export const BUILT_IN_CONFIG: Readonly<WatchdogConfig> = Object.freeze({
-	mainLoopLimit: 100,
-	observedTotalLoopLimit: 500,
-	wallClockMinutes: 30,
+	rootLoopLimit: 100,
+	allLoopLimit: 500,
+	taskMinutes: 30,
+	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 });
 
@@ -79,9 +81,10 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 	}
 
 	for (const key of [
-		"mainLoopLimit",
-		"observedTotalLoopLimit",
-		"wallClockMinutes",
+		"rootLoopLimit",
+		"allLoopLimit",
+		"taskMinutes",
+		"idleResetGapSeconds",
 	] as const) {
 		if (input[key] === undefined) continue;
 		if (positiveSafeInteger(input[key])) config[key] = input[key];
@@ -118,12 +121,14 @@ export function mergeConfig(
 	const config: WatchdogConfig = { ...BUILT_IN_CONFIG };
 
 	for (const { config: partial } of layers) {
-		if (partial.mainLoopLimit !== undefined)
-			config.mainLoopLimit = partial.mainLoopLimit;
-		if (partial.observedTotalLoopLimit !== undefined)
-			config.observedTotalLoopLimit = partial.observedTotalLoopLimit;
-		if (partial.wallClockMinutes !== undefined)
-			config.wallClockMinutes = partial.wallClockMinutes;
+		if (partial.rootLoopLimit !== undefined)
+			config.rootLoopLimit = partial.rootLoopLimit;
+		if (partial.allLoopLimit !== undefined)
+			config.allLoopLimit = partial.allLoopLimit;
+		if (partial.taskMinutes !== undefined)
+			config.taskMinutes = partial.taskMinutes;
+		if (partial.idleResetGapSeconds !== undefined)
+			config.idleResetGapSeconds = partial.idleResetGapSeconds;
 		if (partial.reflectionPrompt !== undefined)
 			config.reflectionPrompt = partial.reflectionPrompt;
 	}

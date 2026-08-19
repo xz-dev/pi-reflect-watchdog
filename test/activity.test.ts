@@ -24,7 +24,7 @@ test("agent_start alone stays idle until the first root user message", () => {
 	});
 });
 
-test("root user message starts the window at zero; turns pair time with loops", () => {
+test("root user message starts active time at zero and pairs it with loops", () => {
 	const tracker = new RootActivityTracker();
 	tracker.beginRun(100);
 	assert.equal(tracker.startRootTask(200), undefined);
@@ -37,7 +37,7 @@ test("root user message starts the window at zero; turns pair time with loops", 
 	});
 });
 
-test("settle snapshots the finished window and the next task starts from zero", () => {
+test("settle freezes active state and an exact idle gap resumes it", () => {
 	const tracker = new RootActivityTracker();
 	tracker.beginRun(0);
 	tracker.startRootTask(100);
@@ -46,60 +46,53 @@ test("settle snapshots the finished window and the next task starts from zero", 
 		elapsedMs: 1_500,
 		loops: 1,
 	});
-	assert.deepEqual(tracker.status(5_000), {
+	assert.deepEqual(tracker.status(61_599), {
 		active: false,
-		elapsedMs: 0,
-		loops: 0,
+		elapsedMs: 1_500,
+		loops: 1,
 	});
-	// A duplicate settle finds no begun window and emits nothing.
-	assert.equal(tracker.settle(6_000), undefined);
-	tracker.beginRun(7_000);
-	assert.equal(tracker.startRootTask(7_200), undefined);
-	assert.deepEqual(tracker.status(7_900), {
-		active: true,
-		elapsedMs: 700,
-		loops: 0,
+	tracker.startRootTask(61_600);
+	tracker.beginRun(61_600);
+	tracker.completeRootTurn();
+	assert.deepEqual(tracker.settle(62_100), {
+		elapsedMs: 2_000,
+		loops: 2,
 	});
 });
 
-test("idle gaps never accrue active time", () => {
+test("only a strictly longer idle gap starts a fresh active cycle", () => {
 	const tracker = new RootActivityTracker();
 	tracker.beginRun(0);
 	tracker.startRootTask(0);
 	tracker.completeRootTurn();
 	assert.deepEqual(tracker.settle(1_000), { elapsedMs: 1_000, loops: 1 });
-	// Long idle gap with no events: the next window still starts at zero.
-	tracker.beginRun(60_000);
-	tracker.startRootTask(61_000);
+	tracker.startRootTask(61_001);
+	tracker.beginRun(61_001);
 	tracker.completeRootTurn();
-	assert.deepEqual(tracker.settle(62_500), {
-		elapsedMs: 1_500,
+	assert.deepEqual(tracker.status(62_500), {
+		active: true,
+		elapsedMs: 1_499,
 		loops: 1,
 	});
 });
 
-test("interjecting root user message snapshots the old window exactly once", () => {
+test("interjecting root user message continues the active cycle", () => {
 	const tracker = new RootActivityTracker();
 	tracker.beginRun(0);
 	tracker.startRootTask(0);
 	tracker.completeRootTurn();
 	tracker.completeRootTurn();
-	assert.deepEqual(tracker.startRootTask(4_000), {
-		elapsedMs: 4_000,
-		loops: 2,
-	});
-	// The replacement window continues from zero.
+	assert.equal(tracker.startRootTask(4_000), undefined);
 	tracker.completeRootTurn();
 	assert.deepEqual(tracker.status(6_300), {
 		active: true,
-		elapsedMs: 2_300,
-		loops: 1,
+		elapsedMs: 6_300,
+		loops: 3,
 	});
-	// The later settle snapshots only the replacement window, never the old one twice.
-	assert.deepEqual(tracker.settle(8_000), { elapsedMs: 4_000, loops: 1 });
+	assert.deepEqual(tracker.settle(8_000), { elapsedMs: 8_000, loops: 3 });
 });
 
-test("interjection during an idle gap emits nothing and the next run starts clean", () => {
+test("interjection during an idle gap arms the next run without losing the cycle", () => {
 	const tracker = new RootActivityTracker();
 	tracker.beginRun(0);
 	tracker.startRootTask(0);
@@ -108,7 +101,7 @@ test("interjection during an idle gap emits nothing and the next run starts clea
 	tracker.beginRun(6_000);
 	assert.deepEqual(tracker.status(9_000), {
 		active: true,
-		elapsedMs: 3_000,
+		elapsedMs: 4_000,
 		loops: 0,
 	});
 });

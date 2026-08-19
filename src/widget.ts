@@ -23,11 +23,11 @@ export interface WidgetTheme {
 export interface WidgetState {
 	activity: ActivityStatus;
 	taskElapsedMs: number;
-	wallClockMinutes: number;
+	taskMinutes: number;
 	rootLoops: number;
-	mainLoopLimit: number;
-	observedTotalLoops: number;
-	observedTotalLoopLimit: number;
+	rootLoopLimit: number;
+	allLoops: number;
+	allLoopLimit: number;
 }
 
 /** Compact duration: seconds under a minute, then m+s, then h+m. */
@@ -42,14 +42,11 @@ export function formatDuration(ms: number): string {
 
 export function formatWidgetText(state: WidgetState): string {
 	const active = state.activity;
-	const head = active.active
-		? `active ${formatDuration(active.elapsedMs)}/${active.loops} loops`
-		: `idle · active ${formatDuration(active.elapsedMs)}/${active.loops} loops`;
 	return (
-		`Reflect Watchdog | ${head}` +
-		` · task ${formatDuration(state.taskElapsedMs)}/${state.wallClockMinutes}m` +
-		` · root ${state.rootLoops}/${state.mainLoopLimit}` +
-		` · observed ${state.observedTotalLoops}/${state.observedTotalLoopLimit}`
+		`Reflect Watchdog | active ${formatDuration(active.elapsedMs)}/${active.loops} loops` +
+		` · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
+		` · root ${state.rootLoops}/${state.rootLoopLimit}` +
+		` · all ${state.allLoops}/${state.allLoopLimit}`
 	);
 }
 

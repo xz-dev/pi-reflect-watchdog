@@ -11,12 +11,14 @@ const entry = (n: number) => ({
 	timestamp: `2026-08-16T13:0${n}:00.000Z`,
 	reasons: ["USER_REQUEST" as const],
 	thresholds: {
+		activeMs: n,
+		activeLoops: n,
+		taskMs: n,
+		taskMinutes: 30,
 		rootLoops: n,
 		rootLoopLimit: 100,
-		domainLoops: n,
-		domainLoopLimit: 500,
-		continuousDomainActiveMs: 0,
-		continuousDomainActiveMinutes: 30,
+		allLoops: n,
+		allLoopLimit: 500,
 	},
 	decision: {
 		type: "NO_ISSUE" as const,

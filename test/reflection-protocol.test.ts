@@ -61,12 +61,14 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 		timestamp: "2026-08-16T13:00:00.000+00:00",
 		reasons: ["USER_REQUEST"],
 		thresholds: {
+			activeMs: 4,
+			activeLoops: 3,
+			taskMs: 4,
+			taskMinutes: 30,
 			rootLoops: 3,
 			rootLoopLimit: 100,
-			domainLoops: 5,
-			domainLoopLimit: 500,
-			continuousDomainActiveMs: 4,
-			continuousDomainActiveMinutes: 30,
+			allLoops: 5,
+			allLoopLimit: 500,
 		},
 	});
 	assert.match(prompt, /Current local RFC3339 time/);

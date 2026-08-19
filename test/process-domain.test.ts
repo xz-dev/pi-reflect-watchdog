@@ -143,6 +143,11 @@ async function flush(): Promise<void> {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+const counterSends = (node: FakeNode) =>
+	node.sent.filter(
+		(entry) => entry.channel === "pi-reflect-watchdog.counters.v2",
+	);
+
 test("root owns root/domain counters and child loop increments aggregate", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
@@ -152,34 +157,37 @@ test("root owns root/domain counters and child loop increments aggregate", async
 	await coordinator.attach(instance, () => {});
 	const first = await coordinator.recordRootLoop();
 	assert.equal(first.rootLoops.value, 1n);
-	assert.equal(first.domainLoops.value, 1n);
+	assert.equal(first.allLoops.value, 1n);
 
 	node.emitPeer("child", "online");
 	await flush();
-	node.emitChannel("pi-reflect-watchdog.activity.v1", {
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
 		busy: false,
 	});
 	await flush();
-	node.emitChannel("pi-reflect-watchdog.loop.v1", {
+	node.emitChannel("pi-reflect-watchdog.loop.v2", {
 		revision: "1",
 		rootLoops: "0",
-		domainLoops: "1",
+		allLoops: "1",
 	});
 	await flush();
 	const counters = coordinator.counters();
 	assert.equal(counters?.rootLoops.value, 1n);
-	assert.equal(counters?.domainLoops.value, 2n);
-	assert.deepEqual(node.broadcasts.at(-1)?.value, {
+	assert.equal(counters?.allLoops.value, 2n);
+	assert.deepEqual(counterSends(node).at(-1)?.value, {
 		revision: "5",
 		generation: "5",
 		domainEpoch: "domain",
 		certain: true,
 		paused: false,
 		anyBusy: false,
-		rootLoops: "1",
-		domainLoops: "2",
+		endLoopTimeMs: null,
 		activeMs: "0",
+		activeLoops: "2",
+		taskMs: "0",
+		rootLoops: "1",
+		allLoops: "2",
 		activityRevisions: [{ nodeId: "child", revision: "1" }],
 		loopRevisions: [{ nodeId: "child", revision: "1" }],
 	});
@@ -187,41 +195,62 @@ test("root owns root/domain counters and child loop increments aggregate", async
 	assert.equal(node.closeCount, 1);
 });
 
-test("active tick adds one fixed quantum and idle grace resets without backfill", async () => {
+test("active tick freezes at aggregate idle and only a strict idle-gap overflow resets all counters", async () => {
 	const node = new FakeNode("host");
 	const time = fakeClock();
+	let nowMs = 10_000;
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
 		clock: time.clock,
 		activeTickMs: 250,
-		idleGraceMs: 1_000,
+		idleResetGapMs: 60_000,
+		now: () => nowMs,
 	});
 	const instance = {};
 	await coordinator.attach(instance, () => {});
+	await coordinator.recordRootLoop();
 	await coordinator.setBusy(instance, true);
 	assert.deepEqual(time.delays, [250]);
 	time.fireNext();
 	await flush();
 	assert.equal(coordinator.counters()?.activeMs.value, 250n);
-	assert.deepEqual(time.delays, [250, 250]);
-	time.fireNext();
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, 500n);
+	assert.equal(coordinator.counters()?.taskMs.value, 250n);
+	assert.equal(coordinator.counters()?.activeLoops.value, 1n);
 
 	await coordinator.setBusy(instance, false);
-	assert.equal(time.delays.at(-1), 1_000);
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, 250n);
+	assert.equal(coordinator.counters()?.taskMs.value, 250n);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 10_000n);
 	assert.equal(
 		time.callbacks.filter((entry) => !entry.cancelled).length,
-		1,
-		"idle cancels the pending active tick and starts grace immediately",
+		0,
+		"all-idle freezes immediately without scheduling a debounce",
 	);
-	time.fireNext();
+
+	nowMs = 70_000;
+	await coordinator.setBusy(instance, true);
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, 250n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, null);
+
+	await coordinator.setBusy(instance, false);
+	await flush();
+	nowMs = 130_001;
+	await coordinator.setBusy(instance, true);
 	await flush();
 	assert.equal(coordinator.counters()?.activeMs.value, 0n);
+	assert.equal(coordinator.counters()?.activeLoops.value, 0n);
+	assert.equal(coordinator.counters()?.taskMs.value, 0n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, null);
 	await coordinator.detach(instance);
 });
 
-test("reflection pause/reset and explicit resume stay watchdog-owned", async () => {
+test("reflection pause resets task/root/all while preserving active and excluding reflection loops", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
@@ -229,45 +258,51 @@ test("reflection pause/reset and explicit resume stay watchdog-owned", async () 
 	const instance = {};
 	await coordinator.attach(instance, () => {});
 	await coordinator.recordRootLoop();
-	const reset = await coordinator.pauseAndReset();
+	const reset = await coordinator.pauseForReflection(true);
 	assert.equal(reset?.domainEpoch, "domain");
 	assert.equal(reset?.certain, true);
 	assert.equal(reset?.fence.generation, reset?.generation);
 	assert.deepEqual(
 		{
-			rootLoops: reset?.rootLoops,
-			domainLoops: reset?.domainLoops,
 			activeMs: reset?.activeMs,
+			activeLoops: reset?.activeLoops,
+			taskMs: reset?.taskMs,
+			rootLoops: reset?.rootLoops,
+			allLoops: reset?.allLoops,
 		},
 		{
-			rootLoops: { value: 0n, paused: true },
-			domainLoops: { value: 0n, paused: true },
 			activeMs: { value: 0n, paused: true },
+			activeLoops: { value: 1n, paused: true },
+			taskMs: { value: 0n, paused: true },
+			rootLoops: { value: 0n, paused: true },
+			allLoops: { value: 0n, paused: true },
 		},
 	);
 	node.emitPeer("child", "online");
 	await flush();
-	node.emitChannel("pi-reflect-watchdog.activity.v1", {
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
 		busy: false,
 	});
 	await flush();
-	node.emitChannel("pi-reflect-watchdog.loop.v1", {
+	node.emitChannel("pi-reflect-watchdog.loop.v2", {
 		revision: "1",
 		rootLoops: "0",
-		domainLoops: "1",
+		allLoops: "1",
 	});
 	await flush();
-	assert.equal(coordinator.counters()?.domainLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	assert.equal(coordinator.counters()?.activeLoops.value, 1n);
 	await coordinator.resume();
 	assert.equal(coordinator.counters()?.rootLoops.paused, false);
-	node.emitChannel("pi-reflect-watchdog.loop.v1", {
+	node.emitChannel("pi-reflect-watchdog.loop.v2", {
 		revision: "2",
 		rootLoops: "0",
-		domainLoops: "2",
+		allLoops: "2",
 	});
 	await flush();
-	assert.equal(coordinator.counters()?.domainLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
+	assert.equal(coordinator.counters()?.activeLoops.value, 2n);
 	await coordinator.detach(instance);
 });
 
@@ -283,15 +318,15 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 	coordinator.subscribe((counters) => seen.push(counters));
 	await coordinator.attach(instance, () => {});
 	assert.deepEqual(node.sent.at(-1)?.value, { revision: "1", busy: false });
-	await coordinator.recordDomainLoop();
+	await coordinator.recordAllLoop();
 	assert.deepEqual(node.sent.at(-1)?.value, {
 		revision: "1",
 		rootLoops: "0",
-		domainLoops: "1",
+		allLoops: "1",
 	});
 
 	node.emitChannel(
-		"pi-reflect-watchdog.counters.v1",
+		"pi-reflect-watchdog.counters.v2",
 		{
 			revision: "1",
 			generation: "1",
@@ -299,9 +334,12 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			certain: true,
 			paused: false,
 			anyBusy: false,
-			rootLoops: "0",
-			domainLoops: "0",
+			endLoopTimeMs: null,
 			activeMs: "0",
+			activeLoops: "0",
+			taskMs: "0",
+			rootLoops: "0",
+			allLoops: "0",
 			activityRevisions: [{ nodeId: "child", revision: "1" }],
 			loopRevisions: [],
 		},
@@ -309,7 +347,7 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 	);
 	assert.equal(coordinator.counters(), undefined);
 	node.emitChannel(
-		"pi-reflect-watchdog.counters.v1",
+		"pi-reflect-watchdog.counters.v2",
 		{
 			revision: "2",
 			generation: "2",
@@ -317,17 +355,20 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			certain: true,
 			paused: false,
 			anyBusy: false,
-			rootLoops: "0",
-			domainLoops: "1",
+			endLoopTimeMs: null,
 			activeMs: "0",
+			activeLoops: "0",
+			taskMs: "0",
+			rootLoops: "0",
+			allLoops: "1",
 			activityRevisions: [{ nodeId: "child", revision: "1" }],
 			loopRevisions: [{ nodeId: "child", revision: "1" }],
 		},
 		"host",
 	);
-	assert.equal(coordinator.counters()?.domainLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
 	node.emitChannel(
-		"pi-reflect-watchdog.counters.v1",
+		"pi-reflect-watchdog.counters.v2",
 		{
 			revision: "1",
 			generation: "1",
@@ -335,15 +376,18 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			certain: true,
 			paused: false,
 			anyBusy: false,
-			rootLoops: "0",
-			domainLoops: "0",
+			endLoopTimeMs: null,
 			activeMs: "0",
+			activeLoops: "0",
+			taskMs: "0",
+			rootLoops: "0",
+			allLoops: "0",
 			activityRevisions: [{ nodeId: "child", revision: "1" }],
 			loopRevisions: [{ nodeId: "child", revision: "1" }],
 		},
 		"host",
 	);
-	assert.equal(coordinator.counters()?.domainLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
 	assert.equal(seen.length, 1);
 	await coordinator.detach(instance);
 });
@@ -360,7 +404,7 @@ test("host transport errors revoke certainty while a peer is still tracked", asy
 	const instance = {};
 	await coordinator.attach(instance, () => {});
 	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v1", {
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
 		busy: false,
 	});
@@ -383,12 +427,12 @@ test("graceful leave stays certain even if the closed channel reports an error",
 	const instance = {};
 	await coordinator.attach(instance, () => {});
 	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v1", {
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
 		busy: false,
 	});
 	await flush();
-	node.emitChannel("pi-reflect-watchdog.leave.v1", { version: 1 });
+	node.emitChannel("pi-reflect-watchdog.leave.v2", { version: 1 });
 	await flush();
 	assert.equal(coordinator.counters()?.certain, true);
 	transportError?.(new Error("closed peer channel"));
@@ -396,17 +440,18 @@ test("graceful leave stays certain even if the closed channel reports an error",
 	await coordinator.detach(instance);
 });
 
-test("host broadcast rejection revokes certainty", async () => {
+test("host counter-send rejection revokes certainty", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
 	});
 	const instance = {};
 	await coordinator.attach(instance, () => {});
-	node.broadcastError = new Error("broadcast failed");
+	node.emitPeer("child", "online");
+	node.sendError = new Error("broadcast failed");
 	await assert.rejects(coordinator.recordRootLoop(), /broadcast failed/);
 	assert.equal(coordinator.counters()?.certain, false);
-	node.broadcastError = null;
+	node.sendError = null;
 	await coordinator.detach(instance);
 });
 
@@ -418,25 +463,25 @@ test("cumulative loop state repairs a missing intermediate write", async () => {
 	const instance = {};
 	await coordinator.attach(instance, () => {});
 	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v1", {
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
 		busy: false,
 	});
 	await flush();
 
 	// Revision 1 was lost. Revision 2 carries both cumulative events.
-	node.emitChannel("pi-reflect-watchdog.loop.v1", {
+	node.emitChannel("pi-reflect-watchdog.loop.v2", {
 		revision: "2",
 		rootLoops: "1",
-		domainLoops: "2",
+		allLoops: "2",
 	});
 	await flush();
 	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
-	assert.equal(coordinator.counters()?.domainLoops.value, 2n);
-	const lastBroadcast = node.broadcasts.at(-1)?.value;
-	assert.ok(lastBroadcast);
+	assert.equal(coordinator.counters()?.allLoops.value, 2n);
+	const lastCounterSend = counterSends(node).at(-1)?.value;
+	assert.ok(lastCounterSend);
 	assert.deepEqual(
-		(lastBroadcast as { loopRevisions: unknown }).loopRevisions,
+		(lastCounterSend as { loopRevisions: unknown }).loopRevisions,
 		[{ nodeId: "child", revision: "2" }],
 	);
 	await coordinator.detach(instance);
@@ -459,7 +504,7 @@ test("failed loop write is replayed cumulatively after reconnect", async () => {
 	assert.deepEqual(node.sent.at(-1)?.value, {
 		revision: "1",
 		rootLoops: "1",
-		domainLoops: "1",
+		allLoops: "1",
 	});
 	await coordinator.detach(instance);
 });

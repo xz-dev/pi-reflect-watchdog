@@ -10,14 +10,14 @@ import {
 
 test("reflectionPrompt layers by field and trusted project precedence", () => {
 	const result = mergeConfig(
-		{ mainLoopLimit: 120, reflectionPrompt: "global semantic prefix" },
+		{ rootLoopLimit: 120, reflectionPrompt: "global semantic prefix" },
 		{
-			observedTotalLoopLimit: 700,
+			allLoopLimit: 700,
 			reflectionPrompt: "project semantic prefix",
 		},
 	);
-	assert.equal(result.config.mainLoopLimit, 120);
-	assert.equal(result.config.observedTotalLoopLimit, 700);
+	assert.equal(result.config.rootLoopLimit, 120);
+	assert.equal(result.config.allLoopLimit, 700);
 	assert.equal(result.config.reflectionPrompt, "project semantic prefix");
 	assert.equal(result.diagnostics.length, 0);
 });

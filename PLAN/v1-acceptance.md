@@ -18,20 +18,20 @@
 
 ## Exact counters
 
-- `pi-reflect-watchdog` owns root loops, domain loops, continuous aggregate-active milliseconds, certainty, generation, and fences.
-- Each ordinary `turn_end` contributes one versioned loop message; root ordinary turns increment both root and domain loops.
+- `pi-reflect-watchdog` owns active time/loops, task time, root loops, all loops, certainty, generation, and fences.
+- Each ordinary `turn_end` contributes one versioned loop message; root ordinary turns increment root/all/active loops, and other observable ordinary turns increment all/active loops.
 - Reflection and correction attempts do not increment counters.
 - Root owns pause/reset/resume. Fresh activity and loop revisions are acknowledged in snapshots; stale epochs, revisions, or reconnect snapshots fail closed.
-- Active time uses recursive fixed-quantum `setTimeout`; delayed callbacks never backfill host sleep.
-- Aggregate idle uses one fixed 10-second handoff grace. Busy returning within grace continues the window; idle through grace resets continuous-active time.
+- Active/task time uses recursive fixed-quantum `setTimeout`; delayed callbacks never backfill host sleep.
+- Aggregate idle has no debounce: it immediately freezes active/task time and records `the_end_loop_time`. Exactly the configured 60-second idle gap resumes the same counters; only a strictly longer gap resets active/task/root/all.
 
 ## Queue and outcomes
 
 - Automatic and manual triggers share one serialized queue.
 - Simultaneous automatic reasons merge while preserving the first pre-reset threshold snapshot.
-- Reasons are `ROOT_LOOP_LIMIT`, `DOMAIN_LOOP_LIMIT`, `CONTINUOUS_DOMAIN_ACTIVE_TIME`, and `USER_REQUEST`.
+- Reasons are `ROOT_LOOP_LIMIT`, `ALL_LOOP_LIMIT`, `TASK_TIME_LIMIT`, and `USER_REQUEST`.
 - `/reflect` trailing text is persisted as user supplement; blank means absent.
-- Reflection starts by pausing/resetting counters. Queue completion resumes counters/timer.
+- Automatic reflection starts by pausing counters and resetting task/root/all while preserving active. Manual reflection pauses without resetting. Queue completion resumes counters/timer.
 - `NO_ISSUE` persists and renders one report, then starts no work turn.
 - `ROUTE_CORRECTION` persists first, then sends the readable report and starts one ordinary work turn.
 

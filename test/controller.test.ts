@@ -3,14 +3,16 @@ import test from "node:test";
 import { TaskController } from "../src/index.js";
 
 const limits = {
-	mainLoopLimit: 2,
-	observedTotalLoopLimit: 3,
-	wallClockMinutes: 1,
+	rootLoopLimit: 2,
+	allLoopLimit: 3,
+	taskMinutes: 1,
+	idleResetGapSeconds: 60,
 };
 
-test("root and domain loop thresholds combine and reset before continuation", () => {
+test("root and all loop thresholds combine and reset task/root/all before continuation", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);
+	controller.startRootActiveSegment(0);
 	const child = controller.bindObserver("child");
 	assert.deepEqual(controller.completeRootTurn(1).warnings, []);
 	assert.deepEqual(
@@ -18,34 +20,61 @@ test("root and domain loop thresholds combine and reset before continuation", ()
 		[],
 	);
 	const warning = controller.completeRootTurn(3);
-	assert.deepEqual(warning.warnings, ["ROOT_LOOP_LIMIT", "DOMAIN_LOOP_LIMIT"]);
-	assert.equal(warning.triggerStatus?.mainLoops, 2);
-	assert.equal(controller.status(3).mainLoops, 0);
-	assert.equal(controller.status(3).observedChildSessions, 1);
+	assert.deepEqual(warning.warnings, ["ROOT_LOOP_LIMIT", "ALL_LOOP_LIMIT"]);
+	assert.equal(warning.triggerStatus?.rootLoops, 2);
+	assert.equal(controller.status(3).rootLoops, 0);
+	assert.equal(controller.status(3).allLoops, 0);
+	assert.equal(controller.status(3).activity.loops, 3);
+	assert.equal(controller.status(3).observableAgentSessions, 1);
 	assert.deepEqual(controller.completeRootTurn(4).warnings, []);
 });
 
-test("domain threshold includes root and observer loops", () => {
+test("all threshold includes root and observer loops", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);
+	controller.startRootActiveSegment(0);
 	const child = controller.bindObserver("child");
 	controller.completeRootTurn(1);
 	controller.completeObserverTurn("child", child, 2);
 	const warning = controller.completeObserverTurn("child", child, 3);
-	assert.deepEqual(warning.warnings, ["DOMAIN_LOOP_LIMIT"]);
-	assert.equal(warning.triggerStatus?.observedTotalLoops, 3);
-	assert.equal(controller.status(3).observedTotalLoops, 0);
+	assert.deepEqual(warning.warnings, ["ALL_LOOP_LIMIT"]);
+	assert.equal(warning.triggerStatus?.allLoops, 3);
+	assert.equal(controller.status(3).allLoops, 0);
+	assert.equal(controller.status(3).activity.loops, 3);
 });
 
-test("continuous domain active time uses root-only time and resets after warning", () => {
+test("task time uses aggregate active time and resets after warning", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);
 	controller.startRootActiveSegment(0);
-	assert.deepEqual(controller.evaluateWallClock(59_999).warnings, []);
-	const warning = controller.evaluateWallClock(60_000);
-	assert.deepEqual(warning.warnings, ["CONTINUOUS_DOMAIN_ACTIVE_TIME"]);
-	assert.equal(warning.triggerStatus?.wallClockElapsedMs, 60_000);
-	assert.equal(controller.status(60_000).wallClockElapsedMs, 0);
+	assert.deepEqual(controller.evaluateTaskTime(59_999).warnings, []);
+	const warning = controller.evaluateTaskTime(60_000);
+	assert.deepEqual(warning.warnings, ["TASK_TIME_LIMIT"]);
+	assert.equal(warning.triggerStatus?.taskElapsedMs, 60_000);
+	assert.equal(controller.status(60_000).taskElapsedMs, 0);
+	assert.equal(controller.status(60_000).activity.elapsedMs, 60_000);
+});
+
+test("active cycle freezes at all-idle, resumes at the exact gap, and resets only after it", () => {
+	const controller = new TaskController(limits);
+	controller.startRootTask(0);
+	controller.startRootActiveSegment(1_000);
+	controller.completeRootTurn(2_000);
+	controller.settleRootActiveSegment(11_000);
+	assert.equal(controller.status(70_999).activity.active, false);
+	assert.equal(controller.status(70_999).activity.elapsedMs, 10_000);
+	assert.equal(controller.status(70_999).activity.loops, 1);
+
+	controller.startRootActiveSegment(71_000);
+	controller.settleRootActiveSegment(72_000);
+	assert.equal(controller.status(72_000).activity.elapsedMs, 11_000);
+	assert.equal(controller.status(72_000).activity.loops, 1);
+
+	controller.startRootActiveSegment(132_001);
+	assert.equal(controller.status(132_001).activity.elapsedMs, 0);
+	assert.equal(controller.status(132_001).activity.loops, 0);
+	assert.equal(controller.status(132_001).rootLoops, 0);
+	assert.equal(controller.status(132_001).taskElapsedMs, 0);
 });
 
 test("observer epochs are rejected after a new root task", () => {
@@ -59,18 +88,21 @@ test("observer epochs are rejected after a new root task", () => {
 	);
 	const current = controller.bindObserver("child");
 	controller.completeObserverTurn("child", current, 3);
-	assert.equal(controller.status(3).observedChildLoops, 1);
+	assert.equal(controller.status(3).otherAgentLoops, 1);
 });
 
-test("manual reset retains runtime limits while threshold reset restores configured limits", () => {
+test("manual reset preserves active and runtime limits while threshold reset restores configured limits", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);
-	controller.setLimits({ mainLoopLimit: 8 }, 0);
-	controller.resetRuntime(1);
-	assert.equal(controller.status(1).limits.mainLoopLimit, 8);
-	controller.setLimits({ mainLoopLimit: 1 }, 2);
-	controller.startRootActiveSegment(2);
-	const warning = controller.completeRootTurn(3);
+	controller.startRootActiveSegment(0);
+	controller.completeRootTurn(1_000);
+	controller.setLimits({ rootLoopLimit: 8 }, 1_000);
+	controller.resetReminderCycle(2_000);
+	assert.equal(controller.status(2_000).limits.rootLoopLimit, 8);
+	assert.equal(controller.status(2_000).activity.loops, 1);
+	controller.setLimits({ rootLoopLimit: 1 }, 2_000);
+	const warning = controller.completeRootTurn(3_000);
 	assert.deepEqual(warning.warnings, ["ROOT_LOOP_LIMIT"]);
-	assert.deepEqual(controller.status(3).limits, limits);
+	assert.deepEqual(controller.status(3_000).limits, limits);
+	assert.equal(controller.status(3_000).activity.loops, 2);
 });
