@@ -91,6 +91,14 @@ Reflection records are context-excluded custom entries on the current session br
 Reflect Watchdog | active <time>/<all-loops> loops · task <time>/<limit> · root <loops>/<limit> · all <loops>/<limit>
 ```
 
+## Design documents
+
+Durable project documents live under [`docs/`](docs/README.md):
+
+- [`docs/planning/v1-acceptance.md`](docs/planning/v1-acceptance.md): v1 acceptance contract.
+- [`docs/planning/user-controls-red-waiver.md`](docs/planning/user-controls-red-waiver.md): historical user-controls repair waiver.
+- [`docs/programming-thinking/pi-reflect-watchdog-lifecycle.idea.lean`](docs/programming-thinking/pi-reflect-watchdog-lifecycle.idea.lean): executable Lean 4 lifecycle and counter-contract authority.
+
 ## Install
 
 This repository uses Git source and generated release branches:
