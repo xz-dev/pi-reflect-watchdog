@@ -4,6 +4,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
 	foldInquiryContext,
@@ -837,13 +838,19 @@ export function createWatchdogExtension(
 				return true;
 			};
 			try {
-				await services.processDomain.attach(runtime, (error) => {
-					if (exitForInitialDomainFailure(error)) return;
-					runtime.domainCounters = undefined;
-					ctx.ui.notify(
-						"pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.",
-						"warning",
-					);
+				await services.processDomain.attach(runtime, {
+					getBusy: () =>
+						runtime.ctx === undefined || runtime.pausedForReflection
+							? false
+							: probePiAgentState(runtime.ctx).busy,
+					onFatal: (error) => {
+						if (exitForInitialDomainFailure(error)) return;
+						runtime.domainCounters = undefined;
+						ctx.ui.notify(
+							"pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.",
+							"warning",
+						);
+					},
 				});
 				if (
 					runtime.state !== "root" ||
@@ -956,12 +963,25 @@ export function createWatchdogExtension(
 			};
 		});
 
-		pi.on("agent_start", () => {
-			if (!runtime.pausedForReflection && runtime.runActivity === "pending")
+		const observeLiveAgentState = (ctx: ExtensionContext): boolean => {
+			const { busy } = probePiAgentState(ctx);
+			if (runtime.pausedForReflection) return busy;
+			if (busy) {
 				classifyWork();
+				return true;
+			}
+			if (runtime.domainAttached)
+				void services.processDomain.setBusy(runtime, false).catch(() => {});
+			return false;
+		};
+
+		pi.on("agent_start", (_event, ctx) => {
+			observeLiveAgentState(ctx);
 		});
-		pi.on("agent_settled", () => {
+		pi.on("agent_settled", (_event, ctx) => {
 			const completedActivity = runtime.runActivity;
+			const idle = !observeLiveAgentState(ctx);
+			if (!idle) return;
 			runtime.runActivity = "pending";
 			if (runtime.pausedForReflection) {
 				if (runtime.domainAttached)
@@ -984,7 +1004,9 @@ export function createWatchdogExtension(
 					);
 					void services.processDomain.resume().finally(() => {
 						runtime.pausedForReflection = false;
+						if (runtime.ctx !== undefined) observeLiveAgentState(runtime.ctx);
 						scheduleTimers(runtime, services);
+						updateStatus(runtime, services);
 					});
 					return;
 				}
@@ -992,13 +1014,13 @@ export function createWatchdogExtension(
 					runtime.resumeAfterReflectionTurn = false;
 					void services.processDomain.resume().finally(() => {
 						runtime.pausedForReflection = false;
+						if (runtime.ctx !== undefined) observeLiveAgentState(runtime.ctx);
 						scheduleTimers(runtime, services);
+						updateStatus(runtime, services);
 					});
 				}
 				return;
 			}
-			if (runtime.domainAttached)
-				void services.processDomain.setBusy(runtime, false).catch(() => {});
 			if (completedActivity !== "work") return;
 			if (rootIsCurrent(runtime)) {
 				const snapshot = runtime.controller.settleRootActiveSegment(

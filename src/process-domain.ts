@@ -110,7 +110,8 @@ interface PeerActivity {
 
 interface Attachment {
 	busy: boolean;
-	onFatal: (error: Error) => void;
+	readonly getBusy: () => boolean;
+	readonly onFatal: (error: Error) => void;
 }
 
 interface ParsedCounterMessage {
@@ -121,7 +122,14 @@ interface ParsedCounterMessage {
 
 export interface ReflectDomainCoordinator {
 	readonly rootProcess: boolean;
-	attach(instance: object, onFatal: (error: Error) => void): Promise<void>;
+	attach(
+		instance: object,
+		options: {
+			/** Queried at attach and after every client reconnect. */
+			readonly getBusy: () => boolean;
+			readonly onFatal: (error: Error) => void;
+		},
+	): Promise<void>;
 	detach(instance: object): Promise<void>;
 	setBusy(instance: object, busy: boolean): Promise<void>;
 	recordRootLoop(): Promise<ReflectDomainCounters>;
@@ -691,6 +699,8 @@ export function createReflectDomainCoordinator(
 			if (event.peer.status === "offline") markClientUncertain();
 			else {
 				markClientUncertain();
+				for (const attachment of attachments.values())
+					attachment.busy = attachment.getBusy();
 				void (async () => {
 					await queueWrite("activity");
 					await queueLoopSnapshot();
@@ -915,10 +925,14 @@ export function createReflectDomainCoordinator(
 		get rootProcess() {
 			return rootProcess;
 		},
-		attach(instance, onFatal) {
+		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
 				if (attachments.has(instance)) return;
-				attachments.set(instance, { busy: false, onFatal });
+				attachments.set(instance, {
+					busy: attachOptions.getBusy(),
+					getBusy: attachOptions.getBusy,
+					onFatal: attachOptions.onFatal,
+				});
 				const alreadyOpen = node !== undefined;
 				try {
 					await ensureOpen();

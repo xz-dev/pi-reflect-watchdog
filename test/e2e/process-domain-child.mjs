@@ -20,14 +20,18 @@ const coordinator = createReflectDomainCoordinator({
 	idleResetGapMs: 300,
 });
 const instance = {};
+let busy = false;
 
 function reply(id, data, error) {
 	process.send?.({ id, data, error });
 }
 
 try {
-	await coordinator.attach(instance, (error) => {
-		process.send?.({ event: "transport-error", message: error.message });
+	await coordinator.attach(instance, {
+		getBusy: () => busy,
+		onFatal: (error) => {
+			process.send?.({ event: "transport-error", message: error.message });
+		},
 	});
 	process.send?.({ event: "ready", pid: process.pid });
 } catch (error) {
@@ -45,10 +49,12 @@ process.on("message", async (message) => {
 	try {
 		switch (command) {
 			case "busy":
+				busy = true;
 				await coordinator.setBusy(instance, true);
 				reply(id, true);
 				break;
 			case "idle":
+				busy = false;
 				await coordinator.setBusy(instance, false);
 				reply(id, true);
 				break;

@@ -154,7 +154,7 @@ test("root owns root/domain counters and child loop increments aggregate", async
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	const first = await coordinator.recordRootLoop();
 	assert.equal(first.rootLoops.value, 1n);
 	assert.equal(first.allLoops.value, 1n);
@@ -207,7 +207,7 @@ test("active tick freezes at aggregate idle and only a strict idle-gap overflow 
 		now: () => nowMs,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	await coordinator.recordRootLoop();
 	await coordinator.setBusy(instance, true);
 	assert.deepEqual(time.delays, [250]);
@@ -256,7 +256,7 @@ test("reflection pause resets task/root/all while preserving active and excludin
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	await coordinator.recordRootLoop();
 	const reset = await coordinator.pauseForReflection(true);
 	assert.equal(reset?.domainEpoch, "domain");
@@ -306,6 +306,41 @@ test("reflection pause resets task/root/all while preserving active and excludin
 	await coordinator.detach(instance);
 });
 
+test("attach and reconnect query the live busy source", async () => {
+	const node = new FakeNode("client", "child");
+	node.emitPeer("host", "online");
+	let busy = true;
+	let probes = 0;
+	const coordinator = createReflectDomainCoordinator({
+		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => {
+			probes += 1;
+			return busy;
+		},
+		onFatal() {},
+	});
+	assert.equal(probes, 1);
+	assert.deepEqual(node.sent.at(-1)?.value, { revision: "1", busy: true });
+
+	busy = false;
+	node.emitPeer("host", "online");
+	await flush();
+	assert.equal(probes, 2);
+	assert.deepEqual(
+		node.sent
+			.filter(
+				(message) => message.channel === "pi-reflect-watchdog.activity.v2",
+			)
+			.at(-1)?.value,
+		{ revision: "2", busy: false },
+	);
+	await coordinator.detach(instance);
+});
+
 test("client requires snapshot echoes for activity and loop revisions", async () => {
 	const node = new FakeNode("client", "child");
 	node.emitPeer("host", "online");
@@ -316,7 +351,7 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 	const instance = {};
 	const seen: ReflectDomainCounters[] = [];
 	coordinator.subscribe((counters) => seen.push(counters));
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	assert.deepEqual(node.sent.at(-1)?.value, { revision: "1", busy: false });
 	await coordinator.recordAllLoop();
 	assert.deepEqual(node.sent.at(-1)?.value, {
@@ -402,7 +437,7 @@ test("host transport errors revoke certainty while a peer is still tracked", asy
 		},
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	node.emitPeer("child", "online");
 	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
@@ -425,7 +460,7 @@ test("graceful leave stays certain even if the closed channel reports an error",
 		},
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	node.emitPeer("child", "online");
 	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
@@ -446,7 +481,7 @@ test("host counter-send rejection revokes certainty", async () => {
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	node.emitPeer("child", "online");
 	node.sendError = new Error("broadcast failed");
 	await assert.rejects(coordinator.recordRootLoop(), /broadcast failed/);
@@ -461,7 +496,7 @@ test("cumulative loop state repairs a missing intermediate write", async () => {
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	node.emitPeer("child", "online");
 	node.emitChannel("pi-reflect-watchdog.activity.v2", {
 		revision: "1",
@@ -495,7 +530,7 @@ test("failed loop write is replayed cumulatively after reconnect", async () => {
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
 	node.sendError = new Error("offline");
 	await assert.rejects(coordinator.recordRootLoop(), /offline/);
 	node.sendError = null;
@@ -517,8 +552,10 @@ test("offline writes stay recoverable and reconnect republishes current state", 
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, () => {});
+	let busy = false;
+	await coordinator.attach(instance, { getBusy: () => busy, onFatal() {} });
 	node.sendError = new Error("offline");
+	busy = true;
 	const write = coordinator.setBusy(instance, true);
 	assert.equal(coordinator.counters(), undefined);
 	await assert.rejects(write, /offline/);

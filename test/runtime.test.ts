@@ -50,12 +50,16 @@ function context() {
 		getSessionId: () => "root",
 		getBranch: () => [],
 	};
+	let idle = false;
 	return {
 		hasUI: true,
 		mode: "rpc",
 		cwd: "/work",
 		isProjectTrusted: () => false,
-		isIdle: () => false,
+		isIdle: () => idle,
+		setIdle: (value: boolean) => {
+			idle = value;
+		},
 		sessionManager: manager,
 		ui: {
 			notify: (text: string, kind?: string) => notifications.push([text, kind]),
@@ -234,6 +238,35 @@ test("unrelated custom inquiries fail closed to ordinary work", async () => {
 		ctx,
 	);
 	await pi.emit("turn_end", {}, ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(activityWrites, [true, false]);
+});
+
+test("live Pi state reopens activity after a completed round", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	assert.deepEqual(activityWrites, [true, false, true]);
+});
+
+test("a false-idle settled event cannot freeze a live run", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(activityWrites, [true]);
+
+	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
 });
@@ -245,6 +278,7 @@ test("user input remains ordinary work during unrelated custom traffic", async (
 	await pi.emit("message_start", { message: { role: "custom" } }, ctx);
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
 	await pi.emit("turn_end", {}, ctx);
+	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
 });
@@ -270,6 +304,7 @@ test("unknown activity metadata fails closed to ordinary work", async () => {
 		ctx,
 	);
 	await pi.emit("turn_end", {}, ctx);
+	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
 });

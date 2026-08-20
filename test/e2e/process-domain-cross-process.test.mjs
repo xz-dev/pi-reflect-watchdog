@@ -120,7 +120,7 @@ test("wrong capability fails closed with status 78 and sanitized output", {
 	const env = {};
 	const root = createReflectDomainCoordinator({ env, open });
 	const instance = {};
-	await root.attach(instance, () => {});
+	await root.attach(instance, { getBusy: () => false, onFatal() {} });
 	t.after(() => root.detach(instance));
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
@@ -138,7 +138,7 @@ test("wrong capability fails closed with status 78 and sanitized output", {
 		'import { createReflectDomainCoordinator, isReflectDomainFatalError } from "./dist/process-domain.js";',
 		"const open = (options) => openProcessDomain({ ...options, connectTimeoutMs: 1500, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 400, heartbeatTimeToLiveMs: 300 });",
 		"const coordinator = createReflectDomainCoordinator({ open });",
-		"try { await coordinator.attach({}, () => {}); process.exitCode = 1; } catch (error) {",
+		"try { await coordinator.attach({}, { getBusy: () => false, onFatal() {} }); process.exitCode = 1; } catch (error) {",
 		'  console.error("CODE=" + (isReflectDomainFatalError(error) ? error.code : "UNKNOWN"));',
 		"  process.exitCode = 78;",
 		"}",
@@ -184,7 +184,7 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 		idleResetGapMs: 300,
 	});
 	const instance = {};
-	await root.attach(instance, () => {});
+	await root.attach(instance, { getBusy: () => false, onFatal() {} });
 	t.after(() => root.detach(instance));
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
