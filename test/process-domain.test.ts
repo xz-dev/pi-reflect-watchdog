@@ -312,6 +312,30 @@ test("pause preserves counters, excludes paused loops, and resume re-probes acti
 	await coordinator.detach(instance);
 });
 
+test("host pause and resume are synchronously visible to fire-and-forget callers", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	// The public API is fire-and-forget (pause(): void), so callers read the
+	// pause state synchronously in the same tick. The published counters
+	// snapshot legitimately lags behind the async publish; the getter must
+	// answer from the host's synchronously maintained internal flag instead
+	// (pi-continue-watchdog's `api.pause(); flag = api.paused` pattern).
+	const pausePromise = coordinator.pause();
+	assert.equal(coordinator.paused, true);
+	await pausePromise;
+	assert.equal(coordinator.paused, true);
+	const resumePromise = coordinator.resume();
+	assert.equal(coordinator.paused, false);
+	await resumePromise;
+	assert.equal(coordinator.paused, false);
+	assert.equal(coordinator.counters()?.rootLoops.paused, false);
+	await coordinator.detach(instance);
+});
+
 test("pause while idle preserves the pre-pause gap and excludes paused time", async () => {
 	const node = new FakeNode("host");
 	let busy = false;

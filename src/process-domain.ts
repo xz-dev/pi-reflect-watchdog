@@ -929,7 +929,13 @@ export function createReflectDomainCoordinator(
 			return rootProcess;
 		},
 		get paused() {
-			return countersValue?.activeMs.paused ?? paused;
+			// The host's internal flag is assigned synchronously by pause() and
+			// resume(), while the published countersValue snapshot only catches
+			// up after an async publish. The void fire-and-forget API contract
+			// requires this getter to be synchronously accurate, so the host
+			// reads its internal flag; clients never set it and learn the pause
+			// state exclusively from host broadcasts.
+			return rootProcess ? paused : (countersValue?.activeMs.paused ?? paused);
 		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
