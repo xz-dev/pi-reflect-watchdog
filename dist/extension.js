@@ -1,4 +1,5 @@
 import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import { createInquiryRuntime, foldInquiryContext, } from "pi-extension-utils/pi-inquiry";
 import { loadRuntimeConfig } from "./config-loader.js";
 import { controllerOptionsFromConfig, TaskController, } from "./controller.js";
@@ -543,11 +544,16 @@ export function createWatchdogExtension(overrides = {}) {
                 return true;
             };
             try {
-                await services.processDomain.attach(runtime, (error) => {
-                    if (exitForInitialDomainFailure(error))
-                        return;
-                    runtime.domainCounters = undefined;
-                    ctx.ui.notify("pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.", "warning");
+                await services.processDomain.attach(runtime, {
+                    getBusy: () => runtime.ctx === undefined || runtime.pausedForReflection
+                        ? false
+                        : probePiAgentState(runtime.ctx).busy,
+                    onFatal: (error) => {
+                        if (exitForInitialDomainFailure(error))
+                            return;
+                        runtime.domainCounters = undefined;
+                        ctx.ui.notify("pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.", "warning");
+                    },
                 });
                 if (runtime.state !== "root" ||
                     !isCurrentRoot(hub, runtime.token, claim.root.generation)) {
@@ -627,12 +633,26 @@ export function createWatchdogExtension(overrides = {}) {
                 taskEpoch: epoch,
             };
         });
-        pi.on("agent_start", () => {
-            if (!runtime.pausedForReflection && runtime.runActivity === "pending")
+        const observeLiveAgentState = (ctx) => {
+            const { busy } = probePiAgentState(ctx);
+            if (runtime.pausedForReflection)
+                return busy;
+            if (busy) {
                 classifyWork();
+                return true;
+            }
+            if (runtime.domainAttached)
+                void services.processDomain.setBusy(runtime, false).catch(() => { });
+            return false;
+        };
+        pi.on("agent_start", (_event, ctx) => {
+            observeLiveAgentState(ctx);
         });
-        pi.on("agent_settled", () => {
+        pi.on("agent_settled", (_event, ctx) => {
             const completedActivity = runtime.runActivity;
+            const idle = !observeLiveAgentState(ctx);
+            if (!idle)
+                return;
             runtime.runActivity = "pending";
             if (runtime.pausedForReflection) {
                 if (runtime.domainAttached)
@@ -648,7 +668,10 @@ export function createWatchdogExtension(overrides = {}) {
                     runtime.ctx?.ui.notify("Reflection aborted before a valid response; watchdog counters resumed.", "warning");
                     void services.processDomain.resume().finally(() => {
                         runtime.pausedForReflection = false;
+                        if (runtime.ctx !== undefined)
+                            observeLiveAgentState(runtime.ctx);
                         scheduleTimers(runtime, services);
+                        updateStatus(runtime, services);
                     });
                     return;
                 }
@@ -656,13 +679,14 @@ export function createWatchdogExtension(overrides = {}) {
                     runtime.resumeAfterReflectionTurn = false;
                     void services.processDomain.resume().finally(() => {
                         runtime.pausedForReflection = false;
+                        if (runtime.ctx !== undefined)
+                            observeLiveAgentState(runtime.ctx);
                         scheduleTimers(runtime, services);
+                        updateStatus(runtime, services);
                     });
                 }
                 return;
             }
-            if (runtime.domainAttached)
-                void services.processDomain.setBusy(runtime, false).catch(() => { });
             if (completedActivity !== "work")
                 return;
             if (rootIsCurrent(runtime)) {

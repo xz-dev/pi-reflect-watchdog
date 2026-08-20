@@ -41,6 +41,6 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
-    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#a9043f0efef765789c221c1193373a8405792f1f"
+    "pi-extension-utils": "git+https://github.com/xz-dev/pi-extension-utils.git#35eb18d7440cd77de339a111b6af86f6e63c14b4"
   }
 }

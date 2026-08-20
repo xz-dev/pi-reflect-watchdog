@@ -33,7 +33,11 @@ export interface ReflectDomainCounters {
 }
 export interface ReflectDomainCoordinator {
     readonly rootProcess: boolean;
-    attach(instance: object, onFatal: (error: Error) => void): Promise<void>;
+    attach(instance: object, options: {
+        /** Queried at attach and after every client reconnect. */
+        readonly getBusy: () => boolean;
+        readonly onFatal: (error: Error) => void;
+    }): Promise<void>;
     detach(instance: object): Promise<void>;
     setBusy(instance: object, busy: boolean): Promise<void>;
     recordRootLoop(): Promise<ReflectDomainCounters>;

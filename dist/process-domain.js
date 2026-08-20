@@ -480,6 +480,8 @@ export function createReflectDomainCoordinator(options = {}) {
                 markClientUncertain();
             else {
                 markClientUncertain();
+                for (const attachment of attachments.values())
+                    attachment.busy = attachment.getBusy();
                 void (async () => {
                     await queueWrite("activity");
                     await queueLoopSnapshot();
@@ -692,11 +694,15 @@ export function createReflectDomainCoordinator(options = {}) {
         get rootProcess() {
             return rootProcess;
         },
-        attach(instance, onFatal) {
+        attach(instance, attachOptions) {
             return queueLifecycle(async () => {
                 if (attachments.has(instance))
                     return;
-                attachments.set(instance, { busy: false, onFatal });
+                attachments.set(instance, {
+                    busy: attachOptions.getBusy(),
+                    getBusy: attachOptions.getBusy,
+                    onFatal: attachOptions.onFatal,
+                });
                 const alreadyOpen = node !== undefined;
                 try {
                     await ensureOpen();
