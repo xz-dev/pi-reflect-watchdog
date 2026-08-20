@@ -623,10 +623,12 @@ export function createWatchdogExtension(overrides = {}) {
                     return services.processDomain.paused;
                 },
                 pause: () => {
-                    void pauseCounting(runtime, services);
+                    // pauseCounting rethrows after its own cleanup; the void API must
+                    // not surface an unhandled rejection.
+                    void pauseCounting(runtime, services).catch(() => { });
                 },
                 resume: () => {
-                    void resumeCounting(runtime, services);
+                    void resumeCounting(runtime, services).catch(() => { });
                 },
             };
             runtime.removeApi = installReflectWatchdogApi(api);
