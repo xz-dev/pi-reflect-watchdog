@@ -1,6 +1,10 @@
 export type ReflectWatchdogCommand = {
     action: "status";
 } | {
+    action: "pause";
+} | {
+    action: "resume";
+} | {
     action: "reset";
 } | {
     action: "limits-show";
@@ -21,6 +25,6 @@ export type ParseReflectWatchdogResult = {
 export declare const REFLECT_WATCHDOG_COMMAND = "reflect-watchdog";
 export declare const REFLECT_COMMAND = "reflect";
 export declare const REFLECT_TIMELINE_COMMAND = "reflect-timeline";
-export declare const REFLECT_WATCHDOG_USAGE = "Usage: /reflect-watchdog [status|reset|limits [<root> <all> <minutes> <idle-reset-seconds>|reset]]";
+export declare const REFLECT_WATCHDOG_USAGE = "Usage: /reflect-watchdog [status|pause|resume|reset|limits [<root> <all> <minutes> <idle-reset-seconds>|reset]]";
 /** Parse the reflect-watchdog control command without touching runtime state. */
 export declare function parseReflectWatchdogCommand(input: string): ParseReflectWatchdogResult;

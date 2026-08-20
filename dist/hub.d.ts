@@ -1,4 +1,10 @@
 export declare const HUB_SYMBOL: unique symbol;
+export declare const REFLECT_WATCHDOG_API_SYMBOL: unique symbol;
+export interface ReflectWatchdogApi {
+    readonly paused: boolean;
+    pause(): void;
+    resume(): void;
+}
 export type RootPriority = 1 | 2;
 export interface RootAttachment<T> {
     token: string;
@@ -16,6 +22,7 @@ export interface RootClaim<T> {
     replaced?: RootAttachment<T>;
 }
 export declare function getHub<T>(): WatchdogHub<T>;
+export declare function installReflectWatchdogApi(api: ReflectWatchdogApi): () => void;
 export declare function allocateAttachmentToken<T>(hub: WatchdogHub<T>, sessionId: string): string;
 /**
  * Atomically reserve or promote the process root. A UI attachment has priority

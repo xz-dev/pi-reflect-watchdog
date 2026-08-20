@@ -1,8 +1,17 @@
 export const HUB_SYMBOL = Symbol.for("pi-reflect-watchdog:hub:v1");
+export const REFLECT_WATCHDOG_API_SYMBOL = Symbol.for("pi-reflect-watchdog.api.v1");
 export function getHub() {
     const globalState = globalThis;
     globalState[HUB_SYMBOL] ??= { nextToken: 0, nextGeneration: 0 };
     return globalState[HUB_SYMBOL];
+}
+export function installReflectWatchdogApi(api) {
+    const host = globalThis;
+    host[REFLECT_WATCHDOG_API_SYMBOL] = api;
+    return () => {
+        if (host[REFLECT_WATCHDOG_API_SYMBOL] === api)
+            delete host[REFLECT_WATCHDOG_API_SYMBOL];
+    };
 }
 export function allocateAttachmentToken(hub, sessionId) {
     hub.nextToken += 1;

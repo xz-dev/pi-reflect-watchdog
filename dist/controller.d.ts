@@ -48,6 +48,8 @@ export declare class TaskController {
     private activeSince;
     /** Exact all-idle timestamp used by the strict greater-than gap guard. */
     private endLoopTime;
+    /** Start of the current global pause, used to exclude paused wall time. */
+    private pausedAt;
     constructor(options?: TaskControllerOptions);
     startRootTask(now: number, rootRunning?: boolean): ActivitySnapshot | undefined;
     bindObserver(observerId: string): number;
@@ -64,6 +66,8 @@ export declare class TaskController {
     restoreConfiguredDefaults(now: number, resetWarningCycle?: boolean): ControllerTransition;
     startRootActiveSegment(now: number): void;
     settleRootActiveSegment(now: number): ActivitySnapshot | undefined;
+    pauseActivity(now: number): ActivitySnapshot | undefined;
+    resumeActivity(now: number, aggregateBusy: boolean): void;
     finalize(): void;
     evaluateTaskTime(now: number): ControllerTransition;
     status(now: number): TaskStatus;

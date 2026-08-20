@@ -5,7 +5,7 @@ import { loadRuntimeConfig } from "./config-loader.js";
 import { controllerOptionsFromConfig, TaskController, } from "./controller.js";
 import { parseReflectWatchdogCommand, REFLECT_COMMAND, REFLECT_TIMELINE_COMMAND, REFLECT_WATCHDOG_COMMAND, } from "./controls.js";
 import { createFatalExitAdapter } from "./fatal-exit.js";
-import { allocateAttachmentToken, claimRoot, getHub, isCurrentRoot, releaseRoot, } from "./hub.js";
+import { allocateAttachmentToken, claimRoot, getHub, installReflectWatchdogApi, isCurrentRoot, releaseRoot, } from "./hub.js";
 import { getReflectDomainCoordinator, isReflectDomainFatalError, } from "./process-domain.js";
 import { formatHistoryResult, formatReflectionReport, queryReflectionHistory, REFLECTION_HISTORY_ENTRY_TYPE, reflectionHistory, } from "./reflection-history.js";
 import { buildReflectionPrompt, buildReflectionReaskPrompt, MAX_REFLECTION_REASKS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, } from "./reflection-protocol.js";
@@ -90,7 +90,7 @@ function deactivate(runtime, services) {
         const detach = () => {
             void services.processDomain.detach(runtime).catch(() => { });
         };
-        if (runtime.pausedForReflection)
+        if (runtime.paused)
             void services.processDomain
                 .resume()
                 .catch(() => { })
@@ -113,11 +113,53 @@ function deactivate(runtime, services) {
     runtime.config = undefined;
     runtime.reflectionQueue = [];
     runtime.activeReflection = undefined;
-    runtime.pausedForReflection = false;
+    runtime.paused = false;
     runtime.resumeAfterReflectionTurn = false;
+    runtime.removeApi?.();
+    runtime.removeApi = undefined;
     runtime.suppressNextRootTurn = false;
     if (runtime.state !== "shutdown")
         runtime.state = "observer";
+}
+async function pauseCounting(runtime, services) {
+    if (runtime.paused || !rootIsCurrent(runtime))
+        return;
+    runtime.paused = true;
+    runtime.runActivity = "pending";
+    clearTimers(runtime, services);
+    runtime.controller.pauseActivity(services.now());
+    try {
+        const counters = await services.processDomain.pause();
+        if (counters !== undefined)
+            runtime.domainCounters = counters;
+    }
+    catch (error) {
+        await services.processDomain.resume().catch(() => { });
+        runtime.paused = false;
+        runtime.reconcileActivity?.();
+        scheduleTimers(runtime, services);
+        updateStatus(runtime, services);
+        throw error;
+    }
+    updateStatus(runtime, services);
+    runtime.widgetRequestRender?.();
+}
+async function resumeCounting(runtime, services) {
+    if (!runtime.paused || !rootIsCurrent(runtime))
+        return;
+    runtime.paused = false;
+    try {
+        await services.processDomain.resume();
+    }
+    finally {
+        runtime.paused = services.processDomain.paused;
+        runtime.domainCounters = services.processDomain.counters();
+        runtime.reconcileActivity?.();
+        runtime.controller.resumeActivity(services.now(), runtime.domainCounters?.anyBusy ?? false);
+        scheduleTimers(runtime, services);
+        updateStatus(runtime, services);
+        runtime.widgetRequestRender?.();
+    }
 }
 function safeCounterNumber(value) {
     const max = BigInt(Number.MAX_SAFE_INTEGER);
@@ -189,6 +231,7 @@ function emitActiveCycleFrozenNotification(runtime, snapshot) {
 function scheduleTimers(runtime, services) {
     clearTimers(runtime, services);
     if (!rootIsCurrent(runtime) ||
+        runtime.paused ||
         runtime.activeReflection !== undefined ||
         runtime.reflectionQueue.length > 0)
         return;
@@ -329,14 +372,10 @@ function sendActiveReflection(runtime) {
 function failReflectionBeforeSend(runtime, services, message) {
     runtime.activeReflection = undefined;
     runtime.reflectionQueue = [];
-    runtime.pausedForReflection = false;
     runtime.resumeAfterReflectionTurn = false;
-    void services.processDomain.resume().catch(() => { });
-    if (rootIsCurrent(runtime)) {
+    void resumeCounting(runtime, services);
+    if (rootIsCurrent(runtime))
         runtime.ctx.ui.notify(message, "warning");
-        scheduleTimers(runtime, services);
-        updateStatus(runtime, services);
-    }
 }
 function beginNextReflection(runtime, services) {
     if (!rootIsCurrent(runtime) || runtime.activeReflection !== undefined)
@@ -352,17 +391,13 @@ function beginNextReflection(runtime, services) {
             inquiryId: `reflection-${pending.id}`,
         }),
     };
-    clearTimers(runtime, services);
-    runtime.pausedForReflection = true;
     runtime.resumeAfterReflectionTurn = false;
     const resetReminderCycle = !pending.reasons.includes("USER_REQUEST");
-    if (resetReminderCycle)
+    if (resetReminderCycle) {
         runtime.controller.resetReminderCycle(services.now());
-    void services.processDomain.pauseForReflection(resetReminderCycle).then((counters) => {
-        if (counters !== undefined)
-            runtime.domainCounters = counters;
-        sendActiveReflection(runtime);
-    }, () => failReflectionBeforeSend(runtime, services, "Reflection failed: process-domain counter pause/reset failed."));
+        void services.processDomain.resetReminderCycle().catch(() => undefined);
+    }
+    void pauseCounting(runtime, services).then(() => sendActiveReflection(runtime), () => failReflectionBeforeSend(runtime, services, "Reflection failed: process-domain counter pause failed."));
 }
 function enqueueReflection(runtime, services, reasons, thresholds, userSupplement) {
     if (!rootIsCurrent(runtime))
@@ -462,14 +497,14 @@ export function createWatchdogExtension(overrides = {}) {
             commandRegistered: false,
             reflectionSequence: 0,
             reflectionQueue: [],
-            pausedForReflection: false,
+            paused: services.processDomain.paused,
             resumeAfterReflectionTurn: false,
             runActivity: "pending",
             suppressNextRootTurn: false,
             domainAttached: false,
         };
         const classifyWork = () => {
-            if (runtime.runActivity === "work")
+            if (runtime.paused || runtime.runActivity === "work")
                 return;
             runtime.runActivity = "work";
             if (runtime.domainAttached)
@@ -545,7 +580,7 @@ export function createWatchdogExtension(overrides = {}) {
             };
             try {
                 await services.processDomain.attach(runtime, {
-                    getBusy: () => runtime.ctx === undefined || runtime.pausedForReflection
+                    getBusy: () => runtime.ctx === undefined
                         ? false
                         : probePiAgentState(runtime.ctx).busy,
                     onFatal: (error) => {
@@ -583,6 +618,18 @@ export function createWatchdogExtension(overrides = {}) {
                 exitForInitialDomainFailure(attachError);
                 return;
             }
+            const api = {
+                get paused() {
+                    return services.processDomain.paused;
+                },
+                pause: () => {
+                    void pauseCounting(runtime, services);
+                },
+                resume: () => {
+                    void resumeCounting(runtime, services);
+                },
+            };
+            runtime.removeApi = installReflectWatchdogApi(api);
             registerControlTool(pi, runtime, services);
             registerHistoryTools(pi, runtime);
             pi.registerEntryRenderer?.(REFLECTION_ENTRY_TYPE, createReflectionEntryRenderer());
@@ -609,6 +656,8 @@ export function createWatchdogExtension(overrides = {}) {
                     return;
                 }
             }
+            if (runtime.paused)
+                return;
             classifyMessage(event.message);
             if (event.message.role !== "user")
                 return;
@@ -635,7 +684,7 @@ export function createWatchdogExtension(overrides = {}) {
         });
         const observeLiveAgentState = (ctx) => {
             const { busy } = probePiAgentState(ctx);
-            if (runtime.pausedForReflection)
+            if (runtime.paused)
                 return busy;
             if (busy) {
                 classifyWork();
@@ -645,6 +694,7 @@ export function createWatchdogExtension(overrides = {}) {
                 void services.processDomain.setBusy(runtime, false).catch(() => { });
             return false;
         };
+        runtime.reconcileActivity = () => runtime.ctx === undefined ? false : observeLiveAgentState(runtime.ctx);
         pi.on("agent_start", (_event, ctx) => {
             observeLiveAgentState(ctx);
         });
@@ -654,36 +704,18 @@ export function createWatchdogExtension(overrides = {}) {
             if (!idle)
                 return;
             runtime.runActivity = "pending";
-            if (runtime.pausedForReflection) {
-                if (runtime.domainAttached)
-                    void services.processDomain.setBusy(runtime, false).catch(() => { });
-                if (rootIsCurrent(runtime)) {
-                    const snapshot = runtime.controller.settleRootActiveSegment(services.now());
-                    emitActiveCycleFrozenNotification(runtime, snapshot);
-                }
+            if (runtime.paused) {
                 if (runtime.activeReflection !== undefined &&
                     !runtime.resumeAfterReflectionTurn) {
                     runtime.activeReflection = undefined;
                     runtime.reflectionQueue = [];
                     runtime.ctx?.ui.notify("Reflection aborted before a valid response; watchdog counters resumed.", "warning");
-                    void services.processDomain.resume().finally(() => {
-                        runtime.pausedForReflection = false;
-                        if (runtime.ctx !== undefined)
-                            observeLiveAgentState(runtime.ctx);
-                        scheduleTimers(runtime, services);
-                        updateStatus(runtime, services);
-                    });
+                    void resumeCounting(runtime, services);
                     return;
                 }
                 if (runtime.resumeAfterReflectionTurn) {
                     runtime.resumeAfterReflectionTurn = false;
-                    void services.processDomain.resume().finally(() => {
-                        runtime.pausedForReflection = false;
-                        if (runtime.ctx !== undefined)
-                            observeLiveAgentState(runtime.ctx);
-                        scheduleTimers(runtime, services);
-                        updateStatus(runtime, services);
-                    });
+                    void resumeCounting(runtime, services);
                 }
                 return;
             }
@@ -753,8 +785,11 @@ export function createWatchdogExtension(overrides = {}) {
             finalizeReflection(runtime, services, text, validation.decision);
             return replacement;
         });
-        pi.on("turn_end", () => {
-            if (runtime.pausedForReflection)
+        pi.on("turn_end", (event) => {
+            if (runtime.paused || event.message.role !== "assistant")
+                return;
+            if (event.message.stopReason !== "stop" &&
+                event.message.stopReason !== "toolUse")
                 return;
             if (runtime.runActivity === "pending")
                 classifyWork();
@@ -788,6 +823,8 @@ export function createWatchdogExtension(overrides = {}) {
         });
         pi.on("session_shutdown", () => {
             services.fatalExit.completeShutdown();
+            runtime.removeApi?.();
+            runtime.removeApi = undefined;
             if (runtime.state === "shutdown")
                 return;
             runtime.state = "shutdown";
@@ -875,6 +912,14 @@ function registerWatchdogCommand(pi, runtime, services) {
             switch (parsed.command.action) {
                 case "status":
                     notifyCommand(ctx, userStatusText(runtime, services));
+                    return;
+                case "pause":
+                    await pauseCounting(runtime, services);
+                    notifyCommand(ctx, "Watchdog counting paused.");
+                    return;
+                case "resume":
+                    await resumeCounting(runtime, services);
+                    notifyCommand(ctx, "Watchdog counting resumed.");
                     return;
                 case "reset":
                     runtime.controller.resetReminderCycle(current);

@@ -4,7 +4,7 @@ export { loadRuntimeConfig, } from "./config-loader.js";
 export { controllerOptionsFromConfig, TaskController, } from "./controller.js";
 export { parseReflectWatchdogCommand, REFLECT_COMMAND, REFLECT_TIMELINE_COMMAND, REFLECT_WATCHDOG_COMMAND, REFLECT_WATCHDOG_USAGE, } from "./controls.js";
 export { createWatchdogExtension } from "./extension.js";
-export { HUB_SYMBOL, } from "./hub.js";
+export { HUB_SYMBOL, REFLECT_WATCHDOG_API_SYMBOL, } from "./hub.js";
 export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export { formatHistoryResult, formatReflectionReport, MAX_HISTORY_RESULT_ITEMS, parseReflectionHistoryData, queryReflectionHistory, REFLECTION_HISTORY_ENTRY_TYPE, reflectionHistory, } from "./reflection-history.js";
 export { buildReflectionPrompt, buildReflectionReaskPrompt, MAX_REFLECTION_REASKS, MAX_REFLECTION_TEXT_CHARACTERS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, } from "./reflection-protocol.js";

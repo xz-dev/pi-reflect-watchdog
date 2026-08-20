@@ -33,6 +33,7 @@ export interface ReflectDomainCounters {
 }
 export interface ReflectDomainCoordinator {
     readonly rootProcess: boolean;
+    readonly paused: boolean;
     attach(instance: object, options: {
         /** Queried at attach and after every client reconnect. */
         readonly getBusy: () => boolean;
@@ -46,7 +47,7 @@ export interface ReflectDomainCoordinator {
     subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
     setIdleResetGapSeconds(seconds: number): void;
     resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
-    pauseForReflection(resetReminderCycle: boolean): Promise<ReflectDomainCounters | undefined>;
+    pause(): Promise<ReflectDomainCounters | undefined>;
     resume(): Promise<void>;
 }
 export interface ReflectDomainClock {

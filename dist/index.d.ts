@@ -4,7 +4,7 @@ export { type ConfigFileIO, type LoadedConfig, loadRuntimeConfig, } from "./conf
 export { type ControllerTransition, controllerOptionsFromConfig, type RuntimeLimits, TaskController, type TaskControllerOptions, type TaskStatus, type WarningKind, } from "./controller.js";
 export { parseReflectWatchdogCommand, REFLECT_COMMAND, REFLECT_TIMELINE_COMMAND, REFLECT_WATCHDOG_COMMAND, REFLECT_WATCHDOG_USAGE, type ReflectWatchdogCommand, } from "./controls.js";
 export { createWatchdogExtension, type RuntimeServices } from "./extension.js";
-export { HUB_SYMBOL, type RootAttachment, type RootClaim, type RootPriority, type WatchdogHub, } from "./hub.js";
+export { HUB_SYMBOL, REFLECT_WATCHDOG_API_SYMBOL, type ReflectWatchdogApi, type RootAttachment, type RootClaim, type RootPriority, type WatchdogHub, } from "./hub.js";
 export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export { formatHistoryResult, formatReflectionReport, MAX_HISTORY_RESULT_ITEMS, parseReflectionHistoryData, queryReflectionHistory, REFLECTION_HISTORY_ENTRY_TYPE, type ReflectionHistoryEntry, type ReflectionHistoryQuery, reflectionHistory, } from "./reflection-history.js";
 export { buildReflectionPrompt, buildReflectionReaskPrompt, MAX_REFLECTION_REASKS, MAX_REFLECTION_TEXT_CHARACTERS, MAX_REFLECTION_TOOL_CALLS, parseReflectionXml, type ReflectionDecision, type ReflectionPromptContext, type ReflectionThresholdSnapshot, type ReflectionTriggerReason, type ReflectionValidation, } from "./reflection-protocol.js";
