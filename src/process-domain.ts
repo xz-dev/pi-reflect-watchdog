@@ -122,6 +122,7 @@ interface ParsedCounterMessage {
 
 export interface ReflectDomainCoordinator {
 	readonly rootProcess: boolean;
+	readonly paused: boolean;
 	attach(
 		instance: object,
 		options: {
@@ -138,9 +139,7 @@ export interface ReflectDomainCoordinator {
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
 	setIdleResetGapSeconds(seconds: number): void;
 	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
-	pauseForReflection(
-		resetReminderCycle: boolean,
-	): Promise<ReflectDomainCounters | undefined>;
+	pause(): Promise<ReflectDomainCounters | undefined>;
 	resume(): Promise<void>;
 }
 
@@ -366,6 +365,8 @@ export function createReflectDomainCoordinator(
 	let acceptedHostRevision = 0n;
 	let acceptedHostEpoch: string | undefined;
 	let paused = false;
+	let pausedAtMs: bigint | null = null;
+	let pausedAggregateBusy: boolean | null = null;
 	let transportHealthy = true;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
@@ -840,6 +841,8 @@ export function createReflectDomainCoordinator(
 				});
 				countersValue = hostState;
 				paused = false;
+				pausedAtMs = null;
+				pausedAggregateBusy = null;
 				transportHealthy = true;
 				snapshotRevision = 0n;
 				snapshotGeneration = 0n;
@@ -925,6 +928,9 @@ export function createReflectDomainCoordinator(
 		get rootProcess() {
 			return rootProcess;
 		},
+		get paused() {
+			return countersValue?.activeMs.paused ?? paused;
+		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
 				if (attachments.has(instance)) return;
@@ -982,6 +988,8 @@ export function createReflectDomainCoordinator(
 				acceptedHostRevision = 0n;
 				acceptedHostEpoch = undefined;
 				paused = false;
+				pausedAtMs = null;
+				pausedAggregateBusy = null;
 				transportHealthy = true;
 				peers.clear();
 				uncertainPeers.clear();
@@ -1062,41 +1070,47 @@ export function createReflectDomainCoordinator(
 			await publishHost();
 			return countersValue;
 		},
-		async pauseForReflection(resetReminderCycle) {
+		async pause() {
 			if (!rootProcess || countersValue === undefined) return countersValue;
+			if (paused) return countersValue;
 			paused = true;
+			pausedAtMs = BigInt(now());
+			pausedAggregateBusy = hostBusy();
 			if (tick !== undefined) clock.clearTimeout(tick);
 			tick = undefined;
 			hostStateRevision += 1n;
-			const current = hostCounters();
-			const reset = resetReminderCycle
-				? clearReminderCounters(current)
-				: current;
-			hostState = {
-				...reset,
-				activeMs: counter(current.activeMs.value, true),
-				activeLoops: counter(current.activeLoops.value, true),
-				taskMs: counter(reset.taskMs.value, true),
-				rootLoops: counter(reset.rootLoops.value, true),
-				allLoops: counter(reset.allLoops.value, true),
-			};
+			hostState = hostCounters();
 			await publishHost();
 			return countersValue;
 		},
 		async resume() {
-			if (!rootProcess || countersValue === undefined) return;
+			if (!rootProcess || countersValue === undefined || !paused) return;
+			const currentTimeMs = BigInt(now());
+			const pausedDurationMs =
+				pausedAtMs === null ? 0n : currentTimeMs - pausedAtMs;
+			const wasBusy = pausedAggregateBusy ?? hostBusy();
+			for (const attachment of attachments.values())
+				attachment.busy = attachment.getBusy();
 			paused = false;
+			pausedAtMs = null;
+			pausedAggregateBusy = null;
 			hostStateRevision += 1n;
 			const current = hostCounters();
 			hostState = {
 				...current,
-				endLoopTimeMs: hostBusy() ? null : BigInt(now()),
+				endLoopTimeMs:
+					current.endLoopTimeMs === null
+						? hostBusy()
+							? null
+							: currentTimeMs
+						: current.endLoopTimeMs + pausedDurationMs,
 				activeMs: counter(current.activeMs.value, false),
 				activeLoops: counter(current.activeLoops.value, false),
 				taskMs: counter(current.taskMs.value, false),
 				rootLoops: counter(current.rootLoops.value, false),
 				allLoops: counter(current.allLoops.value, false),
 			};
+			applyAggregateBusyTransition(wasBusy, hostBusy());
 			await publishHost();
 			updateHostTimers();
 		},

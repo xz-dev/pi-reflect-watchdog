@@ -29,7 +29,9 @@ import {
 	allocateAttachmentToken,
 	claimRoot,
 	getHub,
+	installReflectWatchdogApi,
 	isCurrentRoot,
+	type ReflectWatchdogApi,
 	type RootPriority,
 	releaseRoot,
 } from "./hub.js";
@@ -170,8 +172,10 @@ interface Runtime {
 	reflectionSequence: number;
 	reflectionQueue: PendingReflection[];
 	activeReflection?: ActiveReflection;
-	pausedForReflection: boolean;
+	paused: boolean;
 	resumeAfterReflectionTurn: boolean;
+	removeApi?: () => void;
+	reconcileActivity?: () => boolean;
 	domainCounters?: ReflectDomainCounters;
 	domainCounterUnsubscribe?: () => void;
 	domainAttached: boolean;
@@ -247,7 +251,7 @@ function deactivate(runtime: Runtime, services: RuntimeServices): void {
 		const detach = (): void => {
 			void services.processDomain.detach(runtime).catch(() => {});
 		};
-		if (runtime.pausedForReflection)
+		if (runtime.paused)
 			void services.processDomain
 				.resume()
 				.catch(() => {})
@@ -268,10 +272,58 @@ function deactivate(runtime: Runtime, services: RuntimeServices): void {
 	runtime.config = undefined;
 	runtime.reflectionQueue = [];
 	runtime.activeReflection = undefined;
-	runtime.pausedForReflection = false;
+	runtime.paused = false;
 	runtime.resumeAfterReflectionTurn = false;
+	runtime.removeApi?.();
+	runtime.removeApi = undefined;
 	runtime.suppressNextRootTurn = false;
 	if (runtime.state !== "shutdown") runtime.state = "observer";
+}
+
+async function pauseCounting(
+	runtime: Runtime,
+	services: RuntimeServices,
+): Promise<void> {
+	if (runtime.paused || !rootIsCurrent(runtime)) return;
+	runtime.paused = true;
+	runtime.runActivity = "pending";
+	clearTimers(runtime, services);
+	runtime.controller.pauseActivity(services.now());
+	try {
+		const counters = await services.processDomain.pause();
+		if (counters !== undefined) runtime.domainCounters = counters;
+	} catch (error) {
+		await services.processDomain.resume().catch(() => {});
+		runtime.paused = false;
+		runtime.reconcileActivity?.();
+		scheduleTimers(runtime, services);
+		updateStatus(runtime, services);
+		throw error;
+	}
+	updateStatus(runtime, services);
+	runtime.widgetRequestRender?.();
+}
+
+async function resumeCounting(
+	runtime: Runtime,
+	services: RuntimeServices,
+): Promise<void> {
+	if (!runtime.paused || !rootIsCurrent(runtime)) return;
+	runtime.paused = false;
+	try {
+		await services.processDomain.resume();
+	} finally {
+		runtime.paused = services.processDomain.paused;
+		runtime.domainCounters = services.processDomain.counters();
+		runtime.reconcileActivity?.();
+		runtime.controller.resumeActivity(
+			services.now(),
+			runtime.domainCounters?.anyBusy ?? false,
+		);
+		scheduleTimers(runtime, services);
+		updateStatus(runtime, services);
+		runtime.widgetRequestRender?.();
+	}
 }
 
 function safeCounterNumber(value: bigint): number {
@@ -388,6 +440,7 @@ function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
 	clearTimers(runtime, services);
 	if (
 		!rootIsCurrent(runtime) ||
+		runtime.paused ||
 		runtime.activeReflection !== undefined ||
 		runtime.reflectionQueue.length > 0
 	)
@@ -574,14 +627,9 @@ function failReflectionBeforeSend(
 ): void {
 	runtime.activeReflection = undefined;
 	runtime.reflectionQueue = [];
-	runtime.pausedForReflection = false;
 	runtime.resumeAfterReflectionTurn = false;
-	void services.processDomain.resume().catch(() => {});
-	if (rootIsCurrent(runtime)) {
-		runtime.ctx.ui.notify(message, "warning");
-		scheduleTimers(runtime, services);
-		updateStatus(runtime, services);
-	}
+	void resumeCounting(runtime, services);
+	if (rootIsCurrent(runtime)) runtime.ctx.ui.notify(message, "warning");
 }
 
 function beginNextReflection(
@@ -599,21 +647,19 @@ function beginNextReflection(
 			inquiryId: `reflection-${pending.id}`,
 		}),
 	};
-	clearTimers(runtime, services);
-	runtime.pausedForReflection = true;
 	runtime.resumeAfterReflectionTurn = false;
 	const resetReminderCycle = !pending.reasons.includes("USER_REQUEST");
-	if (resetReminderCycle) runtime.controller.resetReminderCycle(services.now());
-	void services.processDomain.pauseForReflection(resetReminderCycle).then(
-		(counters) => {
-			if (counters !== undefined) runtime.domainCounters = counters;
-			sendActiveReflection(runtime);
-		},
+	if (resetReminderCycle) {
+		runtime.controller.resetReminderCycle(services.now());
+		void services.processDomain.resetReminderCycle().catch(() => undefined);
+	}
+	void pauseCounting(runtime, services).then(
+		() => sendActiveReflection(runtime),
 		() =>
 			failReflectionBeforeSend(
 				runtime,
 				services,
-				"Reflection failed: process-domain counter pause/reset failed.",
+				"Reflection failed: process-domain counter pause failed.",
 			),
 	);
 }
@@ -746,7 +792,7 @@ export function createWatchdogExtension(
 			commandRegistered: false,
 			reflectionSequence: 0,
 			reflectionQueue: [],
-			pausedForReflection: false,
+			paused: services.processDomain.paused,
 			resumeAfterReflectionTurn: false,
 			runActivity: "pending",
 			suppressNextRootTurn: false,
@@ -754,7 +800,7 @@ export function createWatchdogExtension(
 		};
 
 		const classifyWork = (): void => {
-			if (runtime.runActivity === "work") return;
+			if (runtime.paused || runtime.runActivity === "work") return;
 			runtime.runActivity = "work";
 			if (runtime.domainAttached)
 				void services.processDomain.setBusy(runtime, true).catch(() => {});
@@ -840,7 +886,7 @@ export function createWatchdogExtension(
 			try {
 				await services.processDomain.attach(runtime, {
 					getBusy: () =>
-						runtime.ctx === undefined || runtime.pausedForReflection
+						runtime.ctx === undefined
 							? false
 							: probePiAgentState(runtime.ctx).busy,
 					onFatal: (error) => {
@@ -895,6 +941,18 @@ export function createWatchdogExtension(
 				exitForInitialDomainFailure(attachError);
 				return;
 			}
+			const api: ReflectWatchdogApi = {
+				get paused() {
+					return services.processDomain.paused;
+				},
+				pause: () => {
+					void pauseCounting(runtime, services);
+				},
+				resume: () => {
+					void resumeCounting(runtime, services);
+				},
+			};
+			runtime.removeApi = installReflectWatchdogApi(api);
 			registerControlTool(pi, runtime, services);
 			registerHistoryTools(pi, runtime);
 			(
@@ -938,6 +996,7 @@ export function createWatchdogExtension(
 					return;
 				}
 			}
+			if (runtime.paused) return;
 			classifyMessage(event.message);
 			if (event.message.role !== "user") return;
 			if (rootIsCurrent(runtime)) {
@@ -965,7 +1024,7 @@ export function createWatchdogExtension(
 
 		const observeLiveAgentState = (ctx: ExtensionContext): boolean => {
 			const { busy } = probePiAgentState(ctx);
-			if (runtime.pausedForReflection) return busy;
+			if (runtime.paused) return busy;
 			if (busy) {
 				classifyWork();
 				return true;
@@ -974,6 +1033,8 @@ export function createWatchdogExtension(
 				void services.processDomain.setBusy(runtime, false).catch(() => {});
 			return false;
 		};
+		runtime.reconcileActivity = () =>
+			runtime.ctx === undefined ? false : observeLiveAgentState(runtime.ctx);
 
 		pi.on("agent_start", (_event, ctx) => {
 			observeLiveAgentState(ctx);
@@ -983,15 +1044,7 @@ export function createWatchdogExtension(
 			const idle = !observeLiveAgentState(ctx);
 			if (!idle) return;
 			runtime.runActivity = "pending";
-			if (runtime.pausedForReflection) {
-				if (runtime.domainAttached)
-					void services.processDomain.setBusy(runtime, false).catch(() => {});
-				if (rootIsCurrent(runtime)) {
-					const snapshot = runtime.controller.settleRootActiveSegment(
-						services.now(),
-					);
-					emitActiveCycleFrozenNotification(runtime, snapshot);
-				}
+			if (runtime.paused) {
 				if (
 					runtime.activeReflection !== undefined &&
 					!runtime.resumeAfterReflectionTurn
@@ -1002,22 +1055,12 @@ export function createWatchdogExtension(
 						"Reflection aborted before a valid response; watchdog counters resumed.",
 						"warning",
 					);
-					void services.processDomain.resume().finally(() => {
-						runtime.pausedForReflection = false;
-						if (runtime.ctx !== undefined) observeLiveAgentState(runtime.ctx);
-						scheduleTimers(runtime, services);
-						updateStatus(runtime, services);
-					});
+					void resumeCounting(runtime, services);
 					return;
 				}
 				if (runtime.resumeAfterReflectionTurn) {
 					runtime.resumeAfterReflectionTurn = false;
-					void services.processDomain.resume().finally(() => {
-						runtime.pausedForReflection = false;
-						if (runtime.ctx !== undefined) observeLiveAgentState(runtime.ctx);
-						scheduleTimers(runtime, services);
-						updateStatus(runtime, services);
-					});
+					void resumeCounting(runtime, services);
 				}
 				return;
 			}
@@ -1099,8 +1142,13 @@ export function createWatchdogExtension(
 			finalizeReflection(runtime, services, text, validation.decision);
 			return replacement;
 		});
-		pi.on("turn_end", () => {
-			if (runtime.pausedForReflection) return;
+		pi.on("turn_end", (event) => {
+			if (runtime.paused || event.message.role !== "assistant") return;
+			if (
+				event.message.stopReason !== "stop" &&
+				event.message.stopReason !== "toolUse"
+			)
+				return;
 			if (runtime.runActivity === "pending") classifyWork();
 			if (rootIsCurrent(runtime)) {
 				if (runtime.suppressNextRootTurn) {
@@ -1143,6 +1191,8 @@ export function createWatchdogExtension(
 		});
 		pi.on("session_shutdown", () => {
 			services.fatalExit.completeShutdown();
+			runtime.removeApi?.();
+			runtime.removeApi = undefined;
 			if (runtime.state === "shutdown") return;
 			runtime.state = "shutdown";
 			const hub = getHub<Runtime>();
@@ -1261,6 +1311,14 @@ function registerWatchdogCommand(
 			switch (parsed.command.action) {
 				case "status":
 					notifyCommand(ctx, userStatusText(runtime, services));
+					return;
+				case "pause":
+					await pauseCounting(runtime, services);
+					notifyCommand(ctx, "Watchdog counting paused.");
+					return;
+				case "resume":
+					await resumeCounting(runtime, services);
+					notifyCommand(ctx, "Watchdog counting resumed.");
 					return;
 				case "reset":
 					runtime.controller.resetReminderCycle(current);

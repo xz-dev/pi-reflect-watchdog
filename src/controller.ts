@@ -75,6 +75,8 @@ export class TaskController {
 	private activeSince: number | undefined;
 	/** Exact all-idle timestamp used by the strict greater-than gap guard. */
 	private endLoopTime: number | undefined;
+	/** Start of the current global pause, used to exclude paused wall time. */
+	private pausedAt: number | undefined;
 
 	constructor(options: TaskControllerOptions = {}) {
 		this.configuredLimits = {
@@ -250,6 +252,26 @@ export class TaskController {
 		return this.closeActivityIfIdle(now);
 	}
 
+	pauseActivity(now: number): ActivitySnapshot | undefined {
+		if (this.pausedAt !== undefined) return undefined;
+		this.pausedAt = now;
+		return this.closeActivity(now);
+	}
+
+	resumeActivity(now: number, aggregateBusy: boolean): void {
+		if (this.pausedAt === undefined) return;
+		const pausedDuration = Math.max(0, now - this.pausedAt);
+		this.pausedAt = undefined;
+		if (this.endLoopTime !== undefined) this.endLoopTime += pausedDuration;
+		if (aggregateBusy) {
+			this.beginActivity(now);
+			return;
+		}
+		this.rootRunActive = false;
+		this.runningObserverEpochs.clear();
+		this.endLoopTime ??= now;
+	}
+
 	finalize(): void {
 		this.epoch = 0;
 		this.rootLoops = 0;
@@ -263,6 +285,7 @@ export class TaskController {
 		this.rootRunActive = false;
 		this.activeSince = undefined;
 		this.endLoopTime = undefined;
+		this.pausedAt = undefined;
 		this.taskCycleSince = undefined;
 	}
 

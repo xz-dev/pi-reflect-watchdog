@@ -39,6 +39,8 @@ export {
 export { createWatchdogExtension, type RuntimeServices } from "./extension.js";
 export {
 	HUB_SYMBOL,
+	REFLECT_WATCHDOG_API_SYMBOL,
+	type ReflectWatchdogApi,
 	type RootAttachment,
 	type RootClaim,
 	type RootPriority,

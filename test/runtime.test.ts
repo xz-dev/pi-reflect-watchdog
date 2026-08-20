@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createWatchdogExtension } from "../src/extension.js";
-import { HUB_SYMBOL } from "../src/hub.js";
+import {
+	HUB_SYMBOL,
+	REFLECT_WATCHDOG_API_SYMBOL,
+	type ReflectWatchdogApi,
+} from "../src/hub.js";
 import type {
 	ReflectDomainCoordinator,
 	ReflectDomainCounters,
@@ -72,6 +76,7 @@ function context() {
 
 function reset() {
 	delete (globalThis as any)[HUB_SYMBOL];
+	delete (globalThis as any)[REFLECT_WATCHDOG_API_SYMBOL];
 }
 
 function counter() {
@@ -101,6 +106,9 @@ function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
 	const listeners = new Set<(value: ReflectDomainCounters) => void>();
 	return {
 		rootProcess: true,
+		get paused() {
+			return snapshot.activeMs.paused;
+		},
 		async attach() {},
 		async detach() {},
 		async setBusy(_instance, busy) {
@@ -131,10 +139,27 @@ function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
 		async resetReminderCycle() {
 			return snapshot;
 		},
-		async pauseForReflection() {
+		async pause() {
+			snapshot = {
+				...snapshot,
+				activeMs: { ...snapshot.activeMs, paused: true },
+				activeLoops: { ...snapshot.activeLoops, paused: true },
+				taskMs: { ...snapshot.taskMs, paused: true },
+				rootLoops: { ...snapshot.rootLoops, paused: true },
+				allLoops: { ...snapshot.allLoops, paused: true },
+			};
 			return snapshot;
 		},
-		async resume() {},
+		async resume() {
+			snapshot = {
+				...snapshot,
+				activeMs: { ...snapshot.activeMs, paused: false },
+				activeLoops: { ...snapshot.activeLoops, paused: false },
+				taskMs: { ...snapshot.taskMs, paused: false },
+				rootLoops: { ...snapshot.rootLoops, paused: false },
+				allLoops: { ...snapshot.allLoops, paused: false },
+			};
+		},
 	};
 }
 
@@ -147,7 +172,12 @@ function assistant(text: string) {
 	return { message: { role: "assistant", content: [{ type: "text", text }] } };
 }
 
+function turnEnd(stopReason: string) {
+	return { message: { role: "assistant", stopReason } };
+}
+
 async function submitReflection(pi: Pi, ctx: ReturnType<typeof context>) {
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	const message = pi.messages.at(-1)?.message;
 	assert.ok(message);
 	await pi.emit(
@@ -202,6 +232,7 @@ test("/reflect queues one fixed-context inquiry with explicit empty supplement",
 	const reflect = pi.commands.find((item) => item.name === "reflect");
 	assert.ok(reflect);
 	await reflect.handler("", ctx);
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(pi.messages.length, 1);
 	assert.match(
 		pi.messages[0].message.content,
@@ -237,7 +268,7 @@ test("unrelated custom inquiries fail closed to ordinary work", async () => {
 		},
 		ctx,
 	);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
@@ -277,7 +308,7 @@ test("user input remains ordinary work during unrelated custom traffic", async (
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("message_start", { message: { role: "custom" } }, ctx);
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
@@ -303,10 +334,85 @@ test("unknown activity metadata fails closed to ordinary work", async () => {
 		},
 		ctx,
 	);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(activityWrites, [true, false]);
+});
+
+test("public API and command pause every loop then resume from current live state", async () => {
+	const { pi, ctx, activityWrites } = install();
+	await pi.emit("session_start", {}, ctx);
+	const api = (globalThis as any)[
+		REFLECT_WATCHDOG_API_SYMBOL
+	] as ReflectWatchdogApi;
+	assert.equal(api.paused, false);
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await api.pause();
+	assert.equal(api.paused, true);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
+	assert.equal(pi.messages.length, 0);
+
+	ctx.setIdle(true);
+	await api.resume();
+	assert.equal(api.paused, false);
+	assert.deepEqual(activityWrites, [true, false]);
+
+	const command = pi.commands.find((item) => item.name === "reflect-watchdog");
+	assert.ok(command);
+	await command.handler("pause", ctx);
+	assert.equal(api.paused, true);
+	ctx.setIdle(false);
+	await command.handler("resume", ctx);
+	assert.equal(api.paused, false);
+	assert.deepEqual(activityWrites, [true, false, true]);
+});
+
+test("message traffic cannot reopen local activity while paused", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	const api = (globalThis as any)[
+		REFLECT_WATCHDOG_API_SYMBOL
+	] as ReflectWatchdogApi;
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await api.pause();
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("message_start", { message: { role: "assistant" } }, ctx);
+	await pi.emit("message_start", { message: { role: "toolResult" } }, ctx);
+	ctx.setIdle(true);
+	await api.resume();
+
+	const command = pi.commands.find((item) => item.name === "reflect-watchdog");
+	assert.ok(command);
+	await command.handler("status", ctx);
+	assert.match(ctx.notifications.at(-1)?.[0] ?? "", /root loops: 0/);
+	assert.match(
+		ctx.notifications.at(-1)?.[0] ?? "",
+		/active window: 0s\/0 loops/,
+	);
+});
+
+test("only successful model outcomes count toward loop thresholds", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+
+	for (const stopReason of ["error", "aborted", "length"])
+		await pi.emit("turn_end", turnEnd(stopReason), ctx);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 0);
+
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 1);
+	assert.match(pi.messages[0].message.content, /ROOT_LOOP_LIMIT/);
 });
 
 test("threshold inquiry is queued instead of using legacy warning message", async () => {
@@ -314,8 +420,8 @@ test("threshold inquiry is queued instead of using legacy warning message", asyn
 	await pi.emit("session_start", {}, ctx);
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
-	await pi.emit("turn_end", {}, ctx);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(pi.messages.length, 1);
 	assert.match(pi.messages[0].message.content, /ROOT_LOOP_LIMIT/);
@@ -378,7 +484,7 @@ test("NO_ISSUE persists one report and starts no ordinary follow-up turn", async
 		assistant(validNoIssue),
 		ctx,
 	);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(replacement.message.content, []);
 	assert.deepEqual(replacement.message.details.piInquiry, {
@@ -429,7 +535,7 @@ test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", asy
 		assistant(validCorrection),
 		ctx,
 	);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(replacement.message.content, []);
 	assert.equal(pi.entries.length, 1);
@@ -453,10 +559,10 @@ test("reflection and correction attempts do not re-trigger loop counting", async
 	const reflect = pi.commands.find((item) => item.name === "reflect");
 	assert.ok(reflect);
 	await reflect.handler("", ctx);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	await submitReflection(pi, ctx);
 	await pi.emit("message_end", assistant("invalid"), ctx);
-	await pi.emit("turn_end", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	await submitReflection(pi, ctx);
 	await pi.emit("message_end", assistant(validNoIssue), ctx);
 	assert.equal(pi.messages.length, 3);

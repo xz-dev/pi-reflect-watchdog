@@ -250,16 +250,18 @@ test("active tick freezes at aggregate idle and only a strict idle-gap overflow 
 	await coordinator.detach(instance);
 });
 
-test("reflection pause resets task/root/all while preserving active and excluding reflection loops", async () => {
+test("pause preserves counters, excludes paused loops, and resume re-probes activity", async () => {
 	const node = new FakeNode("host");
+	let busy = true;
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
 	});
 	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	await coordinator.attach(instance, { getBusy: () => busy, onFatal() {} });
 	await coordinator.recordRootLoop();
-	const reset = await coordinator.pauseForReflection(true);
+	const reset = await coordinator.pause();
 	assert.equal(reset?.domainEpoch, "domain");
+	assert.equal(coordinator.paused, true);
 	assert.equal(reset?.certain, true);
 	assert.equal(reset?.fence.generation, reset?.generation);
 	assert.deepEqual(
@@ -274,8 +276,8 @@ test("reflection pause resets task/root/all while preserving active and excludin
 			activeMs: { value: 0n, paused: true },
 			activeLoops: { value: 1n, paused: true },
 			taskMs: { value: 0n, paused: true },
-			rootLoops: { value: 0n, paused: true },
-			allLoops: { value: 0n, paused: true },
+			rootLoops: { value: 1n, paused: true },
+			allLoops: { value: 1n, paused: true },
 		},
 	);
 	node.emitPeer("child", "online");
@@ -291,18 +293,88 @@ test("reflection pause resets task/root/all while preserving active and excludin
 		allLoops: "1",
 	});
 	await flush();
-	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
 	assert.equal(coordinator.counters()?.activeLoops.value, 1n);
+	busy = false;
 	await coordinator.resume();
+	assert.equal(coordinator.paused, false);
 	assert.equal(coordinator.counters()?.rootLoops.paused, false);
+	assert.equal(coordinator.counters()?.anyBusy, false);
+	assert.notEqual(coordinator.counters()?.endLoopTimeMs, null);
 	node.emitChannel("pi-reflect-watchdog.loop.v2", {
 		revision: "2",
 		rootLoops: "0",
 		allLoops: "2",
 	});
 	await flush();
-	assert.equal(coordinator.counters()?.allLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 2n);
 	assert.equal(coordinator.counters()?.activeLoops.value, 2n);
+	await coordinator.detach(instance);
+});
+
+test("pause while idle preserves the pre-pause gap and excludes paused time", async () => {
+	const node = new FakeNode("host");
+	let busy = false;
+	let nowMs = 10_000;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		idleResetGapMs: 60_000,
+		now: () => nowMs,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => busy, onFatal() {} });
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	await coordinator.recordRootLoop();
+	busy = false;
+	await coordinator.setBusy(instance, false);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 10_000n);
+
+	nowMs = 40_000;
+	await coordinator.pause();
+	nowMs = 140_000;
+	await coordinator.resume();
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 110_000n);
+
+	nowMs = 170_000;
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
+
+	nowMs = 180_000;
+	busy = false;
+	await coordinator.setBusy(instance, false);
+	nowMs = 240_001;
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	assert.equal(coordinator.counters()?.activeLoops.value, 0n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+
+	busy = false;
+	await coordinator.setBusy(instance, false);
+	await coordinator.recordRootLoop();
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+	nowMs = 250_001;
+	await coordinator.pause();
+	nowMs = 350_001;
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	await coordinator.resume();
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+
+	busy = false;
+	await coordinator.setBusy(instance, false);
+	nowMs = 410_002;
+	await coordinator.pause();
+	nowMs = 510_002;
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	await coordinator.resume();
+	assert.equal(coordinator.counters()?.activeLoops.value, 0n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
 	await coordinator.detach(instance);
 });
 

@@ -77,6 +77,27 @@ test("active cycle freezes at all-idle, resumes at the exact gap, and resets onl
 	assert.equal(controller.status(132_001).taskElapsedMs, 0);
 });
 
+test("pause while idle excludes paused time from the reset gap", () => {
+	const controller = new TaskController(limits);
+	controller.startRootTask(0);
+	controller.startRootActiveSegment(0);
+	controller.completeRootTurn(1_000);
+	controller.settleRootActiveSegment(10_000);
+
+	controller.pauseActivity(40_000);
+	controller.resumeActivity(140_000, true);
+	assert.equal(controller.status(140_000).rootLoops, 1);
+	assert.equal(controller.status(140_000).activity.loops, 1);
+
+	controller.settleRootActiveSegment(150_000);
+	controller.startRootActiveSegment(150_000);
+	controller.settleRootActiveSegment(150_000);
+	controller.pauseActivity(210_002);
+	controller.resumeActivity(310_002, true);
+	assert.equal(controller.status(310_001).rootLoops, 0);
+	assert.equal(controller.status(340_001).activity.loops, 0);
+});
+
 test("observer epochs are rejected after a new root task", () => {
 	const controller = new TaskController(limits);
 	controller.startRootTask(0);

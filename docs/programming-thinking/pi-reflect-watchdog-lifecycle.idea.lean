@@ -262,7 +262,7 @@ structure CodeSource where
   deriving Repr, DecidableEq
 
 def pluginRevision : String :=
-  "a1ec9a96ac8e89ffb66769cfce360940660a417b"
+  "working-tree-successful-loop-and-global-pause"
 
 def piCoreWorktreeRevision : String :=
   "602af3db809911ed01e6ca529bf230e603f64434"
@@ -279,13 +279,13 @@ def translatedCodeSources : List CodeSource :=
       sha256 := "a0cf6814f9410236aeb7733d29ed82322eb314ed097a61fe1fad49f6225e5dac" },
     { repository := "pi-reflect-watchdog", path := "src/extension.ts",
       symbol := "createWatchdogExtension/beginNextReflection/finalizeReflection/deactivate",
-      sha256 := "3e705f529fc1c15f87e90595aaf0f305f74f78cc79864977de6e54421c215ecb" },
+      sha256 := "e79a8ae73786f7916fb61375c8f2305cbbdff6ad8ecc380c47249688dcdcaa37" },
     { repository := "pi-reflect-watchdog", path := "src/process-domain.ts",
       symbol := "createReflectDomainCoordinator",
-      sha256 := "d5036d4d7d678708a07931c42195a1e70f88c2b01d1150e83e9e2fd3409197ff" },
+      sha256 := "3143f0c0bde0d866686e50263374800cd3c791ad539acd703cb7fc2395176bad" },
     { repository := "pi-reflect-watchdog", path := "src/controller.ts",
       symbol := "TaskController",
-      sha256 := "f82f02726ee94ac5f4e1fcd24895b6dc0a041835a3813d4bb2256716ade56a6d" } ]
+      sha256 := "c7a83e3f9a835abad5c6a1194f996a16439f46250e2aa33da796a9266dc72fe3" } ]
 
 structure PiCoreContract where
   agentStartPrecedesPromptMessages : Bool
@@ -916,6 +916,21 @@ inductive LoopScope where
   | everyObservableAgent
   deriving Repr, DecidableEq
 
+inductive ModelTurnOutcome where
+  | stop
+  | toolUse
+  | error
+  | aborted
+  | length
+  | pending
+  | deferred
+  | unknown
+  deriving Repr, DecidableEq
+
+def modelTurnSucceeded : ModelTurnOutcome → Bool
+  | .stop | .toolUse => true
+  | _ => false
+
 inductive ReminderResetScope where
   | taskRootAllOnly
   deriving Repr, DecidableEq
@@ -942,6 +957,9 @@ structure DesiredCounterContract where
   reminderResetScope : ReminderResetScope
   reminderPreservesActive : Bool
   reflectionExcludedFromEveryCounter : Bool
+  externalPauseFreezesIdleGap : Bool
+  resumeReprobesAggregateActivity : Bool
+  onlySuccessfulModelTurnsCount : Bool
   processExitClearsEveryCounter : Bool
   widgetFields : List WidgetField
   deriving Repr, DecidableEq
@@ -966,11 +984,12 @@ def ValidCounterLimits (limits : CounterLimits) : Prop :=
   0 < limits.allLoopLimit
 
 -- Aggregate busy means at least one observable root, agent, or subagent is
--- doing ordinary work; the timestamp is recorded immediately on all-idle.
+-- doing ordinary work; one global pause boolean gates time and loop increments.
 structure CounterState where
   alive : Bool
   aggregateBusy : Bool
   reflectionPaused : Bool
+  pauseStartedAtSeconds : Nat
   endTimeRecorded : Bool
   theEndLoopTimeSeconds : Nat
   activeSeconds : Nat
@@ -984,6 +1003,7 @@ def counterInitial : CounterState :=
   { alive := true,
     aggregateBusy := false,
     reflectionPaused := false,
+    pauseStartedAtSeconds := 0,
     endTimeRecorded := false,
     theEndLoopTimeSeconds := 0,
     activeSeconds := 0,
@@ -998,10 +1018,10 @@ inductive CounterEvent where
   | aggregateBecameBusy (nowSeconds : Nat)
   | aggregateBecameIdle (nowSeconds : Nat)
   | ordinaryWorkElapsed (seconds : Nat)
-  | rootOrdinaryTurnEnded
-  | otherOrdinaryTurnEnded
-  | reflectionStarted
-  | reflectionFinished
+  | rootOrdinaryTurnEnded (outcome : ModelTurnOutcome)
+  | otherOrdinaryTurnEnded (outcome : ModelTurnOutcome)
+  | reflectionStarted (nowSeconds : Nat)
+  | reflectionFinished (nowSeconds : Nat) (aggregateBusyNow : Bool)
   | reminderAcknowledged
   | processExited
   deriving Repr, DecidableEq
@@ -1033,8 +1053,8 @@ def reminderDue (limits : CounterLimits) (state : CounterState) : Bool :=
      decide (limits.rootLoopLimit ≤ state.rootLoops) ||
      decide (limits.allLoopLimit ≤ state.allLoops))
 
--- The total transition function freezes immediately at all-idle, counts all
--- ordinary turns, excludes internal reflection, and applies the two reset scopes.
+-- The total transition function freezes immediately at all-idle, counts only
+-- successful model turns, excludes paused work, and applies the two reset scopes.
 def counterStep
     (limits : CounterLimits) (state : CounterState) (event : CounterEvent) :
     CounterState :=
@@ -1063,29 +1083,48 @@ def counterStep
           activeSeconds := state.activeSeconds + seconds
           taskSeconds := state.taskSeconds + seconds }
       else state
-  | .rootOrdinaryTurnEnded =>
-      if state.alive && state.aggregateBusy && !state.reflectionPaused then
+  | .rootOrdinaryTurnEnded outcome =>
+      if state.alive && state.aggregateBusy && !state.reflectionPaused &&
+          modelTurnSucceeded outcome then
         { state with
           activeLoops := state.activeLoops + 1
           rootLoops := state.rootLoops + 1
           allLoops := state.allLoops + 1 }
       else state
-  | .otherOrdinaryTurnEnded =>
-      if state.alive && state.aggregateBusy && !state.reflectionPaused then
+  | .otherOrdinaryTurnEnded outcome =>
+      if state.alive && state.aggregateBusy && !state.reflectionPaused &&
+          modelTurnSucceeded outcome then
         { state with
           activeLoops := state.activeLoops + 1
           allLoops := state.allLoops + 1 }
       else state
-  | .reflectionStarted =>
-      if state.alive then { state with reflectionPaused := true } else state
-  | .reflectionFinished =>
-      if state.alive then { state with reflectionPaused := false } else state
+  | .reflectionStarted nowSeconds =>
+      if state.alive && !state.reflectionPaused then
+        { state with
+          reflectionPaused := true
+          pauseStartedAtSeconds := nowSeconds }
+      else state
+  | .reflectionFinished nowSeconds aggregateBusyNow =>
+      if state.alive && state.reflectionPaused then
+        let pausedSeconds := nowSeconds - state.pauseStartedAtSeconds
+        { state with
+          aggregateBusy := aggregateBusyNow
+          reflectionPaused := false
+          pauseStartedAtSeconds := 0
+          endTimeRecorded :=
+            if state.endTimeRecorded then true else !aggregateBusyNow
+          theEndLoopTimeSeconds :=
+            if state.endTimeRecorded then
+              state.theEndLoopTimeSeconds + pausedSeconds
+            else if aggregateBusyNow then 0 else nowSeconds }
+      else state
   | .reminderAcknowledged =>
       if reminderDue limits state then clearReminderCycle state else state
   | .processExited =>
       { alive := false,
         aggregateBusy := false,
         reflectionPaused := false,
+        pauseStartedAtSeconds := 0,
         endTimeRecorded := false,
         theEndLoopTimeSeconds := 0,
         activeSeconds := 0,
@@ -1117,6 +1156,9 @@ def desiredCounterContract : DesiredCounterContract :=
     reminderResetScope := .taskRootAllOnly,
     reminderPreservesActive := true,
     reflectionExcludedFromEveryCounter := true,
+    externalPauseFreezesIdleGap := true,
+    resumeReprobesAggregateActivity := true,
+    onlySuccessfulModelTurnsCount := true,
     processExitClearsEveryCounter := true,
     widgetFields := desiredWidgetFields }
 
@@ -1133,6 +1175,9 @@ def DesiredCounterContractIsExact : Prop :=
   desiredCounterContract.reminderResetScope = .taskRootAllOnly ∧
   desiredCounterContract.reminderPreservesActive = true ∧
   desiredCounterContract.reflectionExcludedFromEveryCounter = true ∧
+  desiredCounterContract.externalPauseFreezesIdleGap = true ∧
+  desiredCounterContract.resumeReprobesAggregateActivity = true ∧
+  desiredCounterContract.onlySuccessfulModelTurnsCount = true ∧
   desiredCounterContract.processExitClearsEveryCounter = true ∧
   desiredCounterContract.widgetFields = [.active, .task, .root, .all]
 
@@ -1147,6 +1192,7 @@ def counterExampleState : CounterState :=
   { alive := true,
     aggregateBusy := true,
     reflectionPaused := false,
+    pauseStartedAtSeconds := 0,
     endTimeRecorded := false,
     theEndLoopTimeSeconds := 0,
     activeSeconds := 120,
@@ -1257,33 +1303,73 @@ theorem resume_after_strict_gap_resets_every_counter
   simp [counterStep, shouldStartNewActiveCycle, clearEveryCounter,
     alive, idle, recorded, expired]
 
-theorem root_turn_counts_active_root_and_all
+theorem root_success_counts_active_root_and_all
     (limits : CounterLimits) (state : CounterState)
     (alive : state.alive = true) (busy : state.aggregateBusy = true)
-    (unpaused : state.reflectionPaused = false) :
-    let next := counterStep limits state .rootOrdinaryTurnEnded
+    (unpaused : state.reflectionPaused = false)
+    (outcome : ModelTurnOutcome) (success : modelTurnSucceeded outcome = true) :
+    let next := counterStep limits state (.rootOrdinaryTurnEnded outcome)
     next.activeLoops = state.activeLoops + 1 ∧
     next.rootLoops = state.rootLoops + 1 ∧
     next.allLoops = state.allLoops + 1 := by
-  simp [counterStep, alive, busy, unpaused]
+  simp [counterStep, alive, busy, unpaused, success]
 
-theorem other_turn_counts_active_and_all_not_root
+theorem other_success_counts_active_and_all_not_root
     (limits : CounterLimits) (state : CounterState)
     (alive : state.alive = true) (busy : state.aggregateBusy = true)
-    (unpaused : state.reflectionPaused = false) :
-    let next := counterStep limits state .otherOrdinaryTurnEnded
+    (unpaused : state.reflectionPaused = false)
+    (outcome : ModelTurnOutcome) (success : modelTurnSucceeded outcome = true) :
+    let next := counterStep limits state (.otherOrdinaryTurnEnded outcome)
     next.activeLoops = state.activeLoops + 1 ∧
     next.rootLoops = state.rootLoops ∧
     next.allLoops = state.allLoops + 1 := by
-  simp [counterStep, alive, busy, unpaused]
+  simp [counterStep, alive, busy, unpaused, success]
+
+theorem failed_model_turns_change_no_loop
+    (limits : CounterLimits) (state : CounterState)
+    (outcome : ModelTurnOutcome) (failed : modelTurnSucceeded outcome = false) :
+    counterStep limits state (.rootOrdinaryTurnEnded outcome) = state ∧
+    counterStep limits state (.otherOrdinaryTurnEnded outcome) = state := by
+  simp [counterStep, failed]
 
 theorem reflection_excludes_time_and_every_loop
     (limits : CounterLimits) (state : CounterState)
-    (paused : state.reflectionPaused = true) (seconds : Nat) :
+    (paused : state.reflectionPaused = true) (seconds : Nat)
+    (outcome : ModelTurnOutcome) :
     counterStep limits state (.ordinaryWorkElapsed seconds) = state ∧
-    counterStep limits state .rootOrdinaryTurnEnded = state ∧
-    counterStep limits state .otherOrdinaryTurnEnded = state := by
+    counterStep limits state (.rootOrdinaryTurnEnded outcome) = state ∧
+    counterStep limits state (.otherOrdinaryTurnEnded outcome) = state := by
   simp [counterStep, paused]
+
+theorem pause_while_idle_preserves_gap_excluding_paused_time
+    (limits : CounterLimits) (state : CounterState)
+    (alive : state.alive = true) (idle : state.aggregateBusy = false)
+    (unpaused : state.reflectionPaused = false)
+    (recorded : state.endTimeRecorded = true)
+    (pauseSeconds resumeSeconds : Nat) :
+    let paused := counterStep limits state (.reflectionStarted pauseSeconds)
+    let next := counterStep limits paused (.reflectionFinished resumeSeconds false)
+    next.aggregateBusy = false ∧
+    next.reflectionPaused = false ∧
+    next.endTimeRecorded = true ∧
+    next.theEndLoopTimeSeconds =
+      state.theEndLoopTimeSeconds + (resumeSeconds - pauseSeconds) ∧
+    next.activeSeconds = state.activeSeconds ∧
+    next.activeLoops = state.activeLoops ∧
+    next.taskSeconds = state.taskSeconds ∧
+    next.rootLoops = state.rootLoops ∧
+    next.allLoops = state.allLoops := by
+  simp [counterStep, alive, idle, unpaused, recorded]
+
+theorem resume_reprobes_current_aggregate_activity
+    (limits : CounterLimits) (state : CounterState)
+    (alive : state.alive = true) (paused : state.reflectionPaused = true)
+    (resumeSeconds : Nat) (aggregateBusyNow : Bool) :
+    let next := counterStep limits state
+      (.reflectionFinished resumeSeconds aggregateBusyNow)
+    next.aggregateBusy = aggregateBusyNow ∧
+    next.reflectionPaused = false := by
+  simp [counterStep, alive, paused]
 
 theorem reminder_resets_task_root_all_but_preserves_active
     (limits : CounterLimits) (state : CounterState)
@@ -1302,6 +1388,7 @@ theorem process_exit_clears_all_memory
       { alive := false,
         aggregateBusy := false,
         reflectionPaused := false,
+        pauseStartedAtSeconds := 0,
         endTimeRecorded := false,
         theEndLoopTimeSeconds := 0,
         activeSeconds := 0,
@@ -1349,24 +1436,24 @@ theorem counter_step_preserves_invariant
         exact ⟨Nat.add_le_add_right taskLeActive seconds,
           rootLeAll, allLeActive⟩
       · exact invariant
-  | rootOrdinaryTurnEnded =>
+  | rootOrdinaryTurnEnded outcome =>
       simp only [counterStep]
       split
       · rcases invariant with ⟨taskLeActive, rootLeAll, allLeActive⟩
         exact ⟨taskLeActive, Nat.add_le_add_right rootLeAll 1,
           Nat.add_le_add_right allLeActive 1⟩
       · exact invariant
-  | otherOrdinaryTurnEnded =>
+  | otherOrdinaryTurnEnded outcome =>
       simp only [counterStep]
       split
       · rcases invariant with ⟨taskLeActive, rootLeAll, allLeActive⟩
         exact ⟨taskLeActive, Nat.le_add_right_of_le rootLeAll,
           Nat.add_le_add_right allLeActive 1⟩
       · exact invariant
-  | reflectionStarted =>
+  | reflectionStarted nowSeconds =>
       simp only [counterStep]
       split <;> exact invariant
-  | reflectionFinished =>
+  | reflectionFinished nowSeconds aggregateBusyNow =>
       simp only [counterStep]
       split <;> exact invariant
   | reminderAcknowledged =>
@@ -1387,6 +1474,18 @@ def CounterProcessCorrect : Prop :=
     CounterInvariant (counterStep limits state event)) ∧
   (∀ limits state seconds, state.reflectionPaused = true →
     counterStep limits state (.ordinaryWorkElapsed seconds) = state) ∧
+  (∀ limits state pauseSeconds resumeSeconds,
+    state.alive = true → state.aggregateBusy = false →
+    state.reflectionPaused = false → state.endTimeRecorded = true →
+    let paused := counterStep limits state (.reflectionStarted pauseSeconds)
+    let next := counterStep limits paused (.reflectionFinished resumeSeconds false)
+    next.theEndLoopTimeSeconds =
+      state.theEndLoopTimeSeconds + (resumeSeconds - pauseSeconds)) ∧
+  (∀ limits state resumeSeconds aggregateBusyNow,
+    state.alive = true → state.reflectionPaused = true →
+    (counterStep limits state
+      (.reflectionFinished resumeSeconds aggregateBusyNow)).aggregateBusy =
+        aggregateBusyNow) ∧
   (∀ limits state,
     (counterStep limits state .processExited).activeSeconds = 0)
 
@@ -1399,7 +1498,14 @@ theorem counter_process_is_correct : CounterProcessCorrect := by
     counter_initial_establishes_invariant,
     counter_step_preserves_invariant,
     fun limits state seconds paused =>
-      (reflection_excludes_time_and_every_loop limits state paused seconds).1,
+      (reflection_excludes_time_and_every_loop limits state paused seconds
+        .stop).1,
+    fun limits state pauseSeconds resumeSeconds alive idle unpaused recorded =>
+      (pause_while_idle_preserves_gap_excluding_paused_time limits state alive
+        idle unpaused recorded pauseSeconds resumeSeconds).2.2.2.1,
+    fun limits state resumeSeconds aggregateBusyNow alive paused =>
+      (resume_reprobes_current_aggregate_activity limits state alive paused
+        resumeSeconds aggregateBusyNow).1,
     fun limits state => by rfl
   ⟩
 
@@ -1438,6 +1544,6 @@ end PiReflectWatchdogLifecycle
 -- and the exact scope of the proved repaired workflow.
 def main : IO Unit := do
   IO.println "Current code translation: seven reachable lifecycle inconsistencies."
-  IO.println "Counter contract: active plus task/root/all with strict idle-gap reset."
+  IO.println "Counter contract: global pause plus successful stop/toolUse loop counting."
   IO.println "Repaired model: all reachable states are safe under modeled events."
   IO.println "Normal fair schedule: reflection completes and shutdown releases resources."

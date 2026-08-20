@@ -1,5 +1,7 @@
 export type ReflectWatchdogCommand =
 	| { action: "status" }
+	| { action: "pause" }
+	| { action: "resume" }
 	| { action: "reset" }
 	| { action: "limits-show" }
 	| {
@@ -20,7 +22,7 @@ export const REFLECT_COMMAND = "reflect";
 export const REFLECT_TIMELINE_COMMAND = "reflect-timeline";
 
 export const REFLECT_WATCHDOG_USAGE =
-	"Usage: /reflect-watchdog [status|reset|limits [<root> <all> <minutes> <idle-reset-seconds>|reset]]";
+	"Usage: /reflect-watchdog [status|pause|resume|reset|limits [<root> <all> <minutes> <idle-reset-seconds>|reset]]";
 
 function positiveSafeInteger(token: string | undefined): number | undefined {
 	if (token === undefined || !/^\d+$/.test(token)) return undefined;
@@ -35,6 +37,10 @@ export function parseReflectWatchdogCommand(
 	const words = input.trim().split(/\s+/).filter(Boolean);
 	if (words.length === 0 || (words.length === 1 && words[0] === "status"))
 		return { command: { action: "status" } };
+	if (words.length === 1 && words[0] === "pause")
+		return { command: { action: "pause" } };
+	if (words.length === 1 && words[0] === "resume")
+		return { command: { action: "resume" } };
 	if (words.length === 1 && words[0] === "reset")
 		return { command: { action: "reset" } };
 	if (words[0] === "limits") {

@@ -4,7 +4,7 @@
 
 ## Runtime contract
 
-- A loop is one completed ordinary Pi `turn_end`, not a tool call, tool result, or message.
+- A loop is one successful ordinary model `turn_end`: `stop` or `toolUse`. `error`, `aborted`, `length`, `pending`, `deferred`, and unknown outcomes do not count; tool-result success does not change the model-turn classification.
 - Built-in thresholds are 100 root loops, 500 process-wide loops, and 30 minutes of aggregate active task time. The built-in idle reset gap is 60 seconds.
 - `active` time and `active loops` cover ordinary work by the root and every observable agent or subagent. `root` loops count only root turns; `all` loops count every observable ordinary turn.
 - `pi-reflect-watchdog` owns exact cross-process counters, activity state, certainty, generation, fences, reflection pause/resume, and active-time ticking. `pi-extension-utils` provides only authenticated transport, peer state, strict XML, and inquiry primitives.
@@ -12,7 +12,7 @@
 - The all-idle edge has no debounce or grace period. It immediately freezes active/task time and records `the_end_loop_time`. Resuming at exactly the configured gap continues the same counters; only a strictly longer gap resets active time/loops and task/root/all counters before work resumes.
 - Any task/root/all threshold queues one reflection. Reasons crossed together are merged as `ROOT_LOOP_LIMIT`, `ALL_LOOP_LIMIT`, and/or `TASK_TIME_LIMIT`, with one pre-reset threshold snapshot. Acknowledging an automatic threshold resets task time plus root/all loops while preserving active time/loops.
 - `/reflect [supplement]` queues a manual `USER_REQUEST` reflection. Whitespace-only input means no supplement; nonblank text is persisted with the result. A manual reflection pauses counters but does not reset the task/root/all reminder cycle.
-- All automatic and manual reflections use one serialized queue. While a reflection and its XML corrections run, active/task/root/all counters and watchdog timers are paused; the reflection turns themselves are not counted. Completion resumes the appropriate cycle without self-counting.
+- One process-global pause flag, exposed through the optional `Symbol.for("pi-reflect-watchdog.api.v1")` API and `/reflect-watchdog pause|resume`, gates active/task/root/all increments and timers. Automatic/manual reflection uses the same flag. Resume re-probes live aggregate activity before restarting, retains an all-agent stop during pause, and shifts an existing idle timestamp by the paused duration so paused wall time cannot consume the idle-reset gap. Completion resumes the appropriate cycle without self-counting.
 - Process exit or watchdog shutdown destroys all in-memory timer, counter, timestamp, and pause state. Persisted reflection history remains session data.
 
 The extension is not a subagent controller. It observes only processes that load it and join the inherited authenticated process domain.
@@ -66,6 +66,8 @@ Root-only slash commands:
 ```text
 /reflect [optional user supplement]
 /reflect-watchdog [status]
+/reflect-watchdog pause
+/reflect-watchdog resume
 /reflect-watchdog reset
 /reflect-watchdog limits
 /reflect-watchdog limits <root> <all> <minutes> <idle-reset-seconds>
