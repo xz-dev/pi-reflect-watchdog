@@ -1,39 +1,26 @@
-import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	MessageEndEvent,
+	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
 	foldInquiryContext,
+	type InquiryAttemptHandle,
 	type InquiryRuntime,
 } from "pi-extension-utils/pi-inquiry";
-
+import { BUILT_IN_CONFIG, type WatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
-import {
-	type ControllerTransition,
-	controllerOptionsFromConfig,
-	TaskController,
-	type TaskStatus,
-} from "./controller.js";
-import {
-	parseReflectWatchdogCommand,
-	REFLECT_COMMAND,
-	REFLECT_TIMELINE_COMMAND,
-	REFLECT_WATCHDOG_COMMAND,
-} from "./controls.js";
 import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
 import {
-	allocateAttachmentToken,
-	claimRoot,
-	getHub,
-	installReflectWatchdogApi,
-	isCurrentRoot,
-	type ReflectWatchdogApi,
-	type RootPriority,
-	releaseRoot,
+	createHubAttachmentInstance,
+	getProcessObservableAgentHub,
+	type HubAttachment,
+	type HubMainClaim,
+	type ObservableAgentHub,
 } from "./hub.js";
 import {
 	getReflectDomainCoordinator,
@@ -41,14 +28,6 @@ import {
 	type ReflectDomainCoordinator,
 	type ReflectDomainCounters,
 } from "./process-domain.js";
-import {
-	formatHistoryResult,
-	formatReflectionReport,
-	queryReflectionHistory,
-	REFLECTION_HISTORY_ENTRY_TYPE,
-	type ReflectionHistoryEntry,
-	reflectionHistory,
-} from "./reflection-history.js";
 import {
 	buildReflectionPrompt,
 	buildReflectionReaskPrompt,
@@ -60,10 +39,6 @@ import {
 	type ReflectionTriggerReason,
 } from "./reflection-protocol.js";
 import {
-	createReflectionEntryRenderer,
-	showReflectionTimeline,
-} from "./reflection-timeline.js";
-import {
 	createWatchdogWidget,
 	formatDuration,
 	WIDGET_KEY,
@@ -71,52 +46,37 @@ import {
 } from "./widget.js";
 
 const STATUS_KEY = "pi-reflect-watchdog";
-const TOOL_NAME = "reflect_watchdog_control";
-const HISTORY_COUNT_TOOL_NAME = "reflect_history_count";
-const HISTORY_GET_TOOL_NAME = "reflect_history_get";
-const CONTROL_TOOL_NAMES = new Set([
-	TOOL_NAME,
-	HISTORY_COUNT_TOOL_NAME,
-	HISTORY_GET_TOOL_NAME,
-]);
+const REFLECT_COMMAND = "reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 const REFLECTION_MESSAGE_TYPE = `${REFLECTION_INQUIRY_NAMESPACE}:inquiry`;
-const REFLECTION_ENTRY_TYPE = REFLECTION_HISTORY_ENTRY_TYPE;
-type Timer = ReturnType<typeof setTimeout>;
-
-// Node clamps any setTimeout delay above 2^31-1 ms to 1 ms, which would fire
-// the task threshold far too early. Large valid limits are instead
-// scheduled as capped chunks that recompute the exact remaining delay.
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
-// The dedicated TUI widget shows seconds, so it refreshes at about one
-// second while the root is active and stops entirely while idle. The wall-
-// clock threshold timer is a separate role and keeps its exact semantics.
-const WIDGET_TICK_MS = 1_000;
+const ACTIVE_TICK_MS = 1_000;
 const RPC_STATUS_TICK_MS = 30_000;
 
-type AttachmentState = "new" | "loading" | "root" | "observer" | "shutdown";
+type Timer = ReturnType<typeof setTimeout>;
+type TimerRole = "tui-refresh" | "rpc-status";
+type InternalRun =
+	| { readonly kind: "none" }
+	| { readonly kind: "provisional" | "confirmed"; readonly attempt: number };
 
-export type WatchdogTimerRole = "threshold" | "tui-refresh" | "rpc-status";
+interface UninterruptibleMessageEndAPI {
+	on(
+		event: "message_end",
+		handler: (
+			event: MessageEndEvent,
+			ctx: ExtensionContext,
+		) => { readonly message: MessageEndEvent["message"] } | undefined,
+		options: { readonly uninterruptible: true },
+	): void;
+}
 
 export interface RuntimeServices {
 	now(): number;
-	/**
-	 * Legacy timer seam retained for existing internal consumers. New test
-	 * adapters can use scheduleTimer to observe the watchdog's timer purpose
-	 * without guessing from a delay that can legitimately collide.
-	 */
 	setTimeout(callback: () => void, delay: number): Timer;
 	clearTimeout(timer: Timer): void;
 	loadConfig(cwd: string, trusted: boolean): Promise<LoadedConfig>;
 	processDomain: ReflectDomainCoordinator;
 	fatalExit: FatalExitAdapter;
-	/** Optional role-aware scheduling seam; production falls back to setTimeout. */
-	scheduleTimer?(
-		role: WatchdogTimerRole,
-		callback: () => void,
-		delay: number,
-	): Timer;
+	scheduleTimer?(role: TimerRole, callback: () => void, delay: number): Timer;
 }
 
 const defaultServices: RuntimeServices = {
@@ -128,12 +88,6 @@ const defaultServices: RuntimeServices = {
 	fatalExit: createFatalExitAdapter(),
 };
 
-interface ObserverBinding {
-	observerAttachmentToken: string;
-	rootGeneration: number;
-	taskEpoch: number;
-}
-
 interface PendingReflection {
 	readonly id: number;
 	readonly reasons: ReflectionTriggerReason[];
@@ -143,78 +97,44 @@ interface PendingReflection {
 }
 
 interface ActiveReflection extends PendingReflection {
-	reasks: number;
+	attempt: number;
 	toolCalls: number;
-	submittedAttempt?: number;
 	readonly inquiry: InquiryRuntime;
+	handle: InquiryAttemptHandle;
+	planned?: ReflectionDecision | { readonly error: string };
 }
-
-type RunActivity = "pending" | "work";
 
 interface Runtime {
-	pi: ExtensionAPI;
-	token: string;
-	sessionId: string;
-	state: AttachmentState;
-	root?: { generation: number };
-	controller?: TaskController;
-	config?: LoadedConfig["config"];
-	ctx?: ExtensionContext;
-	sessionManager?: ExtensionContext["sessionManager"];
-	timer?: Timer;
-	ticker?: Timer;
-	timerLifecycle?: { generation: number; epoch: number };
-	widgetOwner?: object;
-	widgetRequestRender?: () => void;
-	observerBinding?: ObserverBinding;
-	toolRegistered: boolean;
-	commandRegistered: boolean;
-	reflectionSequence: number;
-	reflectionQueue: PendingReflection[];
-	activeReflection?: ActiveReflection;
-	paused: boolean;
-	resumeAfterReflectionTurn: boolean;
-	removeApi?: () => void;
-	reconcileActivity?: () => boolean;
-	domainCounters?: ReflectDomainCounters;
-	domainCounterUnsubscribe?: () => void;
+	readonly pi: ExtensionAPI;
+	readonly hub: ObservableAgentHub;
+	readonly processDomain: ReflectDomainCoordinator;
+	readonly attachmentInstance: object;
+	attachment: HubAttachment | null;
+	claim: HubMainClaim | null;
+	ctx: ExtensionContext | null;
+	config: WatchdogConfig;
+	configReady: boolean;
+	stopped: boolean;
 	domainAttached: boolean;
-	runActivity: RunActivity;
-	suppressNextRootTurn: boolean;
-}
-
-function positiveSafeInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-function elapsed(ms: number): string {
-	const seconds = Math.floor(ms / 1000);
-	if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"}`;
-	const minutes = Math.floor(seconds / 60);
-	return `${minutes} minute${minutes === 1 ? "" : "s"}`;
-}
-
-function priority(ctx: ExtensionContext): RootPriority {
-	return ctx.hasUI ? 2 : 1;
-}
-
-function rootIsCurrent(runtime: Runtime): runtime is Runtime & {
-	root: { generation: number };
-	controller: TaskController;
-	ctx: ExtensionContext;
-} {
-	return (
-		runtime.state === "root" &&
-		runtime.root !== undefined &&
-		runtime.controller !== undefined &&
-		runtime.ctx !== undefined &&
-		isCurrentRoot(getHub<Runtime>(), runtime.token, runtime.root.generation)
-	);
+	domainFatal: boolean;
+	localBusy: boolean;
+	latestCounters?: ReflectDomainCounters;
+	latched: Set<Exclude<ReflectionTriggerReason, "USER_REQUEST">>;
+	pendingAutomatic?: PendingReflection;
+	manualQueue: PendingReflection[];
+	activeReflection?: ActiveReflection;
+	internalRun: InternalRun;
+	reflectionSequence: number;
+	ticker?: Timer;
+	widgetTui: { requestRender(): void } | null;
+	widgetRegistered: boolean;
+	unsubscribeHub?: () => void;
+	unsubscribeDomain?: () => void;
 }
 
 function scheduleTimer(
 	services: RuntimeServices,
-	role: WatchdogTimerRole,
+	role: TimerRole,
 	callback: () => void,
 	delay: number,
 ): Timer {
@@ -222,363 +142,6 @@ function scheduleTimer(
 		services.scheduleTimer?.(role, callback, delay) ??
 		services.setTimeout(callback, delay)
 	);
-}
-
-function clearTimers(runtime: Runtime, services: RuntimeServices): void {
-	if (runtime.timer) services.clearTimeout(runtime.timer);
-	if (runtime.ticker) services.clearTimeout(runtime.ticker);
-	runtime.timer = undefined;
-	runtime.ticker = undefined;
-	// Invalidate callbacks that a host may still deliver after clearTimeout;
-	// staleness is scoped to the root generation and task epoch.
-	runtime.timerLifecycle = undefined;
-}
-
-function removeControlTool(runtime: Runtime): void {
-	if (!runtime.toolRegistered) return;
-	// Dynamic tool state is public API. Remove only our name so unrelated tools stay active.
-	runtime.pi.setActiveTools(
-		runtime.pi.getActiveTools().filter((name) => !CONTROL_TOOL_NAMES.has(name)),
-	);
-}
-
-function deactivate(runtime: Runtime, services: RuntimeServices): void {
-	clearTimers(runtime, services);
-	runtime.domainCounterUnsubscribe?.();
-	runtime.domainCounterUnsubscribe = undefined;
-	if (runtime.domainAttached) {
-		runtime.domainAttached = false;
-		const detach = (): void => {
-			void services.processDomain.detach(runtime).catch(() => {});
-		};
-		if (runtime.paused)
-			void services.processDomain
-				.resume()
-				.catch(() => {})
-				.finally(detach);
-		else detach();
-	}
-	runtime.domainCounters = undefined;
-	runtime.runActivity = "pending";
-	clearWidget(runtime);
-	if (runtime.ctx) runtime.ctx.ui.setStatus(STATUS_KEY, undefined);
-	removeControlTool(runtime);
-	runtime.observerBinding = undefined;
-	runtime.root = undefined;
-	runtime.controller?.finalize();
-	runtime.controller = undefined;
-	runtime.ctx = undefined;
-	runtime.sessionManager = undefined;
-	runtime.config = undefined;
-	runtime.reflectionQueue = [];
-	runtime.activeReflection = undefined;
-	runtime.paused = false;
-	runtime.resumeAfterReflectionTurn = false;
-	runtime.removeApi?.();
-	runtime.removeApi = undefined;
-	runtime.suppressNextRootTurn = false;
-	if (runtime.state !== "shutdown") runtime.state = "observer";
-}
-
-async function pauseCounting(
-	runtime: Runtime,
-	services: RuntimeServices,
-): Promise<void> {
-	if (runtime.paused || !rootIsCurrent(runtime)) return;
-	runtime.paused = true;
-	runtime.runActivity = "pending";
-	clearTimers(runtime, services);
-	runtime.controller.pauseActivity(services.now());
-	try {
-		const counters = await services.processDomain.pause();
-		if (counters !== undefined) runtime.domainCounters = counters;
-	} catch (error) {
-		await services.processDomain.resume().catch(() => {});
-		runtime.paused = false;
-		runtime.reconcileActivity?.();
-		scheduleTimers(runtime, services);
-		updateStatus(runtime, services);
-		throw error;
-	}
-	updateStatus(runtime, services);
-	runtime.widgetRequestRender?.();
-}
-
-async function resumeCounting(
-	runtime: Runtime,
-	services: RuntimeServices,
-): Promise<void> {
-	if (!runtime.paused || !rootIsCurrent(runtime)) return;
-	runtime.paused = false;
-	try {
-		await services.processDomain.resume();
-	} finally {
-		runtime.paused = services.processDomain.paused;
-		runtime.domainCounters = services.processDomain.counters();
-		runtime.reconcileActivity?.();
-		runtime.controller.resumeActivity(
-			services.now(),
-			runtime.domainCounters?.anyBusy ?? false,
-		);
-		scheduleTimers(runtime, services);
-		updateStatus(runtime, services);
-		runtime.widgetRequestRender?.();
-	}
-}
-
-function safeCounterNumber(value: bigint): number {
-	const max = BigInt(Number.MAX_SAFE_INTEGER);
-	return Number(value > max ? max : value);
-}
-
-function statusLine(
-	status: TaskStatus,
-	counters?: ReflectDomainCounters,
-): string {
-	return `WD active ${safeCounterNumber(counters?.activeLoops.value ?? BigInt(status.activity.loops))} loops · task ${elapsed(safeCounterNumber(counters?.taskMs.value ?? BigInt(status.taskElapsedMs)))}/${status.limits.taskMinutes}m · root ${safeCounterNumber(counters?.rootLoops.value ?? BigInt(status.rootLoops))}/${status.limits.rootLoopLimit} · all ${safeCounterNumber(counters?.allLoops.value ?? BigInt(status.allLoops))}/${status.limits.allLoopLimit}`;
-}
-
-function widgetState(
-	runtime: Runtime & {
-		root: { generation: number };
-		controller: TaskController;
-		ctx: ExtensionContext;
-	},
-	now: number,
-): WidgetState {
-	const status = runtime.controller.status(now);
-	const counters = runtime.domainCounters;
-	return {
-		activity: {
-			active: counters?.anyBusy ?? status.activity.active,
-			elapsedMs: safeCounterNumber(
-				counters?.activeMs.value ?? BigInt(status.activity.elapsedMs),
-			),
-			loops: safeCounterNumber(
-				counters?.activeLoops.value ?? BigInt(status.activity.loops),
-			),
-		},
-		taskElapsedMs: safeCounterNumber(
-			counters?.taskMs.value ?? BigInt(status.taskElapsedMs),
-		),
-		taskMinutes: status.limits.taskMinutes,
-		rootLoops: safeCounterNumber(
-			counters?.rootLoops.value ?? BigInt(status.rootLoops),
-		),
-		rootLoopLimit: status.limits.rootLoopLimit,
-		allLoops: safeCounterNumber(
-			counters?.allLoops.value ?? BigInt(status.allLoops),
-		),
-		allLoopLimit: status.limits.allLoopLimit,
-	};
-}
-
-// The TUI widget owns its status line. RPC retains the footer status because
-// it is the only non-TUI mode where that status is meaningful.
-function updateStatus(runtime: Runtime, services: RuntimeServices): void {
-	if (!rootIsCurrent(runtime) || runtime.ctx.mode !== "rpc") return;
-	runtime.ctx.ui.setStatus(
-		STATUS_KEY,
-		statusLine(
-			runtime.controller.status(services.now()),
-			runtime.domainCounters,
-		),
-	);
-}
-
-function installWidget(runtime: Runtime, services: RuntimeServices): void {
-	if (!rootIsCurrent(runtime) || runtime.ctx.mode !== "tui") return;
-	const ctx = runtime.ctx;
-	const owner = {};
-	runtime.widgetOwner = owner;
-	runtime.widgetRequestRender = undefined;
-	ctx.ui.setWidget(
-		WIDGET_KEY,
-		(tui, theme) => {
-			// A factory can be invoked after its widget has been replaced. Only the
-			// current root/context/widget instance may retain this TUI callback.
-			if (
-				rootIsCurrent(runtime) &&
-				runtime.ctx === ctx &&
-				runtime.widgetOwner === owner
-			)
-				runtime.widgetRequestRender = () => tui.requestRender();
-			return createWatchdogWidget(theme, () =>
-				widgetState(runtime, services.now()),
-			);
-		},
-		{ placement: "belowEditor" },
-	);
-	ctx.ui.setStatus(STATUS_KEY, undefined);
-}
-
-function clearWidget(runtime: Runtime): void {
-	// Clear first: queued timers and late factory calls must never redraw a
-	// removed, demoted, shut-down, or replaced context.
-	runtime.widgetRequestRender = undefined;
-	runtime.widgetOwner = undefined;
-	if (runtime.ctx?.mode === "tui")
-		runtime.ctx.ui.setWidget(WIDGET_KEY, undefined);
-}
-
-// The freeze notification is user-only TUI output. Pi exposes no reliable
-// public user-abort provenance at agent_settled, so the wording stays
-// neutral and the line never enters the model context or triggers a turn.
-function emitActiveCycleFrozenNotification(
-	runtime: Runtime,
-	snapshot: { elapsedMs: number; loops: number } | undefined,
-): void {
-	if (snapshot === undefined || !rootIsCurrent(runtime)) return;
-	if (runtime.ctx.mode !== "tui") return;
-	runtime.ctx.ui.notify(
-		`Watchdog active frozen | active ${formatDuration(snapshot.elapsedMs)}/${snapshot.loops} loops`,
-		"info",
-	);
-}
-
-function scheduleTimers(runtime: Runtime, services: RuntimeServices): void {
-	clearTimers(runtime, services);
-	if (
-		!rootIsCurrent(runtime) ||
-		runtime.paused ||
-		runtime.activeReflection !== undefined ||
-		runtime.reflectionQueue.length > 0
-	)
-		return;
-	const generation = runtime.root.generation;
-	const epoch = runtime.controller.status(services.now()).epoch;
-	const lifecycle = { generation, epoch };
-	runtime.timerLifecycle = lifecycle;
-	// Each scheduled callback fires exactly once; a host that delivers a
-	// callback again (or after clearTimeout) hits the consumed flag and the
-	// superseded lifecycle token, never the live state.
-	const stale = (fired: { consumed: boolean }): boolean => {
-		if (fired.consumed) return true;
-		fired.consumed = true;
-		return (
-			!rootIsCurrent(runtime) ||
-			runtime.timerLifecycle !== lifecycle ||
-			runtime.controller.status(services.now()).epoch !== epoch
-		);
-	};
-	// scheduleWallClock runs at most once per timer callback; early delivery
-	// rearms the remaining delay in place instead of stacking timers.
-	const scheduleWallClock = (): void => {
-		const status = runtime.controller.status(services.now());
-		if (!status.rootActive) return;
-		const remaining = status.limits.taskMinutes * 60_000 - status.taskElapsedMs;
-		if (remaining <= 0) {
-			// Already at or beyond the boundary (a rearmed limit can land there):
-			// evaluate exactly once instead of scheduling a zero-delay timer.
-			deliverWarnings(
-				runtime,
-				runtime.controller.evaluateTaskTime(services.now()),
-				services,
-			);
-			return;
-		}
-		const fired = { consumed: false };
-		runtime.timer = scheduleTimer(
-			services,
-			"threshold",
-			() => {
-				if (stale(fired)) return;
-				runtime.timer = undefined;
-				const delivered = deliverWarnings(
-					runtime,
-					runtime.controller.evaluateTaskTime(services.now()),
-					services,
-				);
-				// A warning reset creates a fresh timer lifecycle. Only an early or
-				// capped callback without a warning may rearm this lifecycle in place.
-				if (!delivered) scheduleWallClock();
-				updateStatus(runtime, services);
-			},
-			Math.min(remaining, MAX_TIMER_DELAY_MS),
-		);
-		runtime.timer.unref?.();
-	};
-	// Once attached, the watchdog-owned activeMs state is the sole
-	// cross-process wall-threshold authority. A parallel local timer can race
-	// one snapshot broadcast ahead and enqueue a reflection with a stale
-	// snapshot (for example 59000ms at the 60000ms boundary).
-	if (!runtime.domainAttached) scheduleWallClock();
-	const scheduleRefreshTick = (
-		role: Extract<WatchdogTimerRole, "tui-refresh" | "rpc-status">,
-		delay: number,
-		refresh: () => void,
-	): void => {
-		const fired = { consumed: false };
-		runtime.ticker = scheduleTimer(
-			services,
-			role,
-			() => {
-				if (stale(fired)) return;
-				runtime.ticker = undefined;
-				refresh();
-				scheduleRefreshTick(role, delay, refresh);
-			},
-			delay,
-		);
-		runtime.ticker.unref?.();
-	};
-	// Refresh roles are deliberately mode-specific. The widget needs a
-	// second-level redraw while any current-epoch participant runs; RPC keeps
-	// its established bounded footer refresh; print/json/headless have no
-	// changing UI surface to refresh.
-	if (!runtime.controller.status(services.now()).activity.active) return;
-	if (runtime.ctx.mode === "tui")
-		scheduleRefreshTick("tui-refresh", WIDGET_TICK_MS, () => {
-			runtime.widgetRequestRender?.();
-		});
-	else if (runtime.ctx.mode === "rpc")
-		scheduleRefreshTick("rpc-status", RPC_STATUS_TICK_MS, () =>
-			updateStatus(runtime, services),
-		);
-}
-
-function thresholdSnapshot(
-	status: TaskStatus,
-	counters?: ReflectDomainCounters,
-): ReflectionThresholdSnapshot {
-	return {
-		activeMs: Number(
-			counters?.activeMs.value ?? BigInt(status.activity.elapsedMs),
-		),
-		activeLoops: Number(
-			counters?.activeLoops.value ?? BigInt(status.activity.loops),
-		),
-		taskMs: Number(counters?.taskMs.value ?? BigInt(status.taskElapsedMs)),
-		taskMinutes: status.limits.taskMinutes,
-		rootLoops: Number(counters?.rootLoops.value ?? BigInt(status.rootLoops)),
-		rootLoopLimit: status.limits.rootLoopLimit,
-		allLoops: Number(counters?.allLoops.value ?? BigInt(status.allLoops)),
-		allLoopLimit: status.limits.allLoopLimit,
-	};
-}
-
-function domainThresholdReasons(
-	runtime: Runtime & { controller: TaskController },
-	counters: ReflectDomainCounters,
-): ReflectionTriggerReason[] {
-	if (
-		!counters.certain ||
-		counters.taskMs.paused ||
-		counters.rootLoops.paused ||
-		counters.allLoops.paused ||
-		counters.activeMs.paused ||
-		counters.activeLoops.paused
-	)
-		return [];
-	const status = runtime.controller.status(Date.now());
-	const reasons: ReflectionTriggerReason[] = [];
-	if (counters.rootLoops.value >= BigInt(status.limits.rootLoopLimit))
-		reasons.push("ROOT_LOOP_LIMIT");
-	if (counters.allLoops.value >= BigInt(status.limits.allLoopLimit))
-		reasons.push("ALL_LOOP_LIMIT");
-	if (counters.taskMs.value >= BigInt(status.limits.taskMinutes) * 60_000n)
-		reasons.push("TASK_TIME_LIMIT");
-	return reasons;
 }
 
 function localTimestamp(): string {
@@ -590,514 +153,503 @@ function localTimestamp(): string {
 	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, "0")}${sign}${pad(Math.trunc(offset / 60))}:${pad(offset % 60)}`;
 }
 
-function lastReflection(runtime: Runtime): ReflectionHistoryEntry | undefined {
-	return runtime.sessionManager === undefined
-		? undefined
-		: reflectionHistory(runtime.sessionManager).at(-1);
-}
-
-function sendActiveReflection(runtime: Runtime): void {
-	if (
-		!rootIsCurrent(runtime) ||
-		runtime.activeReflection === undefined ||
-		runtime.config === undefined
-	)
-		return;
-	const active = runtime.activeReflection;
-	const previous = lastReflection(runtime);
-	const content = buildReflectionPrompt({
-		semanticPrefix: runtime.config.reflectionPrompt,
-		timestamp: active.timestamp,
-		reasons: active.reasons,
-		thresholds: active.thresholds,
-		userSupplement: active.userSupplement,
-		previousReflection:
-			previous === undefined
-				? undefined
-				: { timestamp: previous.timestamp, report: previous.report },
-	});
-	active.submittedAttempt = undefined;
-	active.inquiry.send(runtime.pi, content, active.reasks + 1);
-}
-
-function failReflectionBeforeSend(
-	runtime: Runtime,
-	services: RuntimeServices,
-	message: string,
-): void {
-	runtime.activeReflection = undefined;
-	runtime.reflectionQueue = [];
-	runtime.resumeAfterReflectionTurn = false;
-	void resumeCounting(runtime, services);
-	if (rootIsCurrent(runtime)) runtime.ctx.ui.notify(message, "warning");
-}
-
-function beginNextReflection(
-	runtime: Runtime,
-	services: RuntimeServices,
-): void {
-	if (!rootIsCurrent(runtime) || runtime.activeReflection !== undefined) return;
-	const pending = runtime.reflectionQueue.shift();
-	if (pending === undefined) return;
-	runtime.activeReflection = {
-		...pending,
-		reasks: 0,
-		toolCalls: 0,
-		inquiry: createInquiryRuntime(REFLECTION_INQUIRY_NAMESPACE, {
-			inquiryId: `reflection-${pending.id}`,
-		}),
-	};
-	runtime.resumeAfterReflectionTurn = false;
-	const resetReminderCycle = !pending.reasons.includes("USER_REQUEST");
-	if (resetReminderCycle) {
-		runtime.controller.resetReminderCycle(services.now());
-		void services.processDomain.resetReminderCycle().catch(() => undefined);
-	}
-	void pauseCounting(runtime, services).then(
-		() => sendActiveReflection(runtime),
-		() =>
-			failReflectionBeforeSend(
-				runtime,
-				services,
-				"Reflection failed: process-domain counter pause failed.",
-			),
+function owns(runtime: Runtime): boolean {
+	return (
+		!runtime.stopped &&
+		runtime.processDomain.rootProcess &&
+		runtime.claim !== null &&
+		runtime.hub.isCurrentMain(runtime.claim)
 	);
 }
 
-function enqueueReflection(
+function currentCounters(runtime: Runtime): ReflectDomainCounters | undefined {
+	return runtime.processDomain.counters() ?? runtime.latestCounters;
+}
+
+function safeNumber(value: bigint | undefined): number {
+	if (value === undefined || value <= 0n) return 0;
+	return Number(
+		value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : value,
+	);
+}
+
+function thresholdSnapshot(runtime: Runtime): ReflectionThresholdSnapshot {
+	const counters = currentCounters(runtime);
+	return {
+		activeMs: safeNumber(counters?.activeMs.value),
+		activeLoops: safeNumber(counters?.activeLoops.value),
+		taskMs: safeNumber(counters?.taskMs.value),
+		taskMinutes: runtime.config.taskMinutes,
+		rootLoops: safeNumber(counters?.rootLoops.value),
+		rootLoopLimit: runtime.config.rootLoopLimit,
+		allLoops: safeNumber(counters?.allLoops.value),
+		allLoopLimit: runtime.config.allLoopLimit,
+	};
+}
+
+function crossedReasons(
 	runtime: Runtime,
-	services: RuntimeServices,
-	reasons: readonly ReflectionTriggerReason[],
-	thresholds: ReflectionThresholdSnapshot,
-	userSupplement?: string,
-): void {
-	if (!rootIsCurrent(runtime)) return;
-	const normalizedReasons = [...new Set(reasons)];
-	const tail = runtime.reflectionQueue.at(-1);
-	if (
-		!normalizedReasons.includes("USER_REQUEST") &&
-		userSupplement === undefined &&
-		tail !== undefined &&
-		!tail.reasons.includes("USER_REQUEST") &&
-		tail.userSupplement === undefined
-	) {
-		for (const reason of normalizedReasons)
-			if (!tail.reasons.includes(reason)) tail.reasons.push(reason);
+): Exclude<ReflectionTriggerReason, "USER_REQUEST">[] {
+	const snapshot = thresholdSnapshot(runtime);
+	const reasons: Exclude<ReflectionTriggerReason, "USER_REQUEST">[] = [];
+	if (snapshot.rootLoops >= runtime.config.rootLoopLimit)
+		reasons.push("ROOT_LOOP_LIMIT");
+	if (snapshot.allLoops >= runtime.config.allLoopLimit)
+		reasons.push("ALL_LOOP_LIMIT");
+	if (snapshot.taskMs >= runtime.config.taskMinutes * 60_000)
+		reasons.push("TASK_TIME_LIMIT");
+	return reasons.filter((reason) => !runtime.latched.has(reason));
+}
+
+function latchAutomaticReflection(runtime: Runtime): void {
+	if (!owns(runtime) || !runtime.configReady) return;
+	const reasons = crossedReasons(runtime);
+	if (reasons.length === 0) return;
+	for (const reason of reasons) runtime.latched.add(reason);
+	if (runtime.pendingAutomatic !== undefined) {
+		for (const reason of reasons)
+			if (!runtime.pendingAutomatic.reasons.includes(reason))
+				runtime.pendingAutomatic.reasons.push(reason);
 		return;
 	}
 	runtime.reflectionSequence += 1;
-	runtime.reflectionQueue.push({
+	runtime.pendingAutomatic = {
 		id: runtime.reflectionSequence,
-		reasons: normalizedReasons,
-		thresholds,
-		userSupplement,
+		reasons: [...reasons],
+		thresholds: thresholdSnapshot(runtime),
 		timestamp: localTimestamp(),
-	});
-	beginNextReflection(runtime, services);
+	};
 }
 
-function finalizeReflection(
+function statusState(runtime: Runtime): WidgetState {
+	const counters = currentCounters(runtime);
+	return {
+		activity: {
+			active: counters?.anyBusy ?? false,
+			elapsedMs: safeNumber(counters?.activeMs.value),
+			loops: safeNumber(counters?.activeLoops.value),
+		},
+		taskElapsedMs: safeNumber(counters?.taskMs.value),
+		taskMinutes: runtime.config.taskMinutes,
+		rootLoops: safeNumber(counters?.rootLoops.value),
+		rootLoopLimit: runtime.config.rootLoopLimit,
+		allLoops: safeNumber(counters?.allLoops.value),
+		allLoopLimit: runtime.config.allLoopLimit,
+	};
+}
+
+function statusText(runtime: Runtime): string {
+	const state = statusState(runtime);
+	return `Reflect Watchdog | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m · root ${state.rootLoops}/${state.rootLoopLimit} · all ${state.allLoops}/${state.allLoopLimit}`;
+}
+
+function refreshWidget(runtime: Runtime): void {
+	if (!owns(runtime) || runtime.ctx === null) return;
+	if (runtime.ctx.mode === "rpc") {
+		runtime.ctx.ui.setStatus(STATUS_KEY, statusText(runtime));
+		return;
+	}
+	if (runtime.ctx.mode !== "tui") return;
+	if (!runtime.widgetRegistered) {
+		runtime.ctx.ui.setWidget(
+			WIDGET_KEY,
+			(tui, theme) => {
+				runtime.widgetTui = tui;
+				return createWatchdogWidget(theme, () => statusState(runtime));
+			},
+			{ placement: "belowEditor" },
+		);
+		runtime.widgetRegistered = true;
+		runtime.ctx.ui.setStatus(STATUS_KEY, undefined);
+		return;
+	}
+	runtime.widgetTui?.requestRender();
+}
+
+function clearWidget(runtime: Runtime): void {
+	const ctx = runtime.ctx;
+	if (ctx !== null && runtime.widgetRegistered && ctx.mode === "tui") {
+		try {
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+		} catch {
+			// Stale session cleanup may reject UI mutation.
+		}
+	}
+	runtime.widgetRegistered = false;
+	runtime.widgetTui = null;
+	ctx?.ui.setStatus(STATUS_KEY, undefined);
+}
+
+function scheduleRefresh(runtime: Runtime, services: RuntimeServices): void {
+	if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
+	runtime.ticker = undefined;
+	if (
+		!owns(runtime) ||
+		runtime.ctx === null ||
+		!currentCounters(runtime)?.anyBusy
+	)
+		return;
+	const role: TimerRole =
+		runtime.ctx.mode === "tui" ? "tui-refresh" : "rpc-status";
+	const delay = role === "tui-refresh" ? ACTIVE_TICK_MS : RPC_STATUS_TICK_MS;
+	runtime.ticker = scheduleTimer(
+		services,
+		role,
+		() => {
+			runtime.ticker = undefined;
+			refreshWidget(runtime);
+			scheduleRefresh(runtime, services);
+		},
+		delay,
+	);
+	runtime.ticker.unref?.();
+}
+
+function safeToDispatch(runtime: Runtime): boolean {
+	if (
+		!owns(runtime) ||
+		runtime.ctx === null ||
+		runtime.activeReflection !== undefined
+	)
+		return false;
+	const piState = probePiAgentState(runtime.ctx);
+	const counters = currentCounters(runtime);
+	const localCountsAsBusy =
+		runtime.localBusy && runtime.internalRun.kind === "none";
+	const sameProcessOthersBusy = Math.max(
+		0,
+		runtime.hub.snapshot.busyCount - (localCountsAsBusy ? 1 : 0),
+	);
+	const crossProcessOthersBusy = counters?.otherBusy === true;
+	return (
+		!piState.pendingMessages &&
+		sameProcessOthersBusy === 0 &&
+		!crossProcessOthersBusy &&
+		counters?.certain === true &&
+		(piState.idle || localCountsAsBusy)
+	);
+}
+
+function sendActiveReflection(runtime: Runtime, prompt: string): void {
+	const active = runtime.activeReflection;
+	if (active === undefined || !owns(runtime)) return;
+	active.handle = active.inquiry.attempt(active.attempt);
+	if (!active.handle.markSent()) return;
+	active.inquiry.send(runtime.pi, prompt, active.attempt);
+}
+
+function beginReflection(runtime: Runtime, pending: PendingReflection): void {
+	const inquiry = createInquiryRuntime(REFLECTION_INQUIRY_NAMESPACE, {
+		inquiryId: `reflection-${pending.id}`,
+	});
+	runtime.activeReflection = {
+		...pending,
+		attempt: 1,
+		toolCalls: 0,
+		inquiry,
+		handle: inquiry.attempt(1),
+	};
+	runtime.internalRun = { kind: "provisional", attempt: 1 };
+	sendActiveReflection(
+		runtime,
+		buildReflectionPrompt({
+			semanticPrefix: runtime.config.reflectionPrompt,
+			timestamp: pending.timestamp,
+			reasons: pending.reasons,
+			thresholds: pending.thresholds,
+			userSupplement: pending.userSupplement,
+		}),
+	);
+}
+
+function maybeDispatch(runtime: Runtime): void {
+	if (!safeToDispatch(runtime)) return;
+	const manual = runtime.manualQueue.shift();
+	if (manual !== undefined) {
+		beginReflection(runtime, manual);
+		return;
+	}
+	const automatic = runtime.pendingAutomatic;
+	if (automatic === undefined) return;
+	runtime.pendingAutomatic = undefined;
+	runtime.latched.clear();
+	void runtime.processDomain.resetReminderCycle().catch(() => {});
+	beginReflection(runtime, automatic);
+}
+
+function queueManualReflection(runtime: Runtime, supplement?: string): void {
+	if (!owns(runtime)) return;
+	runtime.reflectionSequence += 1;
+	runtime.manualQueue.push({
+		id: runtime.reflectionSequence,
+		reasons: ["USER_REQUEST"],
+		thresholds: thresholdSnapshot(runtime),
+		userSupplement: supplement,
+		timestamp: localTimestamp(),
+	});
+	maybeDispatch(runtime);
+}
+
+function finishReflection(
 	runtime: Runtime,
-	services: RuntimeServices,
-	report: string,
 	decision?: ReflectionDecision,
 ): void {
 	const active = runtime.activeReflection;
-	if (!active || !runtime.sessionManager) return;
-	if (decision === undefined) {
-		runtime.ctx?.ui.notify(report, "warning");
-	} else {
-		const entryBase = {
-			version: 1 as const,
-			timestamp: active.timestamp,
-			reasons: active.reasons,
-			thresholds: active.thresholds,
-			userSupplement: active.userSupplement,
-			decision,
-		};
-		const historyEntry = {
-			...entryBase,
-			report: formatReflectionReport(entryBase),
-		};
-		if ("appendEntry" in runtime.pi)
-			(runtime.pi as ExtensionAPI).appendEntry(
-				REFLECTION_ENTRY_TYPE,
-				historyEntry,
-			);
-		if (runtime.ctx?.mode === "tui")
-			runtime.ctx.ui.notify(historyEntry.report, "info");
-		if (decision.type === "ROUTE_CORRECTION") {
-			runtime.pi.sendMessage(
-				{
-					customType: `${REFLECTION_MESSAGE_TYPE}:correction`,
-					content: historyEntry.report,
-					display: true,
-					details: historyEntry,
-				},
-				// message_end runs while the reflection agent loop is still active.
-				// Steer the readable correction into that loop so continuation does
-				// not wait for another user prompt.
-				{ deliverAs: "steer", triggerTurn: true },
-			);
-		}
-	}
+	if (active === undefined) return;
 	runtime.activeReflection = undefined;
-	runtime.suppressNextRootTurn = false;
-	if (runtime.reflectionQueue.length > 0) {
-		beginNextReflection(runtime, services);
-		return;
+	runtime.internalRun = { kind: "none" };
+	if (runtime.ctx !== null) observe(runtime, runtime.ctx);
+	if (decision?.type === "ROUTE_CORRECTION") {
+		runtime.pi.sendMessage(
+			{
+				customType: `${REFLECTION_MESSAGE_TYPE}:correction`,
+				content: [
+					`Reflect watchdog correction: ${decision.reason}`,
+					`Done: ${decision.done}`,
+					`Current step: ${decision.currentStep}`,
+					`Next step: ${decision.nextStep}`,
+				].join("\n"),
+				display: true,
+				details: { timestamp: active.timestamp, decision },
+			},
+			{ deliverAs: "steer", triggerTurn: true },
+		);
+	} else if (decision !== undefined && runtime.ctx?.mode === "tui") {
+		runtime.ctx.ui.notify(`Reflect watchdog: ${decision.reason}`, "info");
 	}
-	// message_end precedes this reflection response's turn_end. Resume only
-	// after that exact turn is swallowed so reflection work cannot count itself.
-	runtime.resumeAfterReflectionTurn = true;
+	maybeDispatch(runtime);
 }
 
-function deliverWarnings(
+function observe(runtime: Runtime, ctx: ExtensionContext): void {
+	if (runtime.stopped || runtime.attachment === null) return;
+	const internal = runtime.internalRun.kind !== "none";
+	runtime.localBusy = probePiAgentState(ctx).busy;
+	const ordinaryBusy = runtime.localBusy && !internal;
+	if (ordinaryBusy) runtime.hub.markBusy(runtime.attachment);
+	else runtime.hub.markIdle(runtime.attachment);
+	void runtime.processDomain
+		.setBusy(runtime.attachmentInstance, ordinaryBusy)
+		.catch(() => {});
+	refreshWidget(runtime);
+}
+
+function commandIsCurrent(
 	runtime: Runtime,
-	transition: ControllerTransition,
-	services: RuntimeServices,
+	ctx: ExtensionCommandContext,
 ): boolean {
-	if (transition.warnings.length === 0 || !rootIsCurrent(runtime)) return false;
-	const status = transition.triggerStatus;
-	if (status === undefined)
-		throw new Error("warning transition must include its pre-reset status");
-	enqueueReflection(
-		runtime,
-		services,
-		transition.warnings,
-		thresholdSnapshot(status, runtime.domainCounters),
+	return (
+		owns(runtime) &&
+		runtime.ctx !== null &&
+		runtime.ctx.sessionManager === ctx.sessionManager
 	);
-	clearTimers(runtime, services);
-	updateStatus(runtime, services);
-	return true;
+}
+
+function isSuccessfulTurn(event: TurnEndEvent): boolean {
+	return (
+		event.message.role === "assistant" &&
+		(event.message.stopReason === "stop" ||
+			event.message.stopReason === "toolUse")
+	);
+}
+
+function syncOwnership(runtime: Runtime, services: RuntimeServices): void {
+	if (runtime.stopped || runtime.attachment === null) return;
+	if (runtime.hub.snapshot.main === null)
+		runtime.hub.reclaimMain(runtime.attachment);
+	const nextClaim = runtime.hub.mainClaimFor(runtime.attachment);
+	if (runtime.claim !== null && !runtime.hub.isCurrentMain(runtime.claim)) {
+		clearWidget(runtime);
+		runtime.activeReflection = undefined;
+		runtime.internalRun = { kind: "none" };
+	}
+	runtime.claim = nextClaim;
+	if (!owns(runtime)) return;
+	latchAutomaticReflection(runtime);
+	refreshWidget(runtime);
+	scheduleRefresh(runtime, services);
+	maybeDispatch(runtime);
+}
+
+function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
+	if (runtime.stopped) return;
+	runtime.stopped = true;
+	if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
+	runtime.ticker = undefined;
+	clearWidget(runtime);
+	runtime.unsubscribeHub?.();
+	runtime.unsubscribeDomain?.();
+	const attachment = runtime.attachment;
+	if (attachment !== null) runtime.hub.detach(attachment);
+	runtime.attachment = null;
+	runtime.claim = null;
+	runtime.ctx = null;
+	runtime.activeReflection = undefined;
+	runtime.manualQueue = [];
+	runtime.pendingAutomatic = undefined;
+	if (runtime.domainAttached) {
+		runtime.domainAttached = false;
+		void runtime.processDomain
+			.detach(runtime.attachmentInstance)
+			.catch(() => {});
+	}
+}
+
+export interface WatchdogExtensionOptions {
+	readonly hub?: ObservableAgentHub;
+	readonly processDomain?: ReflectDomainCoordinator;
+	readonly services?: Partial<RuntimeServices>;
 }
 
 export function createWatchdogExtension(
-	overrides: Partial<RuntimeServices> = {},
+	overrides: Partial<RuntimeServices> | WatchdogExtensionOptions = {},
 ): (pi: ExtensionAPI) => void {
-	const services: RuntimeServices = { ...defaultServices, ...overrides };
+	const structured =
+		"services" in overrides ||
+		"hub" in overrides ||
+		"processDomain" in overrides;
+	const serviceOverrides = structured
+		? (overrides as WatchdogExtensionOptions).services
+		: (overrides as Partial<RuntimeServices>);
+	const services: RuntimeServices = {
+		...defaultServices,
+		...serviceOverrides,
+		processDomain:
+			(structured
+				? (overrides as WatchdogExtensionOptions).processDomain
+				: undefined) ??
+			serviceOverrides?.processDomain ??
+			defaultServices.processDomain,
+	};
+	const hub =
+		(structured ? (overrides as WatchdogExtensionOptions).hub : undefined) ??
+		getProcessObservableAgentHub();
+
 	return (pi) => {
+		const runtime: Runtime = {
+			pi,
+			hub,
+			processDomain: services.processDomain,
+			attachmentInstance: createHubAttachmentInstance(),
+			attachment: null,
+			claim: null,
+			ctx: null,
+			config: { ...BUILT_IN_CONFIG },
+			configReady: false,
+			stopped: false,
+			domainAttached: false,
+			domainFatal: false,
+			localBusy: false,
+			latched: new Set(),
+			manualQueue: [],
+			internalRun: { kind: "none" },
+			reflectionSequence: 0,
+			widgetTui: null,
+			widgetRegistered: false,
+		};
+
 		pi.on("context", (event) => ({
 			messages: foldInquiryContext(
 				event.messages,
 				REFLECTION_INQUIRY_NAMESPACE,
 			),
 		}));
-		const runtime: Runtime = {
-			pi,
-			token: "",
-			sessionId: "",
-			state: "new",
-			toolRegistered: false,
-			commandRegistered: false,
-			reflectionSequence: 0,
-			reflectionQueue: [],
-			paused: services.processDomain.paused,
-			resumeAfterReflectionTurn: false,
-			runActivity: "pending",
-			suppressNextRootTurn: false,
-			domainAttached: false,
-		};
 
-		const classifyWork = (): void => {
-			if (runtime.paused || runtime.runActivity === "work") return;
-			runtime.runActivity = "work";
-			if (runtime.domainAttached)
-				void services.processDomain.setBusy(runtime, true).catch(() => {});
-			if (rootIsCurrent(runtime)) {
-				runtime.controller.startRootActiveSegment(services.now());
-				scheduleTimers(runtime, services);
-				updateStatus(runtime, services);
-				return;
-			}
-			const root = getHub<Runtime>().root?.value;
-			const binding = runtime.observerBinding;
-			if (
-				!root ||
-				!rootIsCurrent(root) ||
-				!binding ||
-				binding.observerAttachmentToken !== runtime.token ||
-				binding.rootGeneration !== root.root.generation
-			)
-				return;
-			root.controller.startObserverRun(runtime.token, services.now());
-			scheduleTimers(root, services);
-			updateStatus(root, services);
-		};
-
-		const classifyMessage = (message: { readonly role?: unknown }): void => {
-			if (message.role === "user") {
-				classifyWork();
-				return;
-			}
-			if (runtime.runActivity === "pending") classifyWork();
-		};
+		pi.registerCommand(REFLECT_COMMAND, {
+			description:
+				"Queue an immediate reflection with optional user supplement",
+			handler: async (args, ctx) => {
+				if (!commandIsCurrent(runtime, ctx)) return;
+				queueManualReflection(runtime, args.trim() || undefined);
+				ctx.ui.notify("Reflection queued.", "info");
+			},
+		});
 
 		pi.on("session_start", async (_event, ctx) => {
-			const hub = getHub<Runtime>();
-			if (runtime.state !== "new") return;
-			// Pi command contexts are distinct wrappers, but retain this exact
-			// session-owned manager plus its stable ID from session_start.
-			runtime.sessionManager = ctx.sessionManager;
-			runtime.sessionId = ctx.sessionManager.getSessionId();
-			runtime.token = allocateAttachmentToken(hub, runtime.sessionId);
-			runtime.state = "loading";
-			// Claim ownership before awaiting configuration. This atomic priority
-			// decision lets a UI claim replace a fallback while preventing delayed
-			// equal/lower-priority callbacks from stealing it afterward.
-			const claim = claimRoot(hub, runtime.token, priority(ctx), runtime);
-			if (!claim) {
-				runtime.state = "observer";
+			if (runtime.ctx !== null || runtime.stopped) return;
+			runtime.ctx = ctx;
+			runtime.localBusy = probePiAgentState(ctx).busy;
+			try {
+				await runtime.processDomain.attach(runtime.attachmentInstance, {
+					getBusy: () => {
+						if (runtime.ctx === null) return false;
+						return (
+							probePiAgentState(runtime.ctx).busy &&
+							runtime.internalRun.kind === "none"
+						);
+					},
+					onFatal: (error) => {
+						if (!isReflectDomainFatalError(error)) return;
+						runtime.domainFatal = true;
+						services.fatalExit.fail(error, ctx);
+					},
+				});
+				runtime.domainAttached = true;
+			} catch (error) {
+				runtime.domainFatal = true;
+				services.fatalExit.fail(
+					error instanceof Error ? error : new Error("process domain failed"),
+					ctx,
+				);
 				return;
 			}
-			runtime.root = { generation: claim.root.generation };
-			if (claim.replaced) deactivate(claim.replaced.value, services);
-			const loaded = await services.loadConfig(ctx.cwd, ctx.isProjectTrusted());
-			// A shutdown/replacement has no cancellation hook; all post-await work is inert.
-			if (
-				runtime.state !== "loading" ||
-				!isCurrentRoot(hub, runtime.token, claim.root.generation)
-			)
-				return;
-			runtime.ctx = ctx;
-			runtime.controller = new TaskController(
-				controllerOptionsFromConfig(loaded.config),
+			const bound = hub.bind({
+				instance: runtime.attachmentInstance,
+				sessionId: ctx.sessionManager.getSessionId(),
+				hasUI: ctx.hasUI,
+				initialBusy: runtime.localBusy,
+			});
+			runtime.attachment = bound.attachment;
+			runtime.claim = hub.mainClaimFor(bound.attachment);
+			runtime.unsubscribeHub = hub.subscribe(() =>
+				syncOwnership(runtime, services),
 			);
+			runtime.unsubscribeDomain = runtime.processDomain.subscribe(
+				(counters) => {
+					runtime.latestCounters = counters;
+					latchAutomaticReflection(runtime);
+					refreshWidget(runtime);
+					scheduleRefresh(runtime, services);
+					maybeDispatch(runtime);
+				},
+			);
+			const loaded = await services.loadConfig(ctx.cwd, ctx.isProjectTrusted());
+			if (runtime.stopped || runtime.ctx !== ctx) return;
 			runtime.config = loaded.config;
-			runtime.state = "root";
+			runtime.processDomain.setIdleResetGapSeconds(
+				runtime.config.idleResetGapSeconds,
+			);
+			runtime.configReady = true;
 			for (const diagnostic of loaded.diagnostics.slice(0, 3))
 				ctx.ui.notify(
 					`pi-reflect-watchdog ${diagnostic.source}: ${diagnostic.message}`,
 					"warning",
 				);
-			let initialAttachComplete = false;
-			let initialExitRequested = false;
-			const exitForInitialDomainFailure = (error: Error): boolean => {
-				if (
-					initialAttachComplete ||
-					initialExitRequested ||
-					!isReflectDomainFatalError(error)
-				)
-					return false;
-				initialExitRequested = true;
-				services.fatalExit.fail(error, ctx);
-				return true;
-			};
-			try {
-				await services.processDomain.attach(runtime, {
-					getBusy: () =>
-						runtime.ctx === undefined
-							? false
-							: probePiAgentState(runtime.ctx).busy,
-					onFatal: (error) => {
-						if (exitForInitialDomainFailure(error)) return;
-						runtime.domainCounters = undefined;
-						ctx.ui.notify(
-							"pi-reflect-watchdog process monitoring is uncertain; cross-process reflection thresholds are paused.",
-							"warning",
-						);
-					},
-				});
-				if (
-					runtime.state !== "root" ||
-					!isCurrentRoot(hub, runtime.token, claim.root.generation)
-				) {
-					await services.processDomain.detach(runtime).catch(() => {});
-					return;
-				}
-				initialAttachComplete = true;
-				runtime.domainAttached = true;
-				services.processDomain.setIdleResetGapSeconds(
-					loaded.config.idleResetGapSeconds,
-				);
-				runtime.domainCounters = services.processDomain.counters();
-				if (services.processDomain.rootProcess) {
-					runtime.domainCounterUnsubscribe = services.processDomain.subscribe(
-						(counters) => {
-							runtime.domainCounters = counters;
-							if (
-								!rootIsCurrent(runtime) ||
-								runtime.activeReflection !== undefined
-							)
-								return;
-							const reasons = domainThresholdReasons(runtime, counters);
-							if (reasons.length === 0) return;
-							enqueueReflection(
-								runtime,
-								services,
-								reasons,
-								thresholdSnapshot(
-									runtime.controller.status(services.now()),
-									counters,
-								),
-							);
-						},
-					);
-				}
-			} catch (error) {
-				const attachError =
-					error instanceof Error ? error : new Error("process domain failed");
-				deactivate(runtime, services);
-				exitForInitialDomainFailure(attachError);
-				return;
-			}
-			const api: ReflectWatchdogApi = {
-				get paused() {
-					return services.processDomain.paused;
-				},
-				pause: () => {
-					// pauseCounting rethrows after its own cleanup; the void API must
-					// not surface an unhandled rejection.
-					void pauseCounting(runtime, services).catch(() => {});
-				},
-				resume: () => {
-					void resumeCounting(runtime, services).catch(() => {});
-				},
-			};
-			runtime.removeApi = installReflectWatchdogApi(api);
-			registerControlTool(pi, runtime, services);
-			registerHistoryTools(pi, runtime);
-			(
-				pi as ExtensionAPI &
-					Partial<Pick<ExtensionAPI, "registerEntryRenderer">>
-			).registerEntryRenderer?.(
-				REFLECTION_ENTRY_TYPE,
-				createReflectionEntryRenderer(),
-			);
-			registerWatchdogCommand(pi, runtime, services);
-			// Recreate the dedicated widget for every fresh root context; TUI
-			// mode uses it as the status UI and never gets a footer status.
-			installWidget(runtime, services);
-			updateStatus(runtime, services);
+			syncOwnership(runtime, services);
 		});
-
-		pi.on("message_start", (event) => {
-			if (event.message.role === "custom") {
-				const active = runtime.activeReflection;
-				const message = event.message as typeof event.message & {
-					readonly customType?: string;
-					readonly details?: {
-						readonly version?: number;
-						readonly namespace?: string;
-						readonly inquiryId?: string;
-						readonly attempt?: number;
-					};
-				};
-				const attempt = active === undefined ? 0 : active.reasks + 1;
-				const correlation = active?.inquiry.correlation(attempt || 1);
-				if (
-					active !== undefined &&
-					correlation !== undefined &&
-					message.customType === REFLECTION_MESSAGE_TYPE &&
-					message.details?.version === correlation.version &&
-					message.details?.namespace === correlation.namespace &&
-					message.details?.inquiryId === correlation.inquiryId &&
-					message.details?.attempt === correlation.attempt
-				) {
-					active.submittedAttempt = attempt;
-					return;
-				}
-			}
-			if (runtime.paused) return;
-			classifyMessage(event.message);
-			if (event.message.role !== "user") return;
-			if (rootIsCurrent(runtime)) {
-				// An interjecting/new root user message replaces a begun activity
-				// window; the finished window is announced exactly once.
-				const snapshot = runtime.controller.startRootTask(
-					services.now(),
-					runtime.controller.status(services.now()).rootActive,
-				);
-				emitActiveCycleFrozenNotification(runtime, snapshot);
-				scheduleTimers(runtime, services);
-				updateStatus(runtime, services);
-				return;
-			}
-			const root = getHub<Runtime>().root?.value;
-			if (!root || !rootIsCurrent(root)) return;
-			const epoch = root.controller.bindObserver(runtime.token);
-			if (epoch === 0) return;
-			runtime.observerBinding = {
-				observerAttachmentToken: runtime.token,
-				rootGeneration: root.root.generation,
-				taskEpoch: epoch,
-			};
-		});
-
-		const observeLiveAgentState = (ctx: ExtensionContext): boolean => {
-			const { busy } = probePiAgentState(ctx);
-			if (runtime.paused) return busy;
-			if (busy) {
-				classifyWork();
-				return true;
-			}
-			if (runtime.domainAttached)
-				void services.processDomain.setBusy(runtime, false).catch(() => {});
-			return false;
-		};
-		runtime.reconcileActivity = () =>
-			runtime.ctx === undefined ? false : observeLiveAgentState(runtime.ctx);
 
 		pi.on("agent_start", (_event, ctx) => {
-			observeLiveAgentState(ctx);
-		});
-		pi.on("agent_settled", (_event, ctx) => {
-			const completedActivity = runtime.runActivity;
-			const idle = !observeLiveAgentState(ctx);
-			if (!idle) return;
-			runtime.runActivity = "pending";
-			if (runtime.paused) {
-				if (
-					runtime.activeReflection !== undefined &&
-					!runtime.resumeAfterReflectionTurn
-				) {
-					runtime.activeReflection = undefined;
-					runtime.reflectionQueue = [];
-					runtime.ctx?.ui.notify(
-						"Reflection aborted before a valid response; watchdog counters resumed.",
-						"warning",
-					);
-					void resumeCounting(runtime, services);
-					return;
-				}
-				if (runtime.resumeAfterReflectionTurn) {
-					runtime.resumeAfterReflectionTurn = false;
-					void resumeCounting(runtime, services);
-				}
-				return;
+			const active = runtime.activeReflection;
+			if (active !== undefined && runtime.internalRun.kind !== "confirmed") {
+				runtime.internalRun = {
+					kind: "provisional",
+					attempt: active.attempt,
+				};
 			}
-			if (completedActivity !== "work") return;
-			if (rootIsCurrent(runtime)) {
-				const snapshot = runtime.controller.settleRootActiveSegment(
-					services.now(),
-				);
-				emitActiveCycleFrozenNotification(runtime, snapshot);
-				scheduleTimers(runtime, services);
-				updateStatus(runtime, services);
-				return;
-			}
-			const root = getHub<Runtime>().root?.value;
-			const binding = runtime.observerBinding;
-			if (
-				!root ||
-				!rootIsCurrent(root) ||
-				!binding ||
-				binding.observerAttachmentToken !== runtime.token ||
-				binding.rootGeneration !== root.root.generation
-			)
-				return;
-			const snapshot = root.controller.settleObserverRun(
-				runtime.token,
-				binding.taskEpoch,
-				services.now(),
-			);
-			emitActiveCycleFrozenNotification(root, snapshot);
-			scheduleTimers(root, services);
-			updateStatus(root, services);
+			observe(runtime, ctx);
 		});
+
+		pi.on("message_start", (event, ctx) => {
+			const active = runtime.activeReflection;
+			if (active?.handle.matchesPrompt(event.message)) {
+				runtime.internalRun = { kind: "confirmed", attempt: active.attempt };
+				observe(runtime, ctx);
+			}
+		});
+
 		pi.on("tool_call", () => {
 			const active = runtime.activeReflection;
-			if (active === undefined) return;
+			if (active === undefined || runtime.internalRun.kind !== "confirmed")
+				return;
 			if (active.toolCalls >= MAX_REFLECTION_TOOL_CALLS)
 				return {
 					block: true,
@@ -1105,466 +657,110 @@ export function createWatchdogExtension(
 				};
 			active.toolCalls += 1;
 		});
-		pi.on("message_end", (event) => {
+
+		const handleMessageEnd = (event: MessageEndEvent) => {
 			const active = runtime.activeReflection;
-			const attempt = active?.submittedAttempt;
-			if (active === undefined || attempt === undefined) return;
-			const text = active.inquiry.capture(event.message);
-			if (text === null) return;
-			active.submittedAttempt = undefined;
-			const replacement = {
-				message: active.inquiry.neutralize(event.message, attempt),
-			};
-			const validation = parseReflectionXml(text);
-			if (!validation.valid) {
-				active.reasks += 1;
-				if (active.reasks < MAX_REFLECTION_REASKS) {
-					active.inquiry.send(
-						runtime.pi,
-						buildReflectionReaskPrompt(validation.error),
-						active.reasks + 1,
-					);
-					return replacement;
-				}
-				runtime.pi.sendMessage(active.inquiry.fold(attempt), {
-					deliverAs: "steer",
-					triggerTurn: false,
-				});
-				finalizeReflection(
-					runtime,
-					services,
-					`Reflection failed: ${validation.error}`,
-				);
-				return replacement;
-			}
-			runtime.pi.sendMessage(active.inquiry.fold(attempt), {
-				deliverAs: "steer",
-				triggerTurn: false,
-			});
-			finalizeReflection(runtime, services, text, validation.decision);
-			return replacement;
-		});
-		pi.on("turn_end", (event) => {
-			if (runtime.paused || event.message.role !== "assistant") return;
+			if (active === undefined) return;
+			const selfRun = runtime.internalRun.kind !== "none";
 			if (
-				event.message.stopReason !== "stop" &&
-				event.message.stopReason !== "toolUse"
+				!selfRun ||
+				(runtime.internalRun.kind === "confirmed" &&
+					runtime.internalRun.attempt !== active.attempt)
 			)
 				return;
-			if (runtime.runActivity === "pending") classifyWork();
-			if (rootIsCurrent(runtime)) {
-				if (runtime.suppressNextRootTurn) {
-					runtime.suppressNextRootTurn = false;
+			const text = active.handle.capture(event.message);
+			if (text === null) return;
+			const validation = parseReflectionXml(text);
+			active.planned = validation.valid
+				? validation.decision
+				: { error: validation.error };
+			return {
+				message: active.handle.neutralize(event.message, {
+					stopReason: "aborted",
+				}),
+			};
+		};
+		(pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
+			"message_end",
+			handleMessageEnd,
+			{ uninterruptible: true },
+		);
+
+		pi.on("turn_end", async (event) => {
+			if (!isSuccessfulTurn(event) || runtime.internalRun.kind !== "none")
+				return;
+			if (owns(runtime)) await runtime.processDomain.recordRootLoop();
+			else await runtime.processDomain.recordAllLoop();
+			latchAutomaticReflection(runtime);
+			refreshWidget(runtime);
+		});
+
+		pi.on("agent_end", () => {});
+		pi.on("agent_settled", (_event, ctx) => {
+			observe(runtime, ctx);
+			const active = runtime.activeReflection;
+			if (active !== undefined && runtime.internalRun.kind !== "none") {
+				const planned = active.planned;
+				runtime.internalRun = { kind: "none" };
+				if (planned !== undefined && "error" in planned) {
+					if (active.attempt < MAX_REFLECTION_REASKS) {
+						const fold = active.handle.complete();
+						if (fold !== null)
+							pi.sendMessage(fold, {
+								deliverAs: "steer",
+								triggerTurn: false,
+							});
+						active.attempt += 1;
+						active.planned = undefined;
+						sendActiveReflection(
+							runtime,
+							buildReflectionReaskPrompt(planned.error),
+						);
+						return;
+					}
+					const fold = active.handle.complete();
+					if (fold !== null)
+						pi.sendMessage(fold, {
+							deliverAs: "steer",
+							triggerTurn: false,
+						});
+					runtime.ctx?.ui.notify(
+						`Reflection failed: ${planned.error}`,
+						"warning",
+					);
+					finishReflection(runtime);
 					return;
 				}
-				const local = runtime.controller.completeRootTurn(services.now());
-				if (runtime.domainAttached) {
-					void services.processDomain.recordRootLoop().then(
-						(counters) => {
-							runtime.domainCounters = counters;
-						},
-						() => {},
-					);
-				} else deliverWarnings(runtime, local, services);
-				updateStatus(runtime, services);
-				return;
-			}
-			if (runtime.domainAttached)
-				void services.processDomain.recordAllLoop().catch(() => {});
-			const root = getHub<Runtime>().root?.value;
-			const binding = runtime.observerBinding;
-			if (
-				!root ||
-				!rootIsCurrent(root) ||
-				!binding ||
-				binding.observerAttachmentToken !== runtime.token ||
-				binding.rootGeneration !== root.root.generation
-			)
-				return;
-			deliverWarnings(
-				root,
-				root.controller.completeObserverTurn(
-					runtime.token,
-					binding.taskEpoch,
-					services.now(),
-				),
-				services,
-			);
-		});
-		pi.on("session_shutdown", () => {
-			services.fatalExit.completeShutdown();
-			runtime.removeApi?.();
-			runtime.removeApi = undefined;
-			if (runtime.state === "shutdown") return;
-			runtime.state = "shutdown";
-			const hub = getHub<Runtime>();
-			// Release the exact hub claim, including a pending one whose
-			// configuration never resolved, so an equal-priority replacement can
-			// become root while the stale resolution stays inert.
-			const generation = runtime.root?.generation;
-			if (
-				generation !== undefined &&
-				releaseRoot(hub, runtime.token, generation)
-			)
-				deactivate(runtime, services);
-			else {
-				const root = hub.root?.value;
-				const binding = runtime.observerBinding;
-				if (
-					root &&
-					rootIsCurrent(root) &&
-					binding &&
-					binding.rootGeneration === root.root.generation
-				) {
-					const snapshot = root.controller.unbindObserver(
-						runtime.token,
-						services.now(),
-						binding.taskEpoch,
-					);
-					emitActiveCycleFrozenNotification(root, snapshot);
-					scheduleTimers(root, services);
-					updateStatus(root, services);
+				if (planned !== undefined) {
+					const fold = active.handle.complete();
+					if (fold !== null)
+						pi.sendMessage(fold, {
+							deliverAs: "steer",
+							triggerTurn: false,
+						});
+					finishReflection(runtime, planned);
+					return;
 				}
-				clearTimers(runtime, services);
-				clearWidget(runtime);
-				runtime.observerBinding = undefined;
+				const fold = active.handle.cancel();
+				if (fold !== null)
+					pi.sendMessage(fold, {
+						deliverAs: "steer",
+						triggerTurn: false,
+					});
+				finishReflection(runtime);
+				return;
 			}
+			latchAutomaticReflection(runtime);
+			maybeDispatch(runtime);
+		});
+
+		pi.on("session_shutdown", () => {
+			shutdownRuntime(runtime, services);
+			services.fatalExit.completeShutdown();
 		});
 	};
 }
 
-export default createWatchdogExtension();
-
-function commandIsCurrent(
-	runtime: Runtime,
-	ctx: ExtensionCommandContext,
-): runtime is Runtime & {
-	root: { generation: number };
-	controller: TaskController;
-	ctx: ExtensionContext;
-	sessionManager: ExtensionContext["sessionManager"];
-} {
-	// Pi wraps event and command contexts separately. The
-	// session manager is the stable session-owned object shared by those
-	// wrappers; pair it with the session ID and current hub token/generation.
-	return (
-		rootIsCurrent(runtime) &&
-		runtime.sessionManager !== undefined &&
-		ctx.sessionManager === runtime.sessionManager &&
-		ctx.sessionManager.getSessionId() === runtime.sessionId
-	);
-}
-
-function userStatusText(runtime: Runtime, services: RuntimeServices): string {
-	const status = runtime.controller?.status(services.now());
-	if (!status) return "Watchdog is not active for this session.";
-	return [
-		"Watchdog status",
-		`root loops: ${status.rootLoops}`,
-		`other agent loops: ${status.otherAgentLoops}`,
-		`observable agent sessions: ${status.observableAgentSessions}`,
-		`all loops: ${status.allLoops}`,
-		`active window: ${formatDuration(status.activity.elapsedMs)}/${status.activity.loops} loops`,
-		`task time: ${elapsed(status.taskElapsedMs)}`,
-		`limits: root=${status.limits.rootLoopLimit}; all=${status.limits.allLoopLimit}; task=${status.limits.taskMinutes}m; idle-reset-gap=${status.limits.idleResetGapSeconds}s`,
-		`configured defaults: root=${status.configuredLimits.rootLoopLimit}; all=${status.configuredLimits.allLoopLimit}; task=${status.configuredLimits.taskMinutes}m; idle-reset-gap=${status.configuredLimits.idleResetGapSeconds}s`,
-		`latched warnings: ${status.latchedWarnings.join(", ") || "none"}`,
-		`coverage: ${status.coverage}`,
-	].join("\n");
-}
-
-function notifyCommand(
-	ctx: ExtensionCommandContext,
-	message: string,
-	kind: "info" | "warning" | "error" = "info",
-): void {
-	ctx.ui.notify(message, kind);
-}
-
-function notifyCommandWarnings(
-	ctx: ExtensionCommandContext,
-	warnings: readonly ReflectionTriggerReason[],
-): void {
-	if (warnings.length !== 0)
-		notifyCommand(ctx, `Reflection queued: ${warnings.join(", ")}`, "warning");
-}
-
-function registerWatchdogCommand(
-	pi: ExtensionAPI,
-	runtime: Runtime,
-	services: RuntimeServices,
-): void {
-	if (runtime.commandRegistered) return;
-	runtime.commandRegistered = true;
-	// Pi has no public command unregistration. Registration occurs only after
-	// this attachment wins root ownership; a stale handler validates generation
-	// and context before reading or changing any current root state.
-	pi.registerCommand(REFLECT_WATCHDOG_COMMAND, {
-		description: "Inspect and control the current reflection watchdog cycle",
-		async handler(args, ctx) {
-			// Never read the stale wrapper's UI before proving stable session identity.
-			if (!commandIsCurrent(runtime, ctx)) return;
-			const parsed = parseReflectWatchdogCommand(args);
-			if ("error" in parsed) {
-				notifyCommand(ctx, parsed.error, "error");
-				return;
-			}
-			const current = services.now();
-			switch (parsed.command.action) {
-				case "status":
-					notifyCommand(ctx, userStatusText(runtime, services));
-					return;
-				case "pause":
-					await pauseCounting(runtime, services);
-					notifyCommand(ctx, "Watchdog counting paused.");
-					return;
-				case "resume":
-					await resumeCounting(runtime, services);
-					notifyCommand(ctx, "Watchdog counting resumed.");
-					return;
-				case "reset":
-					runtime.controller.resetReminderCycle(current);
-					await services.processDomain
-						.resetReminderCycle()
-						.catch(() => undefined);
-					runtime.domainCounters = services.processDomain.counters();
-					scheduleTimers(runtime, services);
-					updateStatus(runtime, services);
-					notifyCommand(
-						ctx,
-						"Watchdog task cycle reset. Active window is unchanged.",
-					);
-					return;
-				case "limits-show":
-					notifyCommand(ctx, userStatusText(runtime, services));
-					return;
-				case "limits-set": {
-					const transition = runtime.controller.setLimits(
-						parsed.command,
-						current,
-					);
-					services.processDomain.setIdleResetGapSeconds(
-						parsed.command.idleResetGapSeconds,
-					);
-					scheduleTimers(runtime, services);
-					notifyCommandWarnings(ctx, transition.warnings);
-					updateStatus(runtime, services);
-					notifyCommand(ctx, "Watchdog current-task limits updated.");
-					return;
-				}
-				case "limits-reset": {
-					const transition =
-						runtime.controller.restoreConfiguredDefaults(current);
-					const configured =
-						runtime.controller.status(current).configuredLimits;
-					services.processDomain.setIdleResetGapSeconds(
-						configured.idleResetGapSeconds,
-					);
-					scheduleTimers(runtime, services);
-					notifyCommandWarnings(ctx, transition.warnings);
-					updateStatus(runtime, services);
-					notifyCommand(
-						ctx,
-						"Watchdog configured limits restored for this task.",
-					);
-					return;
-				}
-			}
-		},
-	});
-	pi.registerCommand(REFLECT_COMMAND, {
-		description: "Queue an immediate reflection with optional user supplement",
-		handler: async (args, ctx) => {
-			if (!commandIsCurrent(runtime, ctx)) return;
-			const status = runtime.controller.status(services.now());
-			enqueueReflection(
-				runtime,
-				services,
-				["USER_REQUEST"],
-				thresholdSnapshot(status, runtime.domainCounters),
-				args.trim() || undefined,
-			);
-			notifyCommand(ctx, "Reflection queued.");
-		},
-	});
-	pi.registerCommand(REFLECT_TIMELINE_COMMAND, {
-		description: "Show completed reflections on the current session branch",
-		handler: async (_args, ctx) => {
-			if (!commandIsCurrent(runtime, ctx)) return;
-			await showReflectionTimeline(ctx, reflectionHistory(ctx.sessionManager));
-		},
-	});
-}
-
-function registerHistoryTools(pi: ExtensionAPI, runtime: Runtime): void {
-	pi.registerTool({
-		name: HISTORY_COUNT_TOOL_NAME,
-		label: "Reflection History Count",
-		description:
-			"Return the number of completed valid reflections on the current session branch.",
-		parameters: Type.Object({}),
-		async execute() {
-			if (!rootIsCurrent(runtime) || runtime.sessionManager === undefined)
-				throw new Error(
-					"reflect_history_count is available only to the current root session",
-				);
-			const count = reflectionHistory(runtime.sessionManager).length;
-			return {
-				content: [{ type: "text", text: String(count) }],
-				details: { count },
-			};
-		},
-	});
-	pi.registerTool({
-		name: HISTORY_GET_TOOL_NAME,
-		label: "Reflection History Get",
-		description:
-			"Get completed reflections by exactly one 1-based selector: latest, index, or range.",
-		parameters: Type.Object({
-			latest: Type.Optional(Type.Boolean()),
-			index: Type.Optional(
-				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-			),
-			range: Type.Optional(
-				Type.Object({
-					start: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-					end: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-				}),
-			),
-		}),
-		async execute(_id, params) {
-			if (!rootIsCurrent(runtime) || runtime.sessionManager === undefined)
-				throw new Error(
-					"reflect_history_get is available only to the current root session",
-				);
-			const selectors = [
-				params.latest === true,
-				params.index !== undefined,
-				params.range !== undefined,
-			].filter(Boolean).length;
-			if (selectors !== 1)
-				throw new Error("provide exactly one of latest, index, or range");
-			const history = reflectionHistory(runtime.sessionManager);
-			let firstOrdinal = 1;
-			let entries: ReflectionHistoryEntry[];
-			if (params.latest === true) {
-				entries = queryReflectionHistory(history, { latest: true });
-			} else if (params.index !== undefined) {
-				firstOrdinal = params.index;
-				entries = queryReflectionHistory(history, { index: params.index });
-			} else {
-				if (params.range === undefined) throw new Error("range is required");
-				firstOrdinal = params.range.start;
-				entries = queryReflectionHistory(history, { range: params.range });
-			}
-			return {
-				content: [
-					{ type: "text", text: formatHistoryResult(entries, firstOrdinal) },
-				],
-				details: { entries, firstOrdinal, total: history.length },
-			};
-		},
-	});
-	pi.setActiveTools([
-		...new Set([
-			...pi.getActiveTools(),
-			HISTORY_COUNT_TOOL_NAME,
-			HISTORY_GET_TOOL_NAME,
-		]),
-	]);
-}
-
-function registerControlTool(
-	pi: ExtensionAPI,
-	runtime: Runtime,
-	services: RuntimeServices,
-): void {
-	runtime.toolRegistered = true;
-	pi.registerTool({
-		name: TOOL_NAME,
-		label: "Reflect Watchdog Control",
-		description:
-			"Inspect or adjust current-task reflection watchdog counters and limits. Use after a genuine reassessment, not merely to silence a warning.",
-		promptSnippet:
-			"Inspect or adjust current reflection watchdog limits after reassessing work",
-		promptGuidelines: [
-			"Use reflect_watchdog_control to inspect or deliberately adjust the current task's reflection watchdog; do not reset it mechanically just to silence a warning.",
-		],
-		parameters: Type.Object({
-			action: StringEnum(["status", "reset", "set_limits", "restore_defaults"]),
-			rootLoopLimit: Type.Optional(
-				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-			),
-			allLoopLimit: Type.Optional(
-				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-			),
-			taskMinutes: Type.Optional(
-				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-			),
-			idleResetGapSeconds: Type.Optional(
-				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-			),
-		}),
-		async execute(_id, params) {
-			if (!rootIsCurrent(runtime))
-				throw new Error(
-					"reflect_watchdog_control is available only to the current root session",
-				);
-			const current = services.now();
-			let transition: ControllerTransition = { warnings: [] };
-			if (params.action === "reset") {
-				runtime.controller.resetReminderCycle(current);
-				await services.processDomain
-					.resetReminderCycle()
-					.catch(() => undefined);
-				runtime.domainCounters = services.processDomain.counters();
-			} else if (params.action === "set_limits") {
-				const limits = {
-					rootLoopLimit: params.rootLoopLimit,
-					allLoopLimit: params.allLoopLimit,
-					taskMinutes: params.taskMinutes,
-					idleResetGapSeconds: params.idleResetGapSeconds,
-				};
-				const values = Object.values(limits).filter(
-					(value) => value !== undefined,
-				);
-				if (values.length === 0)
-					throw new Error(
-						"set_limits requires at least one positive safe integer",
-					);
-				if (!values.every(positiveSafeInteger))
-					throw new Error(
-						"set_limits accepts only positive safe integer limits",
-					);
-				transition = runtime.controller.setLimits(limits, current, true);
-				if (limits.idleResetGapSeconds !== undefined)
-					services.processDomain.setIdleResetGapSeconds(
-						limits.idleResetGapSeconds,
-					);
-			} else if (params.action === "restore_defaults") {
-				transition = runtime.controller.restoreConfiguredDefaults(
-					current,
-					true,
-				);
-				services.processDomain.setIdleResetGapSeconds(
-					runtime.controller.status(current).configuredLimits
-						.idleResetGapSeconds,
-				);
-			}
-			if (!deliverWarnings(runtime, transition, services))
-				scheduleTimers(runtime, services);
-			updateStatus(runtime, services);
-			const status = runtime.controller.status(current);
-			return {
-				content: [
-					{
-						type: "text",
-						text: `reflect_watchdog ${params.action}\nroot loops: ${status.rootLoops}\nother agent loops: ${status.otherAgentLoops}\nobservable agent sessions: ${status.observableAgentSessions}\nall loops: ${status.allLoops}\nlimits: root=${status.limits.rootLoopLimit}; all=${status.limits.allLoopLimit}; task=${status.limits.taskMinutes}m; idle-reset-gap=${status.limits.idleResetGapSeconds}s\ntask elapsed: ${elapsed(status.taskElapsedMs)}\nroot active: ${status.rootActive}\nlatched warnings: ${status.latchedWarnings.join(", ") || "none"}\ncoverage: ${status.coverage}`,
-					},
-				],
-				details: status,
-			};
-		},
-	});
-	pi.setActiveTools([...new Set([...pi.getActiveTools(), TOOL_NAME])]);
+export default function registerWatchdogExtension(pi: ExtensionAPI): void {
+	createWatchdogExtension()(pi);
 }

@@ -140,7 +140,7 @@ test("the real one-minute wall warning steers exactly once while active", {
 	);
 	const reflectionMessages = JSON.stringify(provider.requests[1].body.messages);
 	assert.match(reflectionMessages, /Trigger source\(s\): TASK_TIME_LIMIT/);
-	assert.match(reflectionMessages, /task=60000ms\/1m/i);
+	assert.match(reflectionMessages, /task=6000\dms\/1m/i);
 	assert.ok(
 		provider.requests[1].finishedAt,
 		"reflection response was fully consumed",

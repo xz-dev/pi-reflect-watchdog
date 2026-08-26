@@ -1,11 +1,11 @@
-/* biome-ignore-all lint/suspicious/noExplicitAny: focused fake implements a dynamic ExtensionAPI event registry */
+/* biome-ignore-all lint/suspicious/noExplicitAny: focused dynamic Pi lifecycle fake */
 import assert from "node:assert/strict";
 import test from "node:test";
+
 import { createWatchdogExtension } from "../src/extension.js";
 import {
-	HUB_SYMBOL,
-	REFLECT_WATCHDOG_API_SYMBOL,
-	type ReflectWatchdogApi,
+	createObservableAgentHub,
+	type ObservableAgentHub,
 } from "../src/hub.js";
 import type {
 	ReflectDomainCoordinator,
@@ -14,556 +14,531 @@ import type {
 import { DEFAULT_REFLECTION_PROMPT } from "../src/prompts.js";
 
 class Pi {
-	handlers = new Map<string, (event: any, ctx: any) => any>();
-	commands: Array<{ name: string; handler: (args: string, ctx: any) => any }> =
-		[];
-	tools: any[] = [];
-	messages: any[] = [];
-	entries: any[] = [];
-	activeTools = ["read"];
+	readonly handlers = new Map<string, (event: any, ctx: any) => any>();
+	readonly commands: Array<{
+		name: string;
+		handler: (args: string, ctx: any) => any;
+	}> = [];
+	readonly messages: Array<{ message: any; options: any }> = [];
+
 	on(name: string, handler: (event: any, ctx: any) => any) {
 		this.handlers.set(name, handler);
 	}
+
 	registerCommand(name: string, command: any) {
 		this.commands.push({ name, handler: command.handler });
 	}
-	registerTool(tool: any) {
-		this.tools.push(tool);
-	}
-	registerEntryRenderer() {}
-	appendEntry(type: string, data: unknown) {
-		this.entries.push({ type, data });
-	}
-	getActiveTools() {
-		return this.activeTools;
-	}
-	setActiveTools(names: string[]) {
-		this.activeTools = names;
-	}
+
 	sendMessage(message: unknown, options: unknown) {
 		this.messages.push({ message, options });
 	}
+
 	async emit(name: string, event: any, ctx: any) {
 		return await this.handlers.get(name)?.(event, ctx);
 	}
 }
 
-function context() {
-	const notifications: Array<[string, string | undefined]> = [];
-	const manager = {
-		getSessionId: () => "root",
-		getBranch: () => [],
-	};
-	let idle = false;
+function counter(value = 0n) {
+	return { value };
+}
+
+class FakeDomain implements ReflectDomainCoordinator {
+	readonly rootProcess = true;
+	readonly activityWrites: boolean[] = [];
+	rootWrites = 0;
+	allWrites = 0;
+	resetWrites = 0;
+	private revision = 1n;
+	private readonly attachments = new Map<object, boolean>();
+	private readonly listeners = new Set<
+		(counters: ReflectDomainCounters) => void
+	>();
+	private value: ReflectDomainCounters = this.snapshot();
+
+	async attach(
+		instance: object,
+		options: { getBusy: () => boolean; onFatal: (error: Error) => void },
+	) {
+		this.attachments.set(instance, options.getBusy());
+		this.refreshBusy();
+	}
+
+	async detach(instance: object) {
+		this.attachments.delete(instance);
+		this.refreshBusy();
+	}
+
+	async setBusy(instance: object, busy: boolean) {
+		this.activityWrites.push(busy);
+		this.attachments.set(instance, busy);
+		this.refreshBusy();
+	}
+
+	async recordRootLoop() {
+		this.rootWrites += 1;
+		this.value = this.next({
+			activeLoops: this.value.activeLoops.value + 1n,
+			rootLoops: this.value.rootLoops.value + 1n,
+			allLoops: this.value.allLoops.value + 1n,
+		});
+		this.publish();
+		return this.value;
+	}
+
+	async recordAllLoop() {
+		this.allWrites += 1;
+		this.value = this.next({
+			activeLoops: this.value.activeLoops.value + 1n,
+			allLoops: this.value.allLoops.value + 1n,
+		});
+		this.publish();
+		return this.value;
+	}
+
+	counters() {
+		return this.value;
+	}
+
+	subscribe(listener: (counters: ReflectDomainCounters) => void) {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	setIdleResetGapSeconds() {}
+
+	async resetReminderCycle() {
+		this.resetWrites += 1;
+		this.value = this.next({ taskMs: 0n, rootLoops: 0n, allLoops: 0n });
+		this.publish();
+		return this.value;
+	}
+
+	setRemoteBusy(value: boolean) {
+		this.value = {
+			...this.value,
+			revision: ++this.revision,
+			generation: this.revision,
+			anyBusy: this.value.localBusy || value,
+			otherBusy: value,
+			fence: { domainEpoch: "domain", generation: this.revision },
+		};
+		this.publish();
+	}
+
+	setCounters(input: {
+		activeMs?: bigint;
+		activeLoops?: bigint;
+		taskMs?: bigint;
+		rootLoops?: bigint;
+		allLoops?: bigint;
+	}) {
+		this.value = this.next(input);
+		this.publish();
+	}
+
+	private refreshBusy() {
+		const localBusy = [...this.attachments.values()].some(Boolean);
+		if (localBusy === this.value.localBusy) return;
+		this.value = {
+			...this.value,
+			revision: ++this.revision,
+			generation: this.revision,
+			anyBusy: localBusy || this.value.otherBusy,
+			localBusy,
+			fence: { domainEpoch: "domain", generation: this.revision },
+		};
+		this.publish();
+	}
+
+	private next(input: {
+		activeMs?: bigint;
+		activeLoops?: bigint;
+		taskMs?: bigint;
+		rootLoops?: bigint;
+		allLoops?: bigint;
+	}): ReflectDomainCounters {
+		this.revision += 1n;
+		return {
+			...this.value,
+			revision: this.revision,
+			generation: this.revision,
+			fence: { domainEpoch: "domain", generation: this.revision },
+			activeMs: counter(input.activeMs ?? this.value.activeMs.value),
+			activeLoops: counter(input.activeLoops ?? this.value.activeLoops.value),
+			taskMs: counter(input.taskMs ?? this.value.taskMs.value),
+			rootLoops: counter(input.rootLoops ?? this.value.rootLoops.value),
+			allLoops: counter(input.allLoops ?? this.value.allLoops.value),
+		};
+	}
+
+	private snapshot(): ReflectDomainCounters {
+		return {
+			domainEpoch: "domain",
+			revision: this.revision,
+			generation: this.revision,
+			certain: true,
+			anyBusy: false,
+			localBusy: false,
+			otherBusy: false,
+			endLoopTimeMs: null,
+			fence: { domainEpoch: "domain", generation: this.revision },
+			activeMs: counter(),
+			activeLoops: counter(),
+			taskMs: counter(),
+			rootLoops: counter(),
+			allLoops: counter(),
+		};
+	}
+
+	private publish() {
+		for (const listener of this.listeners) listener(this.value);
+	}
+}
+
+function context(
+	sessionId = "root",
+	options: { idle?: boolean; hasUI?: boolean } = {},
+) {
+	let idle = options.idle ?? true;
+	let pendingMessages = false;
+	const notifications: string[] = [];
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<unknown> = [];
+	const manager = { getSessionId: () => sessionId, getBranch: () => [] };
 	return {
-		hasUI: true,
+		hasUI: options.hasUI ?? true,
 		mode: "rpc",
-		cwd: "/work",
+		cwd: `/work/${sessionId}`,
 		isProjectTrusted: () => false,
 		isIdle: () => idle,
-		setIdle: (value: boolean) => {
+		hasPendingMessages: () => pendingMessages,
+		abort() {},
+		setIdle(value: boolean) {
 			idle = value;
+		},
+		setPendingMessages(value: boolean) {
+			pendingMessages = value;
 		},
 		sessionManager: manager,
 		ui: {
-			notify: (text: string, kind?: string) => notifications.push([text, kind]),
-			setStatus() {},
-			setWidget() {},
+			notify(text: string) {
+				notifications.push(text);
+			},
+			setStatus(_key: string, text?: string) {
+				statuses.push(text);
+			},
+			setWidget(_key: string, value?: unknown) {
+				widgets.push(value);
+			},
 		},
 		notifications,
+		statuses,
+		widgets,
 	};
 }
 
-function reset() {
-	delete (globalThis as any)[HUB_SYMBOL];
-	delete (globalThis as any)[REFLECT_WATCHDOG_API_SYMBOL];
-}
-
-function counter() {
-	return { value: 0n, paused: false };
-}
-
-const counters: ReflectDomainCounters = {
-	domainEpoch: "domain",
-	revision: 1n,
-	generation: 1n,
-	certain: true,
-	anyBusy: false,
-	endLoopTimeMs: null,
-	fence: { domainEpoch: "domain", generation: 1n },
-	activeMs: counter(),
-	activeLoops: counter(),
-	taskMs: counter(),
-	rootLoops: counter(),
-	allLoops: counter(),
+const config = {
+	rootLoopLimit: 2,
+	allLoopLimit: 3,
+	taskMinutes: 30,
+	idleResetGapSeconds: 60,
+	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 };
 
-function fakeDomain(activityWrites: boolean[] = []): ReflectDomainCoordinator {
-	let rootLoops = 0n;
-	let allLoops = 0n;
-	let activeLoops = 0n;
-	let snapshot = counters;
-	const listeners = new Set<(value: ReflectDomainCounters) => void>();
-	return {
-		rootProcess: true,
-		get paused() {
-			return snapshot.activeMs.paused;
+function install(
+	options: {
+		hub?: ObservableAgentHub;
+		domain?: FakeDomain;
+		ctx?: ReturnType<typeof context>;
+		limits?: Partial<typeof config>;
+	} = {},
+) {
+	const pi = new Pi();
+	const ctx = options.ctx ?? context();
+	const domain = options.domain ?? new FakeDomain();
+	createWatchdogExtension({
+		hub: options.hub ?? createObservableAgentHub(),
+		processDomain: domain,
+		services: {
+			loadConfig: async () => ({
+				config: { ...config, ...options.limits },
+				diagnostics: [],
+			}),
 		},
-		async attach() {},
-		async detach() {},
-		async setBusy(_instance, busy) {
-			activityWrites.push(busy);
-		},
-		async recordRootLoop() {
-			rootLoops += 1n;
-			allLoops += 1n;
-			activeLoops += 1n;
-			snapshot = {
-				...snapshot,
-				rootLoops: { ...snapshot.rootLoops, value: rootLoops },
-				allLoops: { ...snapshot.allLoops, value: allLoops },
-				activeLoops: { ...snapshot.activeLoops, value: activeLoops },
-			};
-			for (const listener of listeners) listener(snapshot);
-			return snapshot;
-		},
-		async recordAllLoop() {
-			return snapshot;
-		},
-		counters: () => snapshot,
-		subscribe(listener) {
-			listeners.add(listener);
-			return () => listeners.delete(listener);
-		},
-		setIdleResetGapSeconds() {},
-		async resetReminderCycle() {
-			return snapshot;
-		},
-		async pause() {
-			snapshot = {
-				...snapshot,
-				activeMs: { ...snapshot.activeMs, paused: true },
-				activeLoops: { ...snapshot.activeLoops, paused: true },
-				taskMs: { ...snapshot.taskMs, paused: true },
-				rootLoops: { ...snapshot.rootLoops, paused: true },
-				allLoops: { ...snapshot.allLoops, paused: true },
-			};
-			return snapshot;
-		},
-		async resume() {
-			snapshot = {
-				...snapshot,
-				activeMs: { ...snapshot.activeMs, paused: false },
-				activeLoops: { ...snapshot.activeLoops, paused: false },
-				taskMs: { ...snapshot.taskMs, paused: false },
-				rootLoops: { ...snapshot.rootLoops, paused: false },
-				allLoops: { ...snapshot.allLoops, paused: false },
-			};
-		},
-	};
-}
-
-const validNoIssue =
-	"<reflection><type>NO_ISSUE</type><reason>sound</reason><done>checked</done><current_step>verify</current_step><next_step>continue</next_step></reflection>";
-const validCorrection =
-	"<reflection><type>ROUTE_CORRECTION</type><reason>wrong route</reason><done>checked</done><current_step>replace</current_step><next_step>use corrected route</next_step></reflection>";
-
-function assistant(text: string) {
-	return { message: { role: "assistant", content: [{ type: "text", text }] } };
+	})(pi as any);
+	return { pi, ctx, domain };
 }
 
 function turnEnd(stopReason: string) {
 	return { message: { role: "assistant", stopReason } };
 }
 
-async function submitReflection(pi: Pi, ctx: ReturnType<typeof context>) {
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	const message = pi.messages.at(-1)?.message;
-	assert.ok(message);
-	await pi.emit(
-		"message_start",
-		{ message: { role: "custom", ...message } },
-		ctx,
-	);
+function lastInquiry(pi: Pi) {
+	return pi.messages.findLast(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry"),
+	)?.message;
 }
 
-function install() {
-	reset();
-	const pi = new Pi();
-	const ctx = context();
-	const activityWrites: boolean[] = [];
-	const extension = createWatchdogExtension({
-		processDomain: fakeDomain(activityWrites),
-		loadConfig: async () => ({
-			config: {
-				rootLoopLimit: 2,
-				allLoopLimit: 3,
-				taskMinutes: 30,
-				idleResetGapSeconds: 60,
-				reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
-			},
-			diagnostics: [],
-		}),
-	});
-	extension(pi as any);
-	return { pi, ctx, activityWrites };
-}
-
-test("root registers new commands, history tools, and no legacy command aliases", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	assert.deepEqual(
-		pi.commands.map((item) => item.name),
-		["reflect-watchdog", "reflect", "reflect-timeline"],
-	);
-	assert.deepEqual(
-		pi.tools.map((tool) => tool.name),
-		[
-			"reflect_watchdog_control",
-			"reflect_history_count",
-			"reflect_history_get",
-		],
-	);
-});
-
-test("/reflect queues one fixed-context inquiry with explicit empty supplement", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("", ctx);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(pi.messages.length, 1);
-	assert.match(
-		pi.messages[0].message.content,
-		/Trigger source\(s\): USER_REQUEST/,
-	);
-	assert.match(pi.messages[0].message.content, /User supplement: \(none\)/);
-	assert.equal(pi.messages[0].options.triggerTurn, true);
-	assert.deepEqual(pi.messages[0].message.details, {
-		version: 1,
-		namespace: "pi-reflect-watchdog",
-		inquiryId: "reflection-1",
-		attempt: 1,
-	});
-});
-
-test("unrelated custom inquiries fail closed to ordinary work", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.emit("agent_start", {}, ctx);
+async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
+	const prompt = lastInquiry(pi);
+	assert.ok(prompt);
 	await pi.emit(
 		"message_start",
 		{
 			message: {
 				role: "custom",
-				customType: "unrelated:inquiry",
-				details: {
-					version: 1,
-					namespace: "unrelated",
-					inquiryId: "foreign",
-					attempt: 1,
-				},
+				customType: prompt.customType,
+				details: prompt.details,
 			},
 		},
 		ctx,
 	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [true, false]);
-});
+}
 
-test("live Pi state reopens activity after a completed round", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
+function assistant(text: string) {
+	return { message: { role: "assistant", content: [{ type: "text", text }] } };
+}
 
+const validNoIssue =
+	"<reflection><type>NO_ISSUE</type><reason>sound</reason><done>checked</done><current_step>verify</current_step><next_step>continue</next_step></reflection>";
+const validCorrection =
+	"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>verify</current_step><next_step>continue differently</next_step></reflection>";
+
+async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	await correlateReflection(pi, ctx);
+}
 
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	assert.deepEqual(activityWrites, [true, false, true]);
-});
-
-test("a false-idle settled event cannot freeze a live run", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
-
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [true]);
-
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [true, false]);
-});
-
-test("user input remains ordinary work during unrelated custom traffic", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("message_start", { message: { role: "custom" } }, ctx);
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [true, false]);
-});
-
-test("unknown activity metadata fails closed to ordinary work", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit(
-		"message_start",
-		{
-			message: {
-				role: "custom",
-				customType: "pi-reflect-watchdog:inquiry",
-				details: {
-					version: 2,
-					namespace: "pi-reflect-watchdog",
-					inquiryId: "forged",
-					attempt: 1,
-				},
-			},
-		},
-		ctx,
-	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(activityWrites, [true, false]);
-});
-
-test("public API and command pause every loop then resume from current live state", async () => {
-	const { pi, ctx, activityWrites } = install();
-	await pi.emit("session_start", {}, ctx);
-	const api = (globalThis as any)[
-		REFLECT_WATCHDOG_API_SYMBOL
-	] as ReflectWatchdogApi;
-	assert.equal(api.paused, false);
-
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await api.pause();
-	assert.equal(api.paused, true);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
-	assert.equal(pi.messages.length, 0);
-
-	ctx.setIdle(true);
-	await api.resume();
-	assert.equal(api.paused, false);
-	assert.deepEqual(activityWrites, [true, false]);
-
-	const command = pi.commands.find((item) => item.name === "reflect-watchdog");
-	assert.ok(command);
-	await command.handler("pause", ctx);
-	assert.equal(api.paused, true);
-	ctx.setIdle(false);
-	await command.handler("resume", ctx);
-	assert.equal(api.paused, false);
-	assert.deepEqual(activityWrites, [true, false, true]);
-});
-
-test("message traffic cannot reopen local activity while paused", async () => {
+test("minimal core exposes only /reflect and no model tools", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
-	const api = (globalThis as any)[
-		REFLECT_WATCHDOG_API_SYMBOL
-	] as ReflectWatchdogApi;
+	assert.deepEqual(
+		pi.commands.map((command) => command.name),
+		["reflect"],
+	);
+	assert.equal("registerTool" in pi, false);
+});
 
+test("authoritative domain loops trigger the ask from ordinary work", async () => {
+	const { pi, ctx, domain } = install();
+	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
-	await api.pause();
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
-	await pi.emit("message_start", { message: { role: "assistant" } }, ctx);
-	await pi.emit("message_start", { message: { role: "toolResult" } }, ctx);
-	ctx.setIdle(true);
-	await api.resume();
-
-	const command = pi.commands.find((item) => item.name === "reflect-watchdog");
-	assert.ok(command);
-	await command.handler("status", ctx);
-	assert.match(ctx.notifications.at(-1)?.[0] ?? "", /root loops: 0/);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(pi.messages.length, 0, "one loop remains below threshold");
+	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
+	assert.equal(domain.rootWrites, 2);
+	assert.equal(domain.allWrites, 0);
 	assert.match(
-		ctx.notifications.at(-1)?.[0] ?? "",
-		/active window: 0s\/0 loops/,
+		lastInquiry(pi)?.content ?? "",
+		/ROOT_LOOP_LIMIT/,
+		"threshold reflection steers the current ordinary run",
 	);
-});
-
-test("only successful model outcomes count toward loop thresholds", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("message_start", { message: { role: "user" } }, ctx);
-
-	for (const stopReason of ["error", "aborted", "length"])
-		await pi.emit("turn_end", turnEnd(stopReason), ctx);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(pi.messages.length, 0);
-
+	await correlateReflection(pi, ctx);
+	await pi.emit("message_end", assistant(validNoIssue), ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(pi.messages.length, 1);
-	assert.match(pi.messages[0].message.content, /ROOT_LOOP_LIMIT/);
-});
-
-test("threshold inquiry is queued instead of using legacy warning message", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.resetWrites, 1);
+	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(pi.messages.length, 1);
-	assert.match(pi.messages[0].message.content, /ROOT_LOOP_LIMIT/);
 	assert.equal(
-		pi.messages[0].message.customType,
-		"pi-reflect-watchdog:inquiry",
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"the reset cycle re-arms threshold latches without an immediate duplicate",
 	);
 });
 
-test("reflection tool budget blocks call eleven before execution across reasks", async () => {
-	const { pi, ctx } = install();
+test("failed and unknown assistant outcomes never reach domain counters", async () => {
+	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("budget", ctx);
-	for (let index = 0; index < 10; index += 1)
-		assert.equal(await pi.handlers.get("tool_call")?.({}, ctx), undefined);
-	assert.deepEqual(await pi.handlers.get("tool_call")?.({}, ctx), {
-		block: true,
-		reason: "Reflection tool-call budget exhausted.",
-	});
-	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant("invalid"), ctx);
-	assert.deepEqual(await pi.handlers.get("tool_call")?.({}, ctx), {
-		block: true,
-		reason: "Reflection tool-call budget exhausted.",
-	});
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	for (const reason of [
+		"error",
+		"aborted",
+		"length",
+		"pending",
+		"deferred",
+		"unknown-value",
+	])
+		await pi.emit("turn_end", turnEnd(reason), ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(domain.allWrites, 0);
 });
 
-test("three total invalid XML attempts fail and finish the inquiry", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("", ctx);
-	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant("invalid one"), ctx);
-	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant("invalid two"), ctx);
-	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant("invalid three"), ctx);
-	assert.equal(pi.messages.length, 4, "initial request, two reasks, and fold");
-	assert.equal(
-		pi.messages.at(-1)?.message.customType,
-		"pi-reflect-watchdog:inquiry-fold",
-	);
-	assert.equal(pi.messages.at(-1)?.options.triggerTurn, false);
-	assert.match(ctx.notifications.at(-1)?.[0] ?? "", /Reflection failed/);
+test("observer and subagent successful loops increment all but not root", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const root = install({
+		hub,
+		domain,
+		ctx: context("root", { hasUI: true }),
+		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+	});
+	const child = install({
+		hub,
+		domain,
+		ctx: context("child", { hasUI: false }),
+		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	await child.pi.emit("session_start", {}, child.ctx);
+	child.ctx.setIdle(false);
+	await child.pi.emit("agent_start", {}, child.ctx);
+	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(domain.allWrites, 1);
+	assert.equal(root.pi.messages.length, 0);
+	child.ctx.setIdle(true);
+	await child.pi.emit("agent_settled", {}, child.ctx);
+	assert.match(lastInquiry(root.pi)?.content ?? "", /ALL_LOOP_LIMIT/);
 });
 
-test("NO_ISSUE persists one report and starts no ordinary follow-up turn", async () => {
-	const { pi, ctx } = install();
+test("cross-process child busy keeps reflection queued until aggregate idle", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+	});
 	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("", ctx);
-	await submitReflection(pi, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	domain.setRemoteBusy(true);
+	await domain.recordAllLoop();
+	assert.equal(lastInquiry(pi), undefined);
+	domain.setRemoteBusy(false);
+	assert.match(lastInquiry(pi)?.content ?? "", /ALL_LOOP_LIMIT/);
+});
+
+test("provisional reflection, valid response, and its turn_end add no activity or loops", async () => {
+	const { pi, ctx, domain } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	assert.equal(domain.activityWrites.includes(true), false);
 	const replacement = await pi.emit(
 		"message_end",
 		assistant(validNoIssue),
 		ctx,
 	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await pi.emit("agent_settled", {}, ctx);
 	assert.deepEqual(replacement.message.content, []);
-	assert.deepEqual(replacement.message.details.piInquiry, {
-		version: 1,
-		namespace: "pi-reflect-watchdog",
-		inquiryId: "reflection-1",
-		attempt: 1,
-	});
-	assert.equal(pi.entries.length, 1);
-	assert.equal(pi.entries[0].data.decision.type, "NO_ISSUE");
-	assert.equal(pi.messages.length, 2);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(
-		pi.messages[1].message.customType,
-		"pi-reflect-watchdog:inquiry-fold",
+		domain.rootWrites,
+		0,
+		"message_end must not clear internal identity",
 	);
-
-	const persisted = (sent: any, timestamp: number) => ({
-		role: "custom",
-		customType: sent.customType,
-		content: [{ type: "text", text: sent.content }],
-		display: sent.display,
-		details: sent.details,
-		timestamp,
-	});
-	const folded = await pi.emit(
-		"context",
-		{
-			messages: [
-				persisted(pi.messages[0].message, 1),
-				{ ...replacement.message, timestamp: 2 },
-				persisted(pi.messages[1].message, 3),
-			],
-		},
-		ctx,
-	);
-	assert.deepEqual(folded.messages, []);
+	assert.equal(domain.allWrites, 0);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.counters().activeMs.value, 0n);
+	assert.equal(domain.counters().taskMs.value, 0n);
 });
 
-test("ROUTE_CORRECTION persists then dispatches one readable ordinary turn", async () => {
-	const { pi, ctx } = install();
+test("invalid XML re-ask remains internal through its successful turn", async () => {
+	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("", ctx);
-	await submitReflection(pi, ctx);
-	const replacement = await pi.emit(
-		"message_end",
-		assistant(validCorrection),
-		ctx,
-	);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.emit("message_end", assistant("not XML"), ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(domain.allWrites, 0);
+	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(replacement.message.content, []);
-	assert.equal(pi.entries.length, 1);
-	assert.equal(pi.entries[0].data.decision.type, "ROUTE_CORRECTION");
-	assert.equal(pi.messages.length, 3);
 	assert.equal(
-		pi.messages[1].message.customType,
-		"pi-reflect-watchdog:inquiry-fold",
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		2,
+		"invalid XML dispatches one correlated re-ask after settlement",
 	);
-	assert.match(
-		pi.messages[2].message.content,
-		/Next step: use corrected route/,
-	);
-	assert.equal(pi.messages[2].options.triggerTurn, true);
-	assert.equal(pi.messages[2].options.deliverAs, "steer");
-});
-
-test("reflection and correction attempts do not re-trigger loop counting", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	const reflect = pi.commands.find((item) => item.name === "reflect");
-	assert.ok(reflect);
-	await reflect.handler("", ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await submitReflection(pi, ctx);
-	await pi.emit("message_end", assistant("invalid"), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await submitReflection(pi, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await correlateReflection(pi, ctx);
 	await pi.emit("message_end", assistant(validNoIssue), ctx);
-	assert.equal(pi.messages.length, 3);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(domain.allWrites, 0);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+});
+
+test("route correction starts one ordinary continuation that counts normally", async () => {
+	const { pi, ctx, domain } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.emit("message_end", assistant(validCorrection), ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 0);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":correction"),
+		).length,
+		1,
+	);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 1);
+});
+
+test("domain snapshots, not local wall-clock state, drive status text", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 100, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	domain.setCounters({
+		activeMs: 12_000n,
+		activeLoops: 9n,
+		taskMs: 7_000n,
+		rootLoops: 7n,
+		allLoops: 9n,
+	});
+	assert.match(
+		ctx.statuses.filter(Boolean).at(-1) ?? "",
+		/active 12s\/9 loops · task 7s\/30m · root 7\/100 · all 9\/100/,
+	);
+});
+
+test("surviving observer reclaims main and owns /reflect after shutdown", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const root = install({
+		hub,
+		domain,
+		ctx: context("root", { hasUI: true }),
+	});
+	const observer = install({
+		hub,
+		domain,
+		ctx: context("observer", { hasUI: false }),
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	await observer.pi.emit("session_start", {}, observer.ctx);
+	await root.pi.emit("session_shutdown", {}, root.ctx);
+	await root.pi.commands[0]?.handler("old owner", root.ctx);
+	assert.equal(root.pi.messages.length, 0);
+	await observer.pi.commands[0]?.handler("new owner", observer.ctx);
+	assert.match(lastInquiry(observer.pi)?.content ?? "", /new owner/);
+});
+
+test("reflection tool budget blocks call eleven", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	for (let index = 0; index < 10; index += 1)
+		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
+	assert.deepEqual(await pi.emit("tool_call", {}, ctx), {
+		block: true,
+		reason: "Reflection tool-call budget exhausted.",
+	});
 });

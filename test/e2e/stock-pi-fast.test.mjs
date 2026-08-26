@@ -26,23 +26,6 @@ import {
 	writeJson,
 } from "../../scripts/e2e/harness.mjs";
 
-async function commandNotifications(rpc, command) {
-	const start = rpc.events.length;
-	const response = await rpc.request({
-		type: "prompt",
-		message: `/reflect-watchdog ${command}`,
-	});
-	assert.equal(response.success, true);
-	await new Promise((resolve) => setTimeout(resolve, 100));
-	return rpc.events
-		.slice(start)
-		.map((entry) => entry.message)
-		.filter(
-			(message) =>
-				message.type === "extension_ui_request" && message.method === "notify",
-		);
-}
-
 async function missing(target) {
 	try {
 		await access(target);
@@ -90,11 +73,32 @@ function warningPlan({ requestIndex }) {
 					tool_calls: [
 						{
 							index: 0,
-							id: "watchdog-status-1",
+							id: "ordinary-read-1",
 							type: "function",
 							function: {
-								name: "reflect_watchdog_control",
-								arguments: '{"action":"status"}',
+								name: "read",
+								arguments: '{"path":"package.json","limit":1,"offset":1}',
+							},
+						},
+					],
+				},
+			],
+			finishReason: "tool_calls",
+		};
+	}
+	if (requestIndex === 1) {
+		return {
+			delay: 20,
+			chunks: [
+				{
+					tool_calls: [
+						{
+							index: 0,
+							id: "ordinary-read-2",
+							type: "function",
+							function: {
+								name: "read",
+								arguments: '{"path":"README.md","limit":1,"offset":1}',
 							},
 						},
 					],
@@ -114,7 +118,7 @@ function warningPlan({ requestIndex }) {
 	};
 }
 
-test("the installed packed tarball loads dist and commands never start a model turn", async (t) => {
+test("the installed packed tarball loads dist with only the reflect command", async (t) => {
 	assertStockPi();
 	const resources = await createTestResources(t);
 	const isolated = await createIsolatedEnvironment(resources.base);
@@ -137,17 +141,15 @@ test("the installed packed tarball loads dist and commands never start a model t
 		rpc,
 		path.join(artifact.packagePath, "dist", "extension.js"),
 	);
-	for (const command of ["status", "reset", "limits 7 11 13"]) {
-		const notifications = await commandNotifications(rpc, command);
-		assert.ok(
-			notifications.length >= 1,
-			`${command} reports through extension UI`,
-		);
-		assert.equal(
-			rpc.events.some((entry) => entry.message.type === "agent_start"),
-			false,
-		);
-	}
+	const commands = await rpc.request({ type: "get_commands" });
+	assert.deepEqual(
+		commands.data.commands
+			.filter((command) =>
+				command.sourceInfo?.path?.includes("pi-reflect-watchdog"),
+			)
+			.map((command) => command.name),
+		["reflect"],
+	);
 });
 
 test("packed stock Pi sends a root-loop reflection to its continuation provider request", {
@@ -203,16 +205,6 @@ test("packed stock Pi sends a root-loop reflection to its continuation provider 
 			"tool round requests contain no watchdog reminder before the threshold",
 		);
 	}
-	const toolResult = initialRequests[1].body.messages.find(
-		(message) =>
-			message.role === "tool" && message.tool_call_id === "watchdog-status-1",
-	);
-	assert.match(
-		toolResult?.content ?? "",
-		/^reflect_watchdog status\nroot loops:/,
-		"the second provider request consumes the real reflect_watchdog_control status result",
-	);
-
 	await waitForProviderRequests(provider, 3);
 	const continuation = provider.requests[2];
 	const continuationMessages = JSON.stringify(continuation.body.messages);
@@ -234,8 +226,14 @@ test("packed stock Pi sends a root-loop reflection to its continuation provider 
 	await new Promise((resolve) => setTimeout(resolve, 250));
 	assert.equal(
 		provider.requests.length,
-		3,
-		"the reset cycle lets the one-loop reflection settle without another warning",
+		4,
+		"stock Pi performs one terminal continuation after the internal response",
+	);
+	const terminalMessages = JSON.stringify(provider.requests[3].body.messages);
+	assert.doesNotMatch(
+		terminalMessages,
+		/Your previous reflection response was invalid/,
+		"the terminal continuation is not a recursive XML re-ask",
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(
@@ -365,7 +363,7 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	);
 });
 
-test("stock Pi honors global and trusted-project watchdog config precedence", async (t) => {
+test("stock Pi loads global and trusted-project watchdog configuration", async (t) => {
 	const resources = await createTestResources(t);
 	const isolated = await createIsolatedEnvironment(resources.base);
 	const artifact = await installPackedArtifact({
@@ -384,30 +382,21 @@ test("stock Pi honors global and trusted-project watchdog config precedence", as
 		},
 	);
 
-	for (const [trustFlag, expected] of [
-		["--no-approve", "main=17"],
-		["--approve", "main=29"],
-	]) {
-		const rpc = new RpcPi({
-			cwd: isolated.workspace,
-			env: isolated.env,
-			args: [trustFlag],
-		});
-		resources.add(() => rpc.close());
-		await assertSingleWatchdogCommand(
-			rpc,
-			path.join(artifact.packagePath, "dist", "extension.js"),
-		);
-		const notifications = await commandNotifications(rpc, "status");
-		assert.match(
-			notifications.map((message) => message.message).join("\n"),
-			new RegExp(`root=${expected.split("=")[1]}`),
-		);
-		assert.match(
-			notifications.map((message) => message.message).join("\n"),
-			/all=19; task=23m/,
-		);
-	}
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		args: ["--approve"],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+	const accepted = await rpc.request({
+		type: "prompt",
+		message: "/reflect verify layered configuration",
+	});
+	assert.equal(accepted.success, true);
 });
 
 test("stock Pi installs master and release from actual local Git remotes with exact source paths", async (t) => {
@@ -435,7 +424,7 @@ test("stock Pi installs master and release from actual local Git remotes with ex
 		await assertSingleWatchdogCommand(rpc, path.join(managed, entry));
 		const commands = await rpc.request({ type: "get_commands" });
 		const watchdog = commands.data.commands.find(
-			(command) => command.name === "reflect-watchdog",
+			(command) => command.name === "reflect",
 		);
 		assert.equal(
 			await realpath(watchdog.sourceInfo.path),

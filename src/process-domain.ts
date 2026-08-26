@@ -44,7 +44,6 @@ export function isReflectDomainFatalError(
 
 export interface ReflectCounterValue {
 	readonly value: bigint;
-	readonly paused: boolean;
 }
 
 export interface ReflectDomainFence {
@@ -58,6 +57,8 @@ export interface ReflectDomainCounters {
 	readonly generation: bigint;
 	readonly certain: boolean;
 	readonly anyBusy: boolean;
+	readonly localBusy: boolean;
+	readonly otherBusy: boolean;
 	readonly endLoopTimeMs: bigint | null;
 	readonly fence: ReflectDomainFence;
 	readonly activeMs: ReflectCounterValue;
@@ -88,8 +89,9 @@ interface CountersWire {
 	readonly generation: string;
 	readonly domainEpoch: string;
 	readonly certain: boolean;
-	readonly paused: boolean;
 	readonly anyBusy: boolean;
+	readonly localBusy: boolean;
+	readonly otherBusy: boolean;
 	readonly endLoopTimeMs: string | null;
 	readonly activeMs: string;
 	readonly activeLoops: string;
@@ -122,7 +124,6 @@ interface ParsedCounterMessage {
 
 export interface ReflectDomainCoordinator {
 	readonly rootProcess: boolean;
-	readonly paused: boolean;
 	attach(
 		instance: object,
 		options: {
@@ -139,8 +140,6 @@ export interface ReflectDomainCoordinator {
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
 	setIdleResetGapSeconds(seconds: number): void;
 	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
-	pause(): Promise<ReflectDomainCounters | undefined>;
-	resume(): Promise<void>;
 }
 
 export interface ReflectDomainClock {
@@ -160,18 +159,19 @@ export interface ReflectDomainOptions {
 	readonly now?: () => number;
 }
 
-function counter(value = 0n, paused = false): ReflectCounterValue {
-	return { value, paused };
+function counter(value = 0n): ReflectCounterValue {
+	return { value };
 }
 
 function zeroCounters(
-	paused = false,
 	state: {
 		readonly domainEpoch?: string;
 		readonly revision?: bigint;
 		readonly generation?: bigint;
 		readonly certain?: boolean;
 		readonly anyBusy?: boolean;
+		readonly localBusy?: boolean;
+		readonly otherBusy?: boolean;
 	} = {},
 ): ReflectDomainCounters {
 	const domainEpoch = state.domainEpoch ?? "pending";
@@ -182,13 +182,15 @@ function zeroCounters(
 		generation,
 		certain: state.certain ?? false,
 		anyBusy: state.anyBusy ?? false,
+		localBusy: state.localBusy ?? false,
+		otherBusy: state.otherBusy ?? false,
 		endLoopTimeMs: null,
 		fence: { domainEpoch, generation },
-		activeMs: counter(0n, paused),
-		activeLoops: counter(0n, paused),
-		taskMs: counter(0n, paused),
-		rootLoops: counter(0n, paused),
-		allLoops: counter(0n, paused),
+		activeMs: counter(),
+		activeLoops: counter(),
+		taskMs: counter(),
+		rootLoops: counter(),
+		allLoops: counter(),
 	};
 }
 
@@ -202,17 +204,14 @@ function sameCounters(
 		left.generation === right.generation &&
 		left.certain === right.certain &&
 		left.anyBusy === right.anyBusy &&
+		left.localBusy === right.localBusy &&
+		left.otherBusy === right.otherBusy &&
 		left.endLoopTimeMs === right.endLoopTimeMs &&
 		left.activeMs.value === right.activeMs.value &&
-		left.activeMs.paused === right.activeMs.paused &&
 		left.activeLoops.value === right.activeLoops.value &&
-		left.activeLoops.paused === right.activeLoops.paused &&
 		left.taskMs.value === right.taskMs.value &&
-		left.taskMs.paused === right.taskMs.paused &&
 		left.rootLoops.value === right.rootLoops.value &&
-		left.rootLoops.paused === right.rootLoops.paused &&
-		left.allLoops.value === right.allLoops.value &&
-		left.allLoops.paused === right.allLoops.paused
+		left.allLoops.value === right.allLoops.value
 	);
 }
 
@@ -292,8 +291,9 @@ function parseCounters(
 		!validRevision(wire.generation) ||
 		!validId(wire.domainEpoch) ||
 		typeof wire.certain !== "boolean" ||
-		typeof wire.paused !== "boolean" ||
 		typeof wire.anyBusy !== "boolean" ||
+		typeof wire.localBusy !== "boolean" ||
+		typeof wire.otherBusy !== "boolean" ||
 		(wire.endLoopTimeMs !== null && !validCounterValue(wire.endLoopTimeMs)) ||
 		!validCounterValue(wire.activeMs) ||
 		!validCounterValue(wire.activeLoops) ||
@@ -313,14 +313,16 @@ function parseCounters(
 			generation,
 			certain: wire.certain,
 			anyBusy: wire.anyBusy,
+			localBusy: wire.localBusy,
+			otherBusy: wire.otherBusy,
 			endLoopTimeMs:
 				wire.endLoopTimeMs === null ? null : BigInt(wire.endLoopTimeMs),
 			fence: { domainEpoch: wire.domainEpoch, generation },
-			activeMs: counter(BigInt(wire.activeMs), wire.paused),
-			activeLoops: counter(BigInt(wire.activeLoops), wire.paused),
-			taskMs: counter(BigInt(wire.taskMs), wire.paused),
-			rootLoops: counter(BigInt(wire.rootLoops), wire.paused),
-			allLoops: counter(BigInt(wire.allLoops), wire.paused),
+			activeMs: counter(BigInt(wire.activeMs)),
+			activeLoops: counter(BigInt(wire.activeLoops)),
+			taskMs: counter(BigInt(wire.taskMs)),
+			rootLoops: counter(BigInt(wire.rootLoops)),
+			allLoops: counter(BigInt(wire.allLoops)),
 		},
 		activityRevision: activityRevisions.get(nodeId) ?? 0n,
 		loopRevision: loopRevisions.get(nodeId) ?? 0n,
@@ -364,9 +366,6 @@ export function createReflectDomainCoordinator(
 	let hostStateRevision = 0n;
 	let acceptedHostRevision = 0n;
 	let acceptedHostEpoch: string | undefined;
-	let paused = false;
-	let pausedAtMs: bigint | null = null;
-	let pausedAggregateBusy: boolean | null = null;
 	let transportHealthy = true;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
@@ -472,17 +471,7 @@ export function createReflectDomainCoordinator(
 		}
 	};
 
-	const hostCounters = (): ReflectDomainCounters => {
-		const current = hostState ?? zeroCounters(paused);
-		return {
-			...current,
-			activeMs: counter(current.activeMs.value, paused),
-			activeLoops: counter(current.activeLoops.value, paused),
-			taskMs: counter(current.taskMs.value, paused),
-			rootLoops: counter(current.rootLoops.value, paused),
-			allLoops: counter(current.allLoops.value, paused),
-		};
-	};
+	const hostCounters = (): ReflectDomainCounters => hostState ?? zeroCounters();
 
 	const hostBusy = (): boolean => {
 		if (desiredActivity()) return true;
@@ -508,6 +497,8 @@ export function createReflectDomainCoordinator(
 			generation: snapshotGeneration,
 			certain: uncertainPeers.size === 0,
 			anyBusy: hostBusy(),
+			localBusy: desiredActivity(),
+			otherBusy: [...peers.values()].some((peer) => peer.busy),
 			fence: { domainEpoch, generation: snapshotGeneration },
 		};
 		const activityRevisions = new Map<string, bigint>();
@@ -521,8 +512,9 @@ export function createReflectDomainCoordinator(
 			generation: snapshotGeneration.toString(),
 			domainEpoch,
 			certain: counters.certain,
-			paused,
 			anyBusy: counters.anyBusy,
+			localBusy: counters.localBusy,
+			otherBusy: counters.otherBusy,
 			endLoopTimeMs: counters.endLoopTimeMs?.toString() ?? null,
 			activeMs: counters.activeMs.value.toString(),
 			activeLoops: counters.activeLoops.value.toString(),
@@ -608,71 +600,74 @@ export function createReflectDomainCoordinator(
 		current.rootLoops = loop.rootLoops;
 		current.allLoops = loop.allLoops;
 		hostStateRevision += 1n;
-		if (!paused) {
-			const currentCounters = hostCounters();
-			hostState = {
-				...currentCounters,
-				activeLoops: counter(
-					currentCounters.activeLoops.value + allDelta,
-					paused,
-				),
-				rootLoops: counter(currentCounters.rootLoops.value + rootDelta, paused),
-				allLoops: counter(currentCounters.allLoops.value + allDelta, paused),
-			};
-		}
+		const currentCounters = hostCounters();
+		hostState = {
+			...currentCounters,
+			activeLoops: counter(currentCounters.activeLoops.value + allDelta),
+			rootLoops: counter(currentCounters.rootLoops.value + rootDelta),
+			allLoops: counter(currentCounters.allLoops.value + allDelta),
+		};
 		void publishHost().catch(() => {});
 	};
 
 	const clearEveryCounter = (current: ReflectDomainCounters) => ({
 		...current,
 		endLoopTimeMs: null,
-		activeMs: counter(0n, paused),
-		activeLoops: counter(0n, paused),
-		taskMs: counter(0n, paused),
-		rootLoops: counter(0n, paused),
-		allLoops: counter(0n, paused),
+		activeMs: counter(),
+		activeLoops: counter(),
+		taskMs: counter(),
+		rootLoops: counter(),
+		allLoops: counter(),
 	});
 
 	const clearReminderCounters = (current: ReflectDomainCounters) => ({
 		...current,
-		taskMs: counter(0n, paused),
-		rootLoops: counter(0n, paused),
-		allLoops: counter(0n, paused),
+		taskMs: counter(),
+		rootLoops: counter(),
+		allLoops: counter(),
 	});
 
 	const applyAggregateBusyTransition = (
 		wasBusy: boolean,
 		isBusy: boolean,
 	): void => {
-		if (!rootProcess || paused || wasBusy === isBusy) return;
+		if (!rootProcess || wasBusy === isBusy) return;
 		const current = hostCounters();
 		if (!isBusy) {
-			hostState = { ...current, anyBusy: false, endLoopTimeMs: BigInt(now()) };
+			hostState = {
+				...current,
+				anyBusy: false,
+				localBusy: false,
+				otherBusy: false,
+				endLoopTimeMs: BigInt(now()),
+			};
 			return;
 		}
 		const gapExceeded =
 			current.endLoopTimeMs !== null &&
 			BigInt(now()) > current.endLoopTimeMs + BigInt(idleResetGapMs);
 		const resumed = gapExceeded ? clearEveryCounter(current) : current;
-		hostState = { ...resumed, anyBusy: true, endLoopTimeMs: null };
+		hostState = {
+			...resumed,
+			anyBusy: true,
+			localBusy: desiredActivity(),
+			otherBusy: [...peers.values()].some((peer) => peer.busy),
+			endLoopTimeMs: null,
+		};
 	};
 
 	const scheduleTick = (): void => {
-		if (!rootProcess || node === undefined || tick !== undefined || paused)
-			return;
+		if (!rootProcess || node === undefined || tick !== undefined) return;
 		tick = clock.setTimeout(() => {
 			tick = undefined;
-			if (!rootProcess || paused || !hostCertain()) return;
+			if (!rootProcess || !hostCertain()) return;
 			if (!hostBusy()) return;
 			const current = hostCounters();
 			hostStateRevision += 1n;
 			hostState = {
 				...current,
-				activeMs: counter(
-					current.activeMs.value + BigInt(activeTickMs),
-					paused,
-				),
-				taskMs: counter(current.taskMs.value + BigInt(activeTickMs), paused),
+				activeMs: counter(current.activeMs.value + BigInt(activeTickMs)),
+				taskMs: counter(current.taskMs.value + BigInt(activeTickMs)),
 			};
 			void publishHost().catch(() => {});
 			scheduleTick();
@@ -682,7 +677,7 @@ export function createReflectDomainCoordinator(
 	};
 
 	const updateHostTimers = (): void => {
-		if (!rootProcess || paused || !hostCertain()) return;
+		if (!rootProcess || !hostCertain()) return;
 		if (hostBusy()) {
 			scheduleTick();
 			return;
@@ -835,15 +830,13 @@ export function createReflectDomainCoordinator(
 			node = opened;
 			rootProcess = opened.role === "host";
 			if (rootProcess) {
-				hostState = zeroCounters(false, {
+				hostState = zeroCounters({
 					domainEpoch: opened.declaration.domainId,
 					certain: true,
 				});
 				countersValue = hostState;
-				paused = false;
-				pausedAtMs = null;
-				pausedAggregateBusy = null;
 				transportHealthy = true;
+
 				snapshotRevision = 0n;
 				snapshotGeneration = 0n;
 				unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
@@ -928,15 +921,6 @@ export function createReflectDomainCoordinator(
 		get rootProcess() {
 			return rootProcess;
 		},
-		get paused() {
-			// The host's internal flag is assigned synchronously by pause() and
-			// resume(), while the published countersValue snapshot only catches
-			// up after an async publish. The void fire-and-forget API contract
-			// requires this getter to be synchronously accurate, so the host
-			// reads its internal flag; clients never set it and learn the pause
-			// state exclusively from host broadcasts.
-			return rootProcess ? paused : (countersValue?.activeMs.paused ?? paused);
-		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
 				if (attachments.has(instance)) return;
@@ -993,10 +977,8 @@ export function createReflectDomainCoordinator(
 				hostStateRevision = 0n;
 				acceptedHostRevision = 0n;
 				acceptedHostEpoch = undefined;
-				paused = false;
-				pausedAtMs = null;
-				pausedAggregateBusy = null;
 				transportHealthy = true;
+
 				peers.clear();
 				uncertainPeers.clear();
 				snapshotRevision = 0n;
@@ -1026,17 +1008,17 @@ export function createReflectDomainCoordinator(
 			}
 		},
 		async recordRootLoop() {
-			if (!rootProcess || paused) {
-				if (!rootProcess) await queueWrite("root-loop");
-				return countersValue ?? zeroCounters(paused);
+			if (!rootProcess) {
+				await queueWrite("root-loop");
+				return countersValue ?? zeroCounters();
 			}
 			const current = hostCounters();
 			hostStateRevision += 1n;
 			hostState = {
 				...current,
-				activeLoops: counter(current.activeLoops.value + 1n, false),
-				rootLoops: counter(current.rootLoops.value + 1n, false),
-				allLoops: counter(current.allLoops.value + 1n, false),
+				activeLoops: counter(current.activeLoops.value + 1n),
+				rootLoops: counter(current.rootLoops.value + 1n),
+				allLoops: counter(current.allLoops.value + 1n),
 			};
 			await publishHost();
 			updateHostTimers();
@@ -1045,15 +1027,14 @@ export function createReflectDomainCoordinator(
 		async recordAllLoop() {
 			if (!rootProcess) {
 				await queueWrite("all-loop");
-				return countersValue ?? zeroCounters(true);
+				return countersValue ?? zeroCounters();
 			}
-			if (paused) return hostCounters();
 			const current = hostCounters();
 			hostStateRevision += 1n;
 			hostState = {
 				...current,
-				activeLoops: counter(current.activeLoops.value + 1n, false),
-				allLoops: counter(current.allLoops.value + 1n, false),
+				activeLoops: counter(current.activeLoops.value + 1n),
+				allLoops: counter(current.allLoops.value + 1n),
 			};
 			await publishHost();
 			return countersValue ?? hostCounters();
@@ -1075,50 +1056,6 @@ export function createReflectDomainCoordinator(
 			hostState = clearReminderCounters(hostCounters());
 			await publishHost();
 			return countersValue;
-		},
-		async pause() {
-			if (!rootProcess || countersValue === undefined) return countersValue;
-			if (paused) return countersValue;
-			paused = true;
-			pausedAtMs = BigInt(now());
-			pausedAggregateBusy = hostBusy();
-			if (tick !== undefined) clock.clearTimeout(tick);
-			tick = undefined;
-			hostStateRevision += 1n;
-			hostState = hostCounters();
-			await publishHost();
-			return countersValue;
-		},
-		async resume() {
-			if (!rootProcess || countersValue === undefined || !paused) return;
-			const currentTimeMs = BigInt(now());
-			const pausedDurationMs =
-				pausedAtMs === null ? 0n : currentTimeMs - pausedAtMs;
-			const wasBusy = pausedAggregateBusy ?? hostBusy();
-			for (const attachment of attachments.values())
-				attachment.busy = attachment.getBusy();
-			paused = false;
-			pausedAtMs = null;
-			pausedAggregateBusy = null;
-			hostStateRevision += 1n;
-			const current = hostCounters();
-			hostState = {
-				...current,
-				endLoopTimeMs:
-					current.endLoopTimeMs === null
-						? hostBusy()
-							? null
-							: currentTimeMs
-						: current.endLoopTimeMs + pausedDurationMs,
-				activeMs: counter(current.activeMs.value, false),
-				activeLoops: counter(current.activeLoops.value, false),
-				taskMs: counter(current.taskMs.value, false),
-				rootLoops: counter(current.rootLoops.value, false),
-				allLoops: counter(current.allLoops.value, false),
-			};
-			applyAggregateBusyTransition(wasBusy, hostBusy());
-			await publishHost();
-			updateHostTimers();
 		},
 	};
 }

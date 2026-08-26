@@ -21,11 +21,7 @@ function activeSeconds(capture) {
 	return match ? Number(match[1]) : undefined;
 }
 
-function count(text, pattern) {
-	return [...text.matchAll(pattern)].length;
-}
-
-test("stock Pi TUI renders, ticks, commands, and active-freeze semantics", {
+test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -75,36 +71,21 @@ test("stock Pi TUI renders, ticks, commands, and active-freeze semantics", {
 		"below-editor active time redraws about once per second",
 	);
 	const settled = await tui.waitFor(
-		/Watchdog active frozen \| active .*\/1 loops/,
+		/Reflect Watchdog \| active \d+s\/1 loops · task \d+s\/30m · root 1\/100 · all 1\/500/,
 		12_000,
 	);
+	const frozen = activeSeconds(settled);
+	await new Promise((resolve) => setTimeout(resolve, 1_300));
 	assert.equal(
-		count(settled, /Watchdog active frozen \| active /g),
-		1,
-		"automatic settle freeze notification appears once",
-	);
-
-	tui.send("/reflect-watchdog status");
-	await tui.waitFor(/Watchdog status/);
-	tui.send("/reflect-watchdog reset");
-	const manual = await tui.waitFor(
-		/Watchdog task cycle reset\. Active window is unchanged\./,
-	);
-	assert.equal(
-		count(manual, /Watchdog active frozen \| active /g),
-		0,
-		"manual reset emits no automatic freeze notification",
+		activeSeconds(tui.capture()),
+		frozen,
+		"all-idle freezes active time without notification noise",
 	);
 
 	tui.send("Second real turn");
-	const twice = await tui.waitFor(
-		/Watchdog active frozen \| active .*\/2 loops/,
+	await tui.waitFor(
+		/Reflect Watchdog \| active \d+s\/2 loops · task \d+s\/30m · root 2\/100 · all 2\/500/,
 		12_000,
-	);
-	assert.equal(
-		count(twice, /Watchdog active frozen \| active /g),
-		1,
-		"the next settle emits exactly one freeze notification while preserving the active cycle",
 	);
 
 	tui.key("C-d");

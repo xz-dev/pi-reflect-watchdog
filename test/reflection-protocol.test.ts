@@ -26,11 +26,20 @@ test("reflection XML is strict, decodes entities, and requires unique fields", (
 		).valid,
 		false,
 	);
-	assert.equal(
+	assert.deepEqual(
 		parseReflectionXml(
-			"<Reflection><type>NO_ISSUE</type><reason>x</reason><done>d</done><current_step>c</current_step><next_step>n</next_step></Reflection>",
-		).valid,
-		false,
+			"<Reflection><TYPE>no_issue</TYPE><Reason>x</Reason><DONE>d</DONE><CURRENT_STEP>c</CURRENT_STEP><NEXT_STEP>n</NEXT_STEP></Reflection>",
+		),
+		{
+			valid: true,
+			decision: {
+				type: "NO_ISSUE",
+				reason: "x",
+				done: "d",
+				currentStep: "c",
+				nextStep: "n",
+			},
+		},
 	);
 });
 

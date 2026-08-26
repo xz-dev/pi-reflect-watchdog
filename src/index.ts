@@ -1,8 +1,7 @@
-export {
-	type ActivitySnapshot,
-	type ActivityStatus,
-	RootActivityTracker,
-} from "./activity.js";
+export type {
+	ActivitySnapshot,
+	ActivityStatus,
+} from "./activity-types.js";
 export {
 	BUILT_IN_CONFIG,
 	type ConfigDiagnostic,
@@ -20,44 +19,30 @@ export {
 	loadRuntimeConfig,
 } from "./config-loader.js";
 export {
-	type ControllerTransition,
-	controllerOptionsFromConfig,
-	type RuntimeLimits,
-	TaskController,
-	type TaskControllerOptions,
-	type TaskStatus,
-	type WarningKind,
-} from "./controller.js";
+	createWatchdogExtension,
+	type RuntimeServices,
+	type WatchdogExtensionOptions,
+} from "./extension.js";
 export {
-	parseReflectWatchdogCommand,
-	REFLECT_COMMAND,
-	REFLECT_TIMELINE_COMMAND,
-	REFLECT_WATCHDOG_COMMAND,
-	REFLECT_WATCHDOG_USAGE,
-	type ReflectWatchdogCommand,
-} from "./controls.js";
-export { createWatchdogExtension, type RuntimeServices } from "./extension.js";
-export {
+	createHubAttachmentInstance,
+	createObservableAgentHub,
+	getProcessObservableAgentHub,
 	HUB_SYMBOL,
-	REFLECT_WATCHDOG_API_SYMBOL,
-	type ReflectWatchdogApi,
-	type RootAttachment,
-	type RootClaim,
-	type RootPriority,
-	type WatchdogHub,
+	type HubAttachment,
+	type HubMainClaim,
+	type ObservableAgentHub,
+	type ObservableAgentHubSnapshot,
 } from "./hub.js";
-export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export {
-	formatHistoryResult,
-	formatReflectionReport,
-	MAX_HISTORY_RESULT_ITEMS,
-	parseReflectionHistoryData,
-	queryReflectionHistory,
-	REFLECTION_HISTORY_ENTRY_TYPE,
-	type ReflectionHistoryEntry,
-	type ReflectionHistoryQuery,
-	reflectionHistory,
-} from "./reflection-history.js";
+	createReflectDomainCoordinator,
+	FATAL_EXIT_CODE,
+	getReflectDomainCoordinator,
+	isReflectDomainFatalError,
+	type ReflectDomainCoordinator,
+	type ReflectDomainCounters,
+	ReflectDomainFatalError,
+} from "./process-domain.js";
+export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export {
 	buildReflectionPrompt,
 	buildReflectionReaskPrompt,
@@ -73,6 +58,7 @@ export {
 } from "./reflection-protocol.js";
 export {
 	createWatchdogWidget,
+	formatCompactWidgetText,
 	formatDuration,
 	formatWidgetText,
 	WIDGET_KEY,

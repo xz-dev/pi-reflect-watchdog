@@ -5,6 +5,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
 	createWatchdogWidget,
+	formatCompactWidgetText,
 	formatDuration,
 	formatWidgetText,
 	WIDGET_KEY,
@@ -69,7 +70,7 @@ test("live state renders the exact approved example format", () => {
 	);
 });
 
-test("component renders one truncated line through truncateToWidth", () => {
+test("component switches to compact text before final truncation", () => {
 	let width = 200;
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
 		activity: { active: true, elapsedMs: 8_040_000, loops: 137 },
@@ -89,7 +90,21 @@ test("component renders one truncated line through truncateToWidth", () => {
 	width = 40;
 	const narrow = widget.render(width);
 	assert.equal(narrow.length, 1);
-	assert.equal(narrow[0], truncateToWidth(full[0], width));
+	assert.equal(
+		narrow[0],
+		truncateToWidth(
+			formatCompactWidgetText({
+				activity: { active: true, elapsedMs: 8_040_000, loops: 137 },
+				taskElapsedMs: 760_000,
+				taskMinutes: 30,
+				rootLoops: 37,
+				rootLoopLimit: 100,
+				allLoops: 128,
+				allLoopLimit: 500,
+			}),
+			width,
+		),
+	);
 	assert.ok(visibleWidth(narrow[0]) <= width);
 });
 

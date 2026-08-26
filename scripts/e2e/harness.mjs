@@ -405,11 +405,11 @@ export async function assertSingleWatchdogCommand(rpc, expectedPath) {
 	const response = await rpc.request({ type: "get_commands" }, 30_000);
 	if (!response.success) throw new Error(JSON.stringify(response));
 	const commands = response.data.commands.filter(
-		(command) => command.name === "reflect-watchdog",
+		(command) => command.name === "reflect",
 	);
 	if (commands.length !== 1)
 		throw new Error(
-			`Expected one watchdog command, got ${commands.length}; commands=${JSON.stringify(response.data.commands.map((command) => command.name))}; stderr=${rpc.stderr}`,
+			`Expected one reflect command, got ${commands.length}; commands=${JSON.stringify(response.data.commands.map((command) => command.name))}; stderr=${rpc.stderr}`,
 		);
 	const actual = await realpath(commands[0].sourceInfo.path);
 	const expected = await realpath(expectedPath);

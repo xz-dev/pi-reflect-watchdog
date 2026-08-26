@@ -3,16 +3,18 @@ import {
 	MAX_XML_TEXT_CODE_POINTS,
 	parseTrailingXml,
 } from "pi-extension-utils/xml";
-import type { WarningKind } from "./controller.js";
-
-export const REFLECTION_ROOT_TAG = "reflection";
+export type ReflectionTriggerReason =
+	| "ROOT_LOOP_LIMIT"
+	| "ALL_LOOP_LIMIT"
+	| "TASK_TIME_LIMIT"
+	| "USER_REQUEST";
 export const MAX_REFLECTION_TEXT_CHARACTERS = MAX_XML_TEXT_CODE_POINTS;
 export const MAX_REFLECTION_TOOL_CALLS = 10;
 /** Maximum total invalid XML attempts, matching the continue-watchdog contract. */
 export const MAX_REFLECTION_REASKS = 3;
 
 export type ReflectionType = "NO_ISSUE" | "ROUTE_CORRECTION";
-export type ReflectionTriggerReason = WarningKind | "USER_REQUEST";
+export const REFLECTION_ROOT_TAG = "reflection";
 
 export interface ReflectionDecision {
 	readonly type: ReflectionType;
@@ -57,12 +59,33 @@ const REQUIRED_FIELDS = [
 	"next_step",
 ] as const;
 
+function normalizeReflectionXmlCase(text: string): string {
+	return text.replace(
+		/<\/?(reflection|type|reason|done|current_step|next_step)>/gi,
+		(tag, name: string) =>
+			`${tag.startsWith("</") ? "</" : "<"}${name.toLowerCase()}>`,
+	);
+}
+
 export function parseReflectionXml(text: string): ReflectionValidation {
-	const parsed = parseTrailingXml(text, REFLECTION_ROOT_TAG);
+	const parsed = parseTrailingXml(
+		normalizeReflectionXmlCase(text),
+		REFLECTION_ROOT_TAG,
+	);
 	if (!parsed.valid) return parsed;
+	const normalizedFields = new Map<string, string>();
+	for (const [name, value] of parsed.value.fields) {
+		const normalized = name.toLowerCase();
+		if (normalizedFields.has(normalized))
+			return {
+				valid: false,
+				error: `duplicate reflection field ${normalized}`,
+			};
+		normalizedFields.set(normalized, value);
+	}
 	if (
-		parsed.value.fields.size !== REQUIRED_FIELDS.length ||
-		REQUIRED_FIELDS.some((name) => !parsed.value.fields.has(name))
+		normalizedFields.size !== REQUIRED_FIELDS.length ||
+		REQUIRED_FIELDS.some((name) => !normalizedFields.has(name))
 	)
 		return {
 			valid: false,
@@ -70,7 +93,7 @@ export function parseReflectionXml(text: string): ReflectionValidation {
 		};
 	const values = new Map<string, string>();
 	for (const name of REQUIRED_FIELDS) {
-		const value = parsed.value.fields.get(name)?.trim();
+		const value = normalizedFields.get(name)?.trim();
 		if (!value)
 			return {
 				valid: false,
@@ -78,7 +101,7 @@ export function parseReflectionXml(text: string): ReflectionValidation {
 			};
 		values.set(name, value);
 	}
-	const type = values.get("type");
+	const type = values.get("type")?.toUpperCase();
 	if (type !== "NO_ISSUE" && type !== "ROUTE_CORRECTION")
 		return {
 			valid: false,
@@ -109,7 +132,7 @@ export function buildReflectionPrompt(
 		{ name: "current_step", value: "current work" },
 		{ name: "next_step", value: "correct next step" },
 	]);
-	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: active=${context.thresholds.activeMs}ms/${context.thresholds.activeLoops} loops; task=${context.thresholds.taskMs}ms/${context.thresholds.taskMinutes}m; root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; all=${context.thresholds.allLoops}/${context.thresholds.allLoopLimit}\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one trailing <reflection>...</reflection> XML block. XML names are case-sensitive. The block must contain exactly these five unique, non-empty fields in any order: type, reason, done, current_step, next_step. The type must be NO_ISSUE or ROUTE_CORRECTION. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Example:\n${example}\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement:\n${buildXmlDocument("supplement", [{ name: "text", value: supplement ?? "none" }])}`;
+	return `${context.semanticPrefix.trim()}\n\n[Plugin-generated reflection context]\nCurrent local RFC3339 time: ${context.timestamp}\nTrigger source(s): ${context.reasons.join(", ")}\nThreshold snapshot: active=${context.thresholds.activeMs}ms/${context.thresholds.activeLoops} loops; task=${context.thresholds.taskMs}ms/${context.thresholds.taskMinutes}m; root=${context.thresholds.rootLoops}/${context.thresholds.rootLoopLimit}; all=${context.thresholds.allLoops}/${context.thresholds.allLoopLimit}\nUser supplement: ${supplement ? supplement : "(none)"}\nPrevious completed reflection: ${previous ? `${previous.timestamp}\n${previous.report}` : "(none)"}\n\nYou may use tools only when needed to verify the current route. This reflection and all XML correction attempts share one budget of ${MAX_REFLECTION_TOOL_CALLS} tool calls. The plugin blocks call ${MAX_REFLECTION_TOOL_CALLS + 1} before execution.\n\nEnd the response with exactly one trailing <reflection>...</reflection> XML block. XML names and the type value are case-insensitive. The block must contain exactly these five unique, non-empty fields in any order: type, reason, done, current_step, next_step. The type must be NO_ISSUE or ROUTE_CORRECTION. Total non-thinking assistant text must not exceed ${MAX_REFLECTION_TEXT_CHARACTERS} Unicode characters. Example:\n${example}\n\nDo not copy untrusted text into XML without escaping it. Example escaped supplement:\n${buildXmlDocument("supplement", [{ name: "text", value: supplement ?? "none" }])}`;
 }
 
 export function buildReflectionReaskPrompt(error: string): string {

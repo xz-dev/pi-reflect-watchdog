@@ -232,26 +232,16 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 		"active tick resumes after recovery",
 	);
 
-	const activeBeforeReflection = root.counters()?.activeMs.value;
-	const reset = await root.pause();
-	assert.equal(reset?.rootLoops.value, 1n);
-	assert.equal(reset?.allLoops.value, 2n);
-	assert.ok((reset?.taskMs.value ?? 0n) > 0n);
-	assert.equal(reset?.activeMs.value, activeBeforeReflection);
-	assert.equal(reset?.activeLoops.value, 2n);
-	assert.equal(reset?.rootLoops.paused, true);
-	await child.command("all-loop");
-	await new Promise((resolve) => setTimeout(resolve, 100));
-	assert.equal(root.counters()?.allLoops.value, 2n);
-	assert.equal(root.counters()?.activeLoops.value, 2n);
-	await root.resume();
-	await child.command("idle");
+	const activeBeforeInternalAsk = root.counters()?.activeMs.value;
 	await child.command("all-loop");
 	await waitFor(
 		() =>
 			root.counters()?.allLoops.value === 3n &&
 			root.counters()?.activeLoops.value === 3n,
-		"post-resume loop",
+		"post-recovery loop",
+	);
+	assert.ok(
+		(root.counters()?.activeMs.value ?? 0n) >= (activeBeforeInternalAsk ?? 0n),
 	);
 
 	const revisionBeforeLeave = root.counters()?.revision;

@@ -1,21 +1,13 @@
-/**
- * Dedicated below-editor TUI status line for the root watchdog.
- *
- * The widget is a live component: it reads the current state on every render
- * and truncates to the terminal width, so a 1 Hz ticker refreshes it without
- * reinstalling. It never replaces Pi's footer and is only installed for the
- * current root session in TUI mode.
- */
+/** Responsive below-editor status row, matching Continue Watchdog's pattern. */
 
-import type { Component, TUI } from "@earendil-works/pi-tui";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import type { ActivityStatus } from "./activity.js";
+import type { ActivityStatus } from "./activity-types.js";
 
 export const WIDGET_KEY = "pi-reflect-watchdog";
 export const WIDGET_PLACEMENT = "belowEditor";
 
-/** Theme face needed to style the line; matches the public Theme.fg API. */
 export interface WidgetTheme {
 	fg(color: string, text: string): string;
 }
@@ -30,7 +22,6 @@ export interface WidgetState {
 	allLoopLimit: number;
 }
 
-/** Compact duration: seconds under a minute, then m+s, then h+m. */
 export function formatDuration(ms: number): string {
 	const seconds = Math.max(0, Math.floor(ms / 1000));
 	if (seconds < 60) return `${seconds}s`;
@@ -41,11 +32,19 @@ export function formatDuration(ms: number): string {
 }
 
 export function formatWidgetText(state: WidgetState): string {
-	const active = state.activity;
 	return (
-		`Reflect Watchdog | active ${formatDuration(active.elapsedMs)}/${active.loops} loops` +
+		`Reflect Watchdog | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops` +
 		` · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
 		` · root ${state.rootLoops}/${state.rootLoopLimit}` +
+		` · all ${state.allLoops}/${state.allLoopLimit}`
+	);
+}
+
+export function formatCompactWidgetText(state: WidgetState): string {
+	return (
+		`RW | a ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops}` +
+		` · t ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
+		` · r ${state.rootLoops}/${state.rootLoopLimit}` +
 		` · all ${state.allLoops}/${state.allLoopLimit}`
 	);
 }
@@ -56,13 +55,12 @@ export function createWatchdogWidget(
 ): Component {
 	return {
 		render(width: number): string[] {
-			return [
-				truncateToWidth(theme.fg("muted", formatWidgetText(state())), width),
-			];
+			const current = state();
+			const full = formatWidgetText(current);
+			const compact = formatCompactWidgetText(current);
+			const text = visibleWidth(full) <= width ? full : compact;
+			return [truncateToWidth(theme.fg("dim", text), Math.max(1, width))];
 		},
-		// The line is recomputed from live state on every render; no cache.
 		invalidate(): void {},
 	};
 }
-
-export type WatchdogWidgetFactory = (tui: TUI, theme: WidgetTheme) => Component;
