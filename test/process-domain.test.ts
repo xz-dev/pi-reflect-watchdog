@@ -513,3 +513,31 @@ test("offline writes stay recoverable and reconnect republishes current state", 
 	assert.deepEqual(node.sent.at(-1)?.value, { revision: "3", busy: true });
 	await coordinator.detach(instance);
 });
+
+test("transient host-offline writes resolve without fatal reporting", async () => {
+	const node = new FakeNode("client", "child");
+	node.emitPeer("host", "online");
+	let fatalCount = 0;
+	const coordinator = createReflectDomainCoordinator({
+		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
+		open: async () => node,
+	});
+	const instance = {};
+	let busy = false;
+	await coordinator.attach(instance, {
+		getBusy: () => busy,
+		onFatal() {
+			fatalCount += 1;
+		},
+	});
+	node.sendError = new Error("process-domain host is offline");
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	assert.equal(fatalCount, 0);
+	assert.equal(coordinator.counters(), undefined);
+	node.sendError = null;
+	node.emitPeer("host", "online");
+	await flush();
+	assert.deepEqual(node.sent.at(-1)?.value, { revision: "3", busy: true });
+	await coordinator.detach(instance);
+});

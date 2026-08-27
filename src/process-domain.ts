@@ -42,6 +42,24 @@ export function isReflectDomainFatalError(
 	);
 }
 
+const TRANSIENT_TRANSPORT_MESSAGES = [
+	"process-domain host is offline",
+	"process-domain host disconnected",
+	"process-domain peer disconnected",
+	"process-domain acknowledgement timed out",
+	"process-domain connection timed out",
+	"process-domain connection closed",
+	"process-domain send timed out",
+] as const;
+
+function isTransientTransportError(error: unknown): boolean {
+	if (error instanceof TypeError) return false;
+	const message = error instanceof Error ? error.message : "";
+	return TRANSIENT_TRANSPORT_MESSAGES.some((candidate) =>
+		message.includes(candidate),
+	);
+}
+
 export interface ReflectCounterValue {
 	readonly value: bigint;
 }
@@ -768,6 +786,11 @@ export function createReflectDomainCoordinator(
 					allLoops: clientWrite.allLoops.toString(),
 				} satisfies LoopWire);
 			} catch (error) {
+				if (!rootProcess && isTransientTransportError(error)) {
+					// Reconnect replays activity and the cumulative loop snapshot.
+					markClientUncertain();
+					return;
+				}
 				reportFatal(
 					error instanceof Error
 						? error
@@ -796,6 +819,10 @@ export function createReflectDomainCoordinator(
 					allLoops: allLoops.toString(),
 				} satisfies LoopWire);
 			} catch (error) {
+				if (!rootProcess && isTransientTransportError(error)) {
+					markClientUncertain();
+					return;
+				}
 				reportFatal(
 					error instanceof Error
 						? error
