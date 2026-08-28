@@ -439,6 +439,54 @@ test("provisional reflection, valid response, and its turn_end add no activity o
 	assert.equal(domain.counters().taskMs.value, 0n);
 });
 
+test("provisional reflection never captures an uncorrelated ordinary assistant", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	// Reflection dispatched while an ordinary run is busy stays provisional
+	// until its own prompt is correlated via message_start; the ordinary
+	// assistant reply must pass through untouched.
+	const replacement = await pi.emit(
+		"message_end",
+		assistant("ordinary work in progress"),
+		ctx,
+	);
+	assert.equal(
+		replacement,
+		undefined,
+		"provisional run must not rewrite the ordinary assistant",
+	);
+	// The steer prompt then starts its own turn and is correlated.
+	await pi.emit("agent_start", {}, ctx);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	assert.deepEqual(captured.message.content, []);
+	assert.equal(
+		captured.message.stopReason ?? "stop",
+		"stop",
+		"neutralized inquiry assistant keeps a non-abort terminal state",
+	);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+});
+
+test("confirmed neutralized assistant never synthesizes aborted stopReason", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	const replacement = await pi.emit(
+		"message_end",
+		{ message: { role: "assistant", content: [{ type: "text", text: validNoIssue }], stopReason: "stop" } },
+		ctx,
+	);
+	assert.equal(replacement.message.stopReason, "stop");
+	assert.equal(replacement.message.errorMessage, undefined);
+});
+
 test("invalid XML re-ask remains internal through its successful turn", async () => {
 	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);

@@ -661,11 +661,12 @@ export function createWatchdogExtension(
 		const handleMessageEnd = (event: MessageEndEvent) => {
 			const active = runtime.activeReflection;
 			if (active === undefined) return;
-			const selfRun = runtime.internalRun.kind !== "none";
+			// Only a run whose inquiry prompt was confirmed via message_start may
+			// capture an assistant. A provisional internal run shares the turn
+			// with ordinary work and must never claim its assistant replies.
 			if (
-				!selfRun ||
-				(runtime.internalRun.kind === "confirmed" &&
-					runtime.internalRun.attempt !== active.attempt)
+				runtime.internalRun.kind !== "confirmed" ||
+				runtime.internalRun.attempt !== active.attempt
 			)
 				return;
 			const text = active.handle.capture(event.message);
@@ -674,10 +675,11 @@ export function createWatchdogExtension(
 			active.planned = validation.valid
 				? validation.decision
 				: { error: validation.error };
+			// Keep the provider's original stopReason. Synthesizing "aborted"
+			// here would leak this plugin's internal lifecycle into the global
+			// abort semantics other extensions legitimately observe.
 			return {
-				message: active.handle.neutralize(event.message, {
-					stopReason: "aborted",
-				}),
+				message: active.handle.neutralize(event.message),
 			};
 		};
 		(pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(
