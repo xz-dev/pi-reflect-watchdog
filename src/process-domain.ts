@@ -1,6 +1,7 @@
 import {
 	isProcessDomainOpenError,
 	openProcessDomain,
+	openSharedProcessDomain,
 	type ProcessDomainDataMessage,
 	type ProcessDomainEvent,
 	type ProcessDomainNode,
@@ -361,7 +362,7 @@ function revisionMap(
 export function createReflectDomainCoordinator(
 	options: ReflectDomainOptions = {},
 ): ReflectDomainCoordinator {
-	const open = options.open ?? openProcessDomain;
+	const open = options.open ?? openSharedProcessDomain;
 	const env = options.env ?? process.env;
 	const clock = options.clock ?? {
 		setTimeout: (callback: () => void, delayMs: number) =>
