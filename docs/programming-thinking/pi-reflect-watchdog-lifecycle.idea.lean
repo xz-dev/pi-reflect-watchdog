@@ -125,8 +125,9 @@ def countTurn (state : State) (outcome : TurnOutcome) : State :=
     { next with pending := mergeTriggers next.pending (crossed next) }
   else state
 
--- Lifecycle transitions follow Continue Watchdog seams. Pending reasons can
--- dispatch one inquiry, reflection completion clears it, and shutdown is final.
+-- Lifecycle transitions follow Continue Watchdog seams. Pending reasons enter
+-- Pi's native queue without waiting for local or peer idleness; one inquiry,
+-- reflection completion, and terminal shutdown remain serialized.
 def step (state : State) (event : Event) : State :=
   if state.phase = .shutdown then state
   else
@@ -144,7 +145,7 @@ def step (state : State) (event : Event) : State :=
         { state with pending := state.pending ++ [.userRequest] }
     | .dispatchReflection =>
         if state.phase = .main && state.pending ≠ [] &&
-            !state.inquiryActive && !state.localBusy && !state.otherBusy then
+            !state.inquiryActive then
           { state with inquiryActive := true, runKind := .reflection }
         else state
     | .reflectionFinished decision =>
@@ -195,8 +196,8 @@ def Safe (state : State) : Prop :=
     state.localBusy = false ∧ state.otherBusy = false ∧
       state.inquiryActive = false ∧ state.pending = []
 
--- Supporting lemmas prove exact outcomes, time/loop exclusion, inquiry guards,
--- ownership recovery, correction behavior, and terminal shutdown.
+-- Supporting lemmas prove exact outcomes, time/loop exclusion, native queued
+-- dispatch while work is busy, ownership recovery, correction, and shutdown.
 theorem success_policy_exact (outcome : TurnOutcome) :
     modelTurnSucceeded outcome = true ↔
       outcome = .stop ∨ outcome = .toolUse := by
@@ -238,19 +239,19 @@ theorem manual_reflection_can_dispatch :
     (step queued .dispatchReflection).inquiryActive = true := by
   decide
 
-theorem simultaneous_local_and_other_busy_blocks_dispatch :
+theorem simultaneous_local_and_other_busy_still_dispatches :
     let main := step initial .acquireMain
     let localRun := step main (.agentStart .ordinary)
     let both := step localRun (.observeOtherBusy true)
     let queued := step both .queueManualReflection
-    (step queued .dispatchReflection).inquiryActive = false := by
+    (step queued .dispatchReflection).inquiryActive = true := by
   decide
 
-theorem local_busy_blocks_dispatch :
+theorem local_busy_still_dispatches :
     let main := step initial .acquireMain
     let localRun := step main (.agentStart .ordinary)
     let queued := step localRun .queueManualReflection
-    (step queued .dispatchReflection).inquiryActive = false := by
+    (step queued .dispatchReflection).inquiryActive = true := by
   decide
 
 theorem dispatch_classifies_reflection :
@@ -281,7 +282,8 @@ theorem shutdown_is_absorbing (state : State) (event : Event)
   simp [step, stopped]
 
 -- Top-level correctness combines exact successful-loop policy, complete
--- internal time/loop exclusion, dispatch/reclaim, correction, and termination.
+-- internal time/loop exclusion, native queued dispatch/reclaim, correction,
+-- and termination.
 theorem process_is_correct :
     (∀ outcome, modelTurnSucceeded outcome = true ↔
       outcome = .stop ∨ outcome = .toolUse) ∧
@@ -296,11 +298,11 @@ theorem process_is_correct :
       let localRun := step main (.agentStart .ordinary)
       let both := step localRun (.observeOtherBusy true)
       let queued := step both .queueManualReflection
-      (step queued .dispatchReflection).inquiryActive = false) ∧
+      (step queued .dispatchReflection).inquiryActive = true) ∧
     (let main := step initial .acquireMain
       let localRun := step main (.agentStart .ordinary)
       let queued := step localRun .queueManualReflection
-      (step queued .dispatchReflection).inquiryActive = false) ∧
+      (step queued .dispatchReflection).inquiryActive = true) ∧
     (let main := step initial .acquireMain
       let queued := step main .queueManualReflection
       (step queued .dispatchReflection).runKind = .reflection) ∧
@@ -331,9 +333,9 @@ theorem process_is_correct :
   constructor
   · exact manual_reflection_can_dispatch
   constructor
-  · exact simultaneous_local_and_other_busy_blocks_dispatch
+  · exact simultaneous_local_and_other_busy_still_dispatches
   constructor
-  · exact local_busy_blocks_dispatch
+  · exact local_busy_still_dispatches
   constructor
   · exact dispatch_classifies_reflection
   constructor
@@ -355,4 +357,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "minimal reflect lifecycle: ask + successful loops; internal time and loops excluded; no pause state"
+  IO.println "minimal reflect lifecycle: native queued ask + successful loops; internal time and loops excluded; no pause state"

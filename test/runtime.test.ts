@@ -372,7 +372,7 @@ test("failed and unknown assistant outcomes never reach domain counters", async 
 	assert.equal(domain.allWrites, 0);
 });
 
-test("observer and subagent successful loops increment all but not root", async () => {
+test("same-process child threshold queues reflection while the child stays busy", async () => {
 	const hub = createObservableAgentHub();
 	const domain = new FakeDomain();
 	const root = install({
@@ -394,13 +394,10 @@ test("observer and subagent successful loops increment all but not root", async 
 	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 1);
-	assert.equal(root.pi.messages.length, 0);
-	child.ctx.setIdle(true);
-	await child.pi.emit("agent_settled", {}, child.ctx);
 	assert.match(lastInquiry(root.pi)?.content ?? "", /ALL_LOOP_LIMIT/);
 });
 
-test("cross-process child busy keeps reflection queued until aggregate idle", async () => {
+test("cross-process child threshold queues reflection while the child stays busy", async () => {
 	const { pi, ctx, domain } = install({
 		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
 	});
@@ -409,9 +406,24 @@ test("cross-process child busy keeps reflection queued until aggregate idle", as
 	await pi.emit("agent_start", {}, ctx);
 	domain.setRemoteBusy(true);
 	await domain.recordAllLoop();
-	assert.equal(lastInquiry(pi), undefined);
-	domain.setRemoteBusy(false);
 	assert.match(lastInquiry(pi)?.content ?? "", /ALL_LOOP_LIMIT/);
+});
+
+test("native Pi steering queue accepts reflection despite an existing pending message", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	ctx.setPendingMessages(true);
+	await pi.emit("agent_start", {}, ctx);
+	await domain.recordAllLoop();
+	const inquiry = lastInquiry(pi);
+	assert.match(inquiry?.content ?? "", /ALL_LOOP_LIMIT/);
+	assert.deepEqual(pi.messages[pi.messages.length - 1]?.options, {
+		triggerTurn: true,
+		deliverAs: "steer",
+	});
 });
 
 test("provisional reflection, valid response, and its turn_end add no activity or loops", async () => {
@@ -480,7 +492,13 @@ test("confirmed neutralized assistant never synthesizes aborted stopReason", asy
 	await startReflectionRun(pi, ctx);
 	const replacement = await pi.emit(
 		"message_end",
-		{ message: { role: "assistant", content: [{ type: "text", text: validNoIssue }], stopReason: "stop" } },
+		{
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: validNoIssue }],
+				stopReason: "stop",
+			},
+		},
 		ctx,
 	);
 	assert.equal(replacement.message.stopReason, "stop");
@@ -526,11 +544,23 @@ test("route correction starts one ordinary continuation that counts normally", a
 	assert.equal(domain.rootWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":correction"),
-		).length,
-		1,
+	const correction = [...pi.messages]
+		.reverse()
+		.find(
+			({ message }) =>
+				message.customType === "pi-reflect-watchdog:route-correction",
+		);
+	assert.ok(correction);
+	assert.deepEqual(correction.options, {
+		deliverAs: "steer",
+		triggerTurn: true,
+	});
+	assert.match(correction.message.content, /Continue the current task/);
+	assert.match(correction.message.content, /Do not emit reflection XML/);
+	assert.doesNotMatch(
+		correction.message.customType,
+		/:inquiry(?::|$)/,
+		"ordinary continuation is outside the internal inquiry namespace",
 	);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);

@@ -7,10 +7,10 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - Pi lifecycle state comes from `agent_start`, live `probePiAgentState`, and authoritative `agent_settled`.
 - Only successful assistant `turn_end` outcomes count: `stop` and `toolUse`.
 - `error`, `aborted`, `length`, `pending`, `deferred`, and unknown outcomes do not count.
-- Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and may steer the current ordinary run between turns.
-- `/reflect [optional supplement]` dispatches when this attachment is the current main and the aggregate lifecycle is safe; otherwise it stays queued.
+- Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.
+- `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main.
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
-- `ROUTE_CORRECTION` starts one ordinary continuation; that continuation counts normally.
+- `ROUTE_CORRECTION` starts one ordinary continuation with an explicit no-XML instruction; that continuation counts normally.
 - Reflection may use up to 10 tool calls across at most three XML attempts.
 - XML element names and reflection `type` value are case-insensitive.
 

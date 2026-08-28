@@ -48,7 +48,6 @@ import {
 const STATUS_KEY = "pi-reflect-watchdog";
 const REFLECT_COMMAND = "reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
-const REFLECTION_MESSAGE_TYPE = `${REFLECTION_INQUIRY_NAMESPACE}:inquiry`;
 const ACTIVE_TICK_MS = 1_000;
 const RPC_STATUS_TICK_MS = 30_000;
 
@@ -306,27 +305,11 @@ function scheduleRefresh(runtime: Runtime, services: RuntimeServices): void {
 }
 
 function safeToDispatch(runtime: Runtime): boolean {
-	if (
-		!owns(runtime) ||
-		runtime.ctx === null ||
-		runtime.activeReflection !== undefined
-	)
-		return false;
-	const piState = probePiAgentState(runtime.ctx);
-	const counters = currentCounters(runtime);
-	const localCountsAsBusy =
-		runtime.localBusy && runtime.internalRun.kind === "none";
-	const sameProcessOthersBusy = Math.max(
-		0,
-		runtime.hub.snapshot.busyCount - (localCountsAsBusy ? 1 : 0),
-	);
-	const crossProcessOthersBusy = counters?.otherBusy === true;
 	return (
-		!piState.pendingMessages &&
-		sameProcessOthersBusy === 0 &&
-		!crossProcessOthersBusy &&
-		counters?.certain === true &&
-		(piState.idle || localCountsAsBusy)
+		owns(runtime) &&
+		runtime.ctx !== null &&
+		runtime.activeReflection === undefined &&
+		currentCounters(runtime)?.certain === true
 	);
 }
 
@@ -402,9 +385,10 @@ function finishReflection(
 	if (decision?.type === "ROUTE_CORRECTION") {
 		runtime.pi.sendMessage(
 			{
-				customType: `${REFLECTION_MESSAGE_TYPE}:correction`,
+				customType: `${REFLECTION_INQUIRY_NAMESPACE}:route-correction`,
 				content: [
-					`Reflect watchdog correction: ${decision.reason}`,
+					"Continue the current task using this corrected route. Do not emit reflection XML.",
+					`Reason: ${decision.reason}`,
 					`Done: ${decision.done}`,
 					`Current step: ${decision.currentStep}`,
 					`Next step: ${decision.nextStep}`,

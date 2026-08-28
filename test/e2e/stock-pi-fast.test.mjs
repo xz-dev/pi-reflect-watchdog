@@ -317,6 +317,8 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	const continuationMessages = JSON.stringify(
 		provider.requests[1].body.messages,
 	);
+	assert.match(continuationMessages, /Continue the current task/);
+	assert.match(continuationMessages, /Do not emit reflection XML/);
 	assert.match(continuationMessages, /Next step: apply corrected route/);
 	assert.equal(
 		provider.requests[1].body.messages.some(
@@ -357,7 +359,7 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 		entries.filter(
 			(entry) =>
 				entry.type === "custom_message" &&
-				entry.customType === "pi-reflect-watchdog:inquiry:correction",
+				entry.customType === "pi-reflect-watchdog:route-correction",
 		).length,
 		1,
 	);
