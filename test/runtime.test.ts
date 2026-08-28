@@ -2,6 +2,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
+import type { WatchdogConfig } from "../src/config.js";
 import { createWatchdogExtension } from "../src/extension.js";
 import {
 	createObservableAgentHub,
@@ -15,11 +17,24 @@ import { DEFAULT_REFLECTION_PROMPT } from "../src/prompts.js";
 
 class Pi {
 	readonly handlers = new Map<string, (event: any, ctx: any) => any>();
+	readonly bus = new Map<string, Set<(data: unknown) => void>>();
 	readonly commands: Array<{
 		name: string;
 		handler: (args: string, ctx: any) => any;
 	}> = [];
 	readonly messages: Array<{ message: any; options: any }> = [];
+
+	readonly events = {
+		on: (channel: string, handler: (data: unknown) => void) => {
+			const handlers = this.bus.get(channel) ?? new Set();
+			handlers.add(handler);
+			this.bus.set(channel, handlers);
+			return () => handlers.delete(handler);
+		},
+		emit: (channel: string, data: unknown) => {
+			for (const handler of this.bus.get(channel) ?? []) handler(data);
+		},
+	};
 
 	on(name: string, handler: (event: any, ctx: any) => any) {
 		this.handlers.set(name, handler);
@@ -44,6 +59,7 @@ function counter(value = 0n) {
 
 class FakeDomain implements ReflectDomainCoordinator {
 	readonly rootProcess = true;
+	paused = false;
 	readonly activityWrites: boolean[] = [];
 	rootWrites = 0;
 	allWrites = 0;
@@ -65,6 +81,10 @@ class FakeDomain implements ReflectDomainCoordinator {
 
 	async detach(instance: object) {
 		this.attachments.delete(instance);
+		if (this.attachments.size === 0) {
+			this.paused = false;
+			this.value = { ...this.value, paused: false };
+		}
 		this.refreshBusy();
 	}
 
@@ -75,6 +95,7 @@ class FakeDomain implements ReflectDomainCoordinator {
 	}
 
 	async recordRootLoop() {
+		if (this.paused) return this.value;
 		this.rootWrites += 1;
 		this.value = this.next({
 			activeLoops: this.value.activeLoops.value + 1n,
@@ -86,6 +107,7 @@ class FakeDomain implements ReflectDomainCoordinator {
 	}
 
 	async recordAllLoop() {
+		if (this.paused) return this.value;
 		this.allWrites += 1;
 		this.value = this.next({
 			activeLoops: this.value.activeLoops.value + 1n,
@@ -109,6 +131,13 @@ class FakeDomain implements ReflectDomainCoordinator {
 	async resetReminderCycle() {
 		this.resetWrites += 1;
 		this.value = this.next({ taskMs: 0n, rootLoops: 0n, allLoops: 0n });
+		this.publish();
+		return this.value;
+	}
+
+	async setPaused(paused: boolean) {
+		this.paused = paused;
+		this.value = { ...this.value, paused };
 		this.publish();
 		return this.value;
 	}
@@ -177,6 +206,7 @@ class FakeDomain implements ReflectDomainCoordinator {
 			revision: this.revision,
 			generation: this.revision,
 			certain: true,
+			paused: this.paused,
 			anyBusy: false,
 			localBusy: false,
 			otherBusy: false,
@@ -237,12 +267,13 @@ function context(
 	};
 }
 
-const config = {
+const config: WatchdogConfig = {
 	rootLoopLimit: 2,
 	allLoopLimit: 3,
 	taskMinutes: 30,
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
+	hookPauses: [],
 };
 
 function install(
@@ -267,6 +298,15 @@ function install(
 		},
 	})(pi as any);
 	return { pi, ctx, domain };
+}
+
+function publishHook(pi: Pi, name: string) {
+	publishSemanticHook(pi.events, { name });
+}
+
+async function flushAsync() {
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function turnEnd(stopReason: string) {
@@ -309,6 +349,170 @@ async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	await pi.emit("agent_start", {}, ctx);
 	await correlateReflection(pi, ctx);
 }
+
+test("paired semantic hooks nest independently, overlap, and keep manual reflect available", async () => {
+	const { pi, ctx, domain } = install({
+		limits: {
+			rootLoopLimit: 1,
+			hookPauses: [
+				{ pause: "inquiry-started", resume: "inquiry-finished" },
+				{ pause: "inquiry-started", resume: "review-finished" },
+			],
+		},
+	});
+	await pi.emit("session_start", {}, ctx);
+	publishHook(pi, "inquiry-finished");
+	publishHook(pi, "inquiry-started");
+	publishHook(pi, "inquiry-started");
+	await flushAsync();
+	assert.equal(domain.paused, true);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(lastInquiry(pi), undefined);
+
+	await pi.commands[0]?.handler("manual during pause", ctx);
+	assert.match(lastInquiry(pi)?.content ?? "", /USER_REQUEST/);
+	const manualCount = pi.messages.length;
+	publishHook(pi, "inquiry-finished");
+	publishHook(pi, "review-finished");
+	await flushAsync();
+	assert.equal(domain.paused, true, "one nested depth remains");
+	publishHook(pi, "inquiry-finished");
+	publishHook(pi, "review-finished");
+	await flushAsync();
+	assert.equal(domain.paused, false);
+	assert.equal(pi.messages.length, manualCount);
+});
+
+test("paused lifecycle observations do not reopen process-domain activity", async () => {
+	const { pi, ctx, domain } = install({
+		limits: {
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	await pi.emit("session_start", {}, ctx);
+	publishHook(pi, "work-paused");
+	await flushAsync();
+	const writesBefore = domain.activityWrites.length;
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.activityWrites.length, writesBefore);
+	publishHook(pi, "work-resumed");
+	await flushAsync();
+	assert.equal(domain.paused, false);
+});
+
+test("observer lifecycle is gated by authoritative domain pause", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const root = install({
+		hub,
+		domain,
+		ctx: context("root", { hasUI: true }),
+		limits: {
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	const child = install({
+		hub,
+		domain,
+		ctx: context("child", { hasUI: false }),
+		limits: {
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	await child.pi.emit("session_start", {}, child.ctx);
+	publishHook(root.pi, "work-paused");
+	await flushAsync();
+	const writesBefore = domain.activityWrites.length;
+	child.ctx.setIdle(false);
+	await child.pi.emit("agent_start", {}, child.ctx);
+	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	child.ctx.setIdle(true);
+	await child.pi.emit("agent_settled", {}, child.ctx);
+	assert.equal(domain.activityWrites.length, writesBefore);
+	assert.equal(domain.allWrites, 0);
+	publishHook(root.pi, "work-resumed");
+	await flushAsync();
+	child.ctx.setIdle(false);
+	await child.pi.emit("agent_start", {}, child.ctx);
+	assert.equal(domain.activityWrites.at(-1), true);
+});
+
+test("resume re-evaluates frozen threshold and shutdown unsubscribes and resumes", async () => {
+	const { pi, ctx, domain } = install({
+		limits: {
+			rootLoopLimit: 1,
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	await pi.emit("session_start", {}, ctx);
+	publishHook(pi, "work-paused");
+	await flushAsync();
+	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.rootWrites, 0);
+	assert.equal(lastInquiry(pi), undefined);
+	pi.events.emit("pi:semantic-hook:v1", { version: 9, name: "work-resumed" });
+	assert.equal(domain.paused, true);
+	publishHook(pi, "work-resumed");
+	await flushAsync();
+	assert.equal(domain.paused, false);
+	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
+
+	publishHook(pi, "work-paused");
+	await flushAsync();
+	assert.equal(domain.paused, true);
+	await pi.emit("session_shutdown", {}, ctx);
+	await flushAsync();
+	assert.equal(domain.paused, false);
+	publishHook(pi, "work-paused");
+	await flushAsync();
+	assert.equal(domain.paused, false);
+});
+
+test("observer shutdown preserves owner pause until final domain detach", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const root = install({
+		hub,
+		domain,
+		ctx: context("root", { hasUI: true }),
+		limits: {
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	const child = install({
+		hub,
+		domain,
+		ctx: context("child", { hasUI: false }),
+		limits: {
+			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
+		},
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	await child.pi.emit("session_start", {}, child.ctx);
+	publishHook(root.pi, "work-paused");
+	await flushAsync();
+	assert.equal(domain.paused, true);
+	await child.pi.emit("session_shutdown", {}, child.ctx);
+	await flushAsync();
+	assert.equal(domain.paused, true, "observer cannot resume the owner pause");
+	await root.pi.emit("session_shutdown", {}, root.ctx);
+	await flushAsync();
+	assert.equal(
+		domain.paused,
+		false,
+		"final detach destroys paused domain state",
+	);
+});
 
 test("minimal core exposes only /reflect and no model tools", async () => {
 	const { pi, ctx } = install();

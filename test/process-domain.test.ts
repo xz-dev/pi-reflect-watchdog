@@ -9,6 +9,7 @@ import {
 	createReflectDomainCoordinator,
 	type ReflectDomainClock,
 	type ReflectDomainCounters,
+	setReflectDomainPausedForWatchdog,
 } from "../src/process-domain.js";
 
 class FakeNode implements ProcessDomainNode {
@@ -98,11 +99,15 @@ class FakeNode implements ProcessDomainNode {
 			listener(message);
 	}
 
-	emitPeer(nodeId: string, status: "online" | "offline"): void {
+	emitPeer(
+		nodeId: string,
+		status: "online" | "offline",
+		activity: "idle" | "busy" = "idle",
+	): void {
 		const peer = {
 			nodeId,
 			status,
-			metadata: { activity: "idle" },
+			metadata: { activity },
 			connectedAt: Date.now(),
 			...(status === "offline" ? { disconnectedAt: Date.now() } : {}),
 		} as const;
@@ -148,6 +153,95 @@ const counterSends = (node: FakeNode) =>
 		(entry) => entry.channel === "pi-reflect-watchdog.counters.v2",
 	);
 
+test("process-domain pause freezes local and child writes and reconciles live activity on resume", async () => {
+	const node = new FakeNode("host");
+	const time = fakeClock();
+	let nowMs = 10_000;
+	let liveBusy = true;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		clock: time.clock,
+		activeTickMs: 250,
+		now: () => nowMs,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => liveBusy,
+		onFatal() {},
+	});
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	await coordinator.setBusy(instance, false);
+	await coordinator.setBusy(instance, true);
+	time.fireNext();
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, 250n);
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+	assert.equal(coordinator.paused, true);
+	const frozen = coordinator.counters();
+	await coordinator.setBusy(instance, false);
+	await coordinator.recordRootLoop();
+	node.emitPeer("child", "online", "busy");
+	await flush();
+	node.emitChannel("pi-reflect-watchdog.activity.v2", {
+		revision: "1",
+		busy: true,
+	});
+	node.emitChannel("pi-reflect-watchdog.loop.v2", {
+		revision: "1",
+		rootLoops: "0",
+		allLoops: "1",
+	});
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, frozen?.activeMs.value);
+	assert.equal(coordinator.counters()?.localBusy, true);
+	assert.equal(coordinator.counters()?.otherBusy, false);
+	assert.equal(
+		coordinator.counters()?.rootLoops.value,
+		frozen?.rootLoops.value,
+	);
+	assert.equal(coordinator.counters()?.allLoops.value, frozen?.allLoops.value);
+
+	liveBusy = false;
+	nowMs += 10_000;
+	await setReflectDomainPausedForWatchdog(coordinator, false);
+	assert.equal(coordinator.paused, false);
+	assert.equal(coordinator.counters()?.localBusy, false);
+	assert.equal(coordinator.counters()?.otherBusy, true);
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	await coordinator.detach(instance);
+});
+
+test("paused duration shifts an existing idle timestamp and resume-to-idle records now", async () => {
+	const node = new FakeNode("host");
+	let nowMs = 1_000;
+	let liveBusy = true;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		now: () => nowMs,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => liveBusy,
+		onFatal() {},
+	});
+	liveBusy = false;
+	await coordinator.setBusy(instance, false);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 1_000n);
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+	nowMs = 11_000;
+	await setReflectDomainPausedForWatchdog(coordinator, false);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 11_000n);
+
+	liveBusy = true;
+	await coordinator.setBusy(instance, true);
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+	liveBusy = false;
+	nowMs = 21_000;
+	await setReflectDomainPausedForWatchdog(coordinator, false);
+	assert.equal(coordinator.counters()?.endLoopTimeMs, 21_000n);
+	await coordinator.detach(instance);
+});
+
 test("root owns root/domain counters and child loop increments aggregate", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
@@ -180,6 +274,7 @@ test("root owns root/domain counters and child loop increments aggregate", async
 		generation: "5",
 		domainEpoch: "domain",
 		certain: true,
+		paused: false,
 		anyBusy: false,
 		localBusy: false,
 		otherBusy: false,
@@ -286,6 +381,89 @@ test("attach and reconnect query the live busy source", async () => {
 	await coordinator.detach(instance);
 });
 
+test("client suppresses activity and loops from authoritative pause until a live-state resume write", async () => {
+	const node = new FakeNode("client", "child");
+	node.emitPeer("host", "online");
+	let busy = false;
+	let probes = 0;
+	const coordinator = createReflectDomainCoordinator({
+		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => {
+			probes += 1;
+			return busy;
+		},
+		onFatal() {},
+	});
+	assert.equal(probes, 1);
+
+	node.emitChannel(
+		"pi-reflect-watchdog.counters.v2",
+		{
+			revision: "1",
+			generation: "1",
+			domainEpoch: "domain",
+			certain: true,
+			paused: true,
+			anyBusy: false,
+			localBusy: false,
+			otherBusy: false,
+			endLoopTimeMs: null,
+			activeMs: "0",
+			activeLoops: "0",
+			taskMs: "0",
+			rootLoops: "0",
+			allLoops: "0",
+			activityRevisions: [{ nodeId: "child", revision: "1" }],
+			loopRevisions: [],
+		},
+		"host",
+	);
+	assert.equal(coordinator.paused, true);
+	const sentWhilePaused = node.sent.length;
+	busy = true;
+	await coordinator.setBusy(instance, true);
+	await coordinator.recordAllLoop();
+	assert.equal(node.sent.length, sentWhilePaused);
+
+	busy = false;
+	node.emitPeer("host", "online");
+	await flush();
+	assert.equal(probes, 1);
+	assert.equal(node.sent.length, sentWhilePaused);
+
+	node.emitChannel(
+		"pi-reflect-watchdog.counters.v2",
+		{
+			revision: "2",
+			generation: "2",
+			domainEpoch: "domain",
+			certain: true,
+			paused: false,
+			anyBusy: false,
+			localBusy: false,
+			otherBusy: false,
+			endLoopTimeMs: null,
+			activeMs: "0",
+			activeLoops: "0",
+			taskMs: "0",
+			rootLoops: "0",
+			allLoops: "0",
+			activityRevisions: [{ nodeId: "child", revision: "1" }],
+			loopRevisions: [],
+		},
+		"host",
+	);
+	await flush();
+	assert.equal(coordinator.paused, false);
+	assert.equal(probes, 2);
+	assert.deepEqual(node.sent.at(-1)?.value, { revision: "2", busy: false });
+	await coordinator.detach(instance);
+});
+
 test("client requires snapshot echoes for activity and loop revisions", async () => {
 	const node = new FakeNode("client", "child");
 	node.emitPeer("host", "online");
@@ -312,6 +490,7 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			generation: "1",
 			domainEpoch: "domain",
 			certain: true,
+			paused: false,
 			anyBusy: false,
 			localBusy: false,
 			otherBusy: false,
@@ -334,6 +513,7 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			generation: "2",
 			domainEpoch: "domain",
 			certain: true,
+			paused: false,
 			anyBusy: false,
 			localBusy: false,
 			otherBusy: false,
@@ -356,6 +536,7 @@ test("client requires snapshot echoes for activity and loop revisions", async ()
 			generation: "1",
 			domainEpoch: "domain",
 			certain: true,
+			paused: false,
 			anyBusy: false,
 			localBusy: false,
 			otherBusy: false,

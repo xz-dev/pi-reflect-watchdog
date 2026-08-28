@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, readdir, readFile, realpath } from "node:fs/promises";
+import {
+	access,
+	lstat,
+	mkdir,
+	readdir,
+	readFile,
+	realpath,
+	writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { RELEASE_ALLOWLIST } from "../../scripts/distribution.mjs";
@@ -23,6 +31,7 @@ import {
 	createTestResources,
 	installPackedArtifact,
 	RpcPi,
+	runBoundedProcess,
 	writeJson,
 } from "../../scripts/e2e/harness.mjs";
 
@@ -149,6 +158,147 @@ test("the installed packed tarball loads dist with only the reflect command", as
 			)
 			.map((command) => command.name),
 		["reflect"],
+	);
+});
+
+test("packed stock Pi semantic hook pause suppresses then resumes automatic reflection", {
+	timeout: 60_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-hook-pause-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		rootLoopLimit: 1,
+		allLoopLimit: 500,
+		taskMinutes: 30,
+		hookPauses: [{ pause: "fixture-pause", resume: "fixture-resume" }],
+	});
+	const producerDir = path.join(resources.base, "hook-producer");
+	await mkdir(producerDir, { recursive: true });
+	await writeFile(
+		path.join(producerDir, "package.json"),
+		JSON.stringify({
+			name: "watchdog-hook-producer",
+			version: "1.0.0",
+			type: "module",
+			pi: { extensions: ["./index.js"] },
+			dependencies: {
+				"pi-extension-utils":
+					"git+https://github.com/xz-dev/pi-extension-utils.git#fc15bcfa8bc2f5ad56fe5db69137c9a0e29fb6b0",
+			},
+		}),
+	);
+	await writeFile(
+		path.join(producerDir, "index.js"),
+		`import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
+export default function producer(pi) {
+  pi.registerCommand("fixture-hook", {
+    description: "publish a fixture semantic hook",
+    handler(args) { publishSemanticHook(pi.events, { name: args.trim() }); },
+  });
+}
+`,
+	);
+	const utilityTarball = process.env.PI_EXTENSION_UTILS_E2E_TARBALL;
+	assert.ok(utilityTarball, "PI_EXTENSION_UTILS_E2E_TARBALL is required");
+	const result = await runBoundedProcess(
+		"npm",
+		[
+			"install",
+			"--ignore-scripts",
+			"--no-audit",
+			"--no-fund",
+			"--prefix",
+			producerDir,
+			utilityTarball,
+		],
+		{ timeoutMs: 120_000 },
+	);
+	assert.equal(result.status, 0, result.stderr);
+	assert.equal(
+		(
+			await lstat(path.join(producerDir, "node_modules", "pi-extension-utils"))
+		).isSymbolicLink(),
+		false,
+	);
+	const settingsPath = path.join(isolated.agentDir, "settings.json");
+	const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+	settings.packages.push(producerDir);
+	await writeJson(settingsPath, settings);
+
+	const provider = await startFakeProvider({ responsePlan: warningPlan });
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		args: ["--provider", "watchdog-fixture", "--model", "watchdog-fixture"],
+		launcherArgs: ["--mode", "rpc", "--no-session"],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	await rpc.request({ type: "prompt", message: "/fixture-hook fixture-pause" });
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	provider.requests.length = 0;
+	await rpc.request({
+		type: "prompt",
+		message: "Complete one ordinary tool round while fixture pause is active.",
+	});
+	await waitForProviderRequests(provider, 2);
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(
+		provider.requests.some((request) =>
+			JSON.stringify(request.body.messages).includes("Trigger source(s):"),
+		),
+		false,
+		"paused threshold emitted no reflection",
+	);
+	const pausedRequestCount = provider.requests.length;
+	await rpc.request({
+		type: "prompt",
+		message: "/fixture-hook fixture-resume",
+	});
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	await rpc.request({
+		type: "prompt",
+		message: "Complete another ordinary event after fixture resume.",
+	});
+	const reflectionDeadline = performance.now() + 10_000;
+	let reflection;
+	while (performance.now() < reflectionDeadline) {
+		reflection = provider.requests.find((request) =>
+			JSON.stringify(request.body.messages).includes(
+				"Trigger source(s): ROOT_LOOP_LIMIT",
+			),
+		);
+		if (reflection) break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.ok(reflection, "resume dispatched one qualifying reflection");
+	assert.equal(
+		provider.requests
+			.slice(pausedRequestCount)
+			.filter((request) =>
+				JSON.stringify(request.body.messages).includes(
+					"Trigger source(s): ROOT_LOOP_LIMIT",
+				),
+			).length,
+		1,
+		"resume dispatches exactly one qualifying reflection",
 	);
 });
 

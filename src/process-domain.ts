@@ -1,6 +1,6 @@
 import {
 	isProcessDomainOpenError,
-	openProcessDomain,
+	type openProcessDomain,
 	openSharedProcessDomain,
 	type ProcessDomainDataMessage,
 	type ProcessDomainEvent,
@@ -75,6 +75,7 @@ export interface ReflectDomainCounters {
 	readonly revision: bigint;
 	readonly generation: bigint;
 	readonly certain: boolean;
+	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
 	readonly otherBusy: boolean;
@@ -108,6 +109,7 @@ interface CountersWire {
 	readonly generation: string;
 	readonly domainEpoch: string;
 	readonly certain: boolean;
+	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
 	readonly otherBusy: boolean;
@@ -143,10 +145,11 @@ interface ParsedCounterMessage {
 
 export interface ReflectDomainCoordinator {
 	readonly rootProcess: boolean;
+	readonly paused: boolean;
 	attach(
 		instance: object,
 		options: {
-			/** Queried at attach and after every client reconnect. */
+			/** Queried at attach, after every client reconnect, and when pause ends. */
 			readonly getBusy: () => boolean;
 			readonly onFatal: (error: Error) => void;
 		},
@@ -159,6 +162,32 @@ export interface ReflectDomainCoordinator {
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
 	setIdleResetGapSeconds(seconds: number): void;
 	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
+}
+
+type ReflectDomainPauseControl = (
+	paused: boolean,
+) => Promise<ReflectDomainCounters | undefined>;
+
+type ReflectDomainPauseBridge = ReflectDomainCoordinator & {
+	setPaused: ReflectDomainPauseControl;
+};
+
+const PAUSE_CONTROLS = new WeakMap<
+	ReflectDomainCoordinator,
+	ReflectDomainPauseControl
+>();
+
+/** @internal Watchdog-owned control; intentionally absent from the package root API. */
+export function setReflectDomainPausedForWatchdog(
+	coordinator: ReflectDomainCoordinator,
+	paused: boolean,
+): Promise<ReflectDomainCounters | undefined> {
+	const control = PAUSE_CONTROLS.get(coordinator);
+	if (control !== undefined) return control(paused);
+	const injected = coordinator as Partial<ReflectDomainPauseBridge>;
+	return typeof injected.setPaused === "function"
+		? injected.setPaused(paused)
+		: Promise.resolve(undefined);
 }
 
 export interface ReflectDomainClock {
@@ -200,6 +229,7 @@ function zeroCounters(
 		revision: state.revision ?? 0n,
 		generation,
 		certain: state.certain ?? false,
+		paused: false,
 		anyBusy: state.anyBusy ?? false,
 		localBusy: state.localBusy ?? false,
 		otherBusy: state.otherBusy ?? false,
@@ -222,6 +252,7 @@ function sameCounters(
 		left.revision === right.revision &&
 		left.generation === right.generation &&
 		left.certain === right.certain &&
+		left.paused === right.paused &&
 		left.anyBusy === right.anyBusy &&
 		left.localBusy === right.localBusy &&
 		left.otherBusy === right.otherBusy &&
@@ -310,6 +341,7 @@ function parseCounters(
 		!validRevision(wire.generation) ||
 		!validId(wire.domainEpoch) ||
 		typeof wire.certain !== "boolean" ||
+		typeof wire.paused !== "boolean" ||
 		typeof wire.anyBusy !== "boolean" ||
 		typeof wire.localBusy !== "boolean" ||
 		typeof wire.otherBusy !== "boolean" ||
@@ -331,6 +363,7 @@ function parseCounters(
 			revision: BigInt(wire.revision),
 			generation,
 			certain: wire.certain,
+			paused: wire.paused,
 			anyBusy: wire.anyBusy,
 			localBusy: wire.localBusy,
 			otherBusy: wire.otherBusy,
@@ -376,6 +409,7 @@ export function createReflectDomainCoordinator(
 	const attachments = new Map<object, Attachment>();
 	const listeners = new Set<(counters: ReflectDomainCounters) => void>();
 	const peers = new Map<string, PeerActivity>();
+	const deferredPausedPeers = new Set<string>();
 	const uncertainPeers = new Set<string>();
 	let node: ProcessDomainNode | undefined;
 	let rootProcess = false;
@@ -385,6 +419,10 @@ export function createReflectDomainCoordinator(
 	let hostStateRevision = 0n;
 	let acceptedHostRevision = 0n;
 	let acceptedHostEpoch: string | undefined;
+	let paused = false;
+	let clientPaused = false;
+	let pausedAtMs: bigint | null = null;
+	let pausedAggregateBusy: boolean | null = null;
 	let transportHealthy = true;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
@@ -515,6 +553,7 @@ export function createReflectDomainCoordinator(
 			revision: snapshotRevision,
 			generation: snapshotGeneration,
 			certain: uncertainPeers.size === 0,
+			paused,
 			anyBusy: hostBusy(),
 			localBusy: desiredActivity(),
 			otherBusy: [...peers.values()].some((peer) => peer.busy),
@@ -531,6 +570,7 @@ export function createReflectDomainCoordinator(
 			generation: snapshotGeneration.toString(),
 			domainEpoch,
 			certain: counters.certain,
+			paused,
 			anyBusy: counters.anyBusy,
 			localBusy: counters.localBusy,
 			otherBusy: counters.otherBusy,
@@ -573,7 +613,7 @@ export function createReflectDomainCoordinator(
 		});
 
 	const applyHostActivity = (message: ProcessDomainDataMessage): void => {
-		if (!rootProcess || node === undefined) return;
+		if (!rootProcess || node === undefined || paused) return;
 		const peer = node
 			.peers()
 			.find((candidate) => candidate.nodeId === message.senderId);
@@ -619,13 +659,15 @@ export function createReflectDomainCoordinator(
 		current.rootLoops = loop.rootLoops;
 		current.allLoops = loop.allLoops;
 		hostStateRevision += 1n;
-		const currentCounters = hostCounters();
-		hostState = {
-			...currentCounters,
-			activeLoops: counter(currentCounters.activeLoops.value + allDelta),
-			rootLoops: counter(currentCounters.rootLoops.value + rootDelta),
-			allLoops: counter(currentCounters.allLoops.value + allDelta),
-		};
+		if (!paused) {
+			const currentCounters = hostCounters();
+			hostState = {
+				...currentCounters,
+				activeLoops: counter(currentCounters.activeLoops.value + allDelta),
+				rootLoops: counter(currentCounters.rootLoops.value + rootDelta),
+				allLoops: counter(currentCounters.allLoops.value + allDelta),
+			};
+		}
 		void publishHost().catch(() => {});
 	};
 
@@ -650,7 +692,7 @@ export function createReflectDomainCoordinator(
 		wasBusy: boolean,
 		isBusy: boolean,
 	): void => {
-		if (!rootProcess || wasBusy === isBusy) return;
+		if (!rootProcess || paused || wasBusy === isBusy) return;
 		const current = hostCounters();
 		if (!isBusy) {
 			hostState = {
@@ -676,10 +718,11 @@ export function createReflectDomainCoordinator(
 	};
 
 	const scheduleTick = (): void => {
-		if (!rootProcess || node === undefined || tick !== undefined) return;
+		if (!rootProcess || node === undefined || tick !== undefined || paused)
+			return;
 		tick = clock.setTimeout(() => {
 			tick = undefined;
-			if (!rootProcess || !hostCertain()) return;
+			if (!rootProcess || paused || !hostCertain()) return;
 			if (!hostBusy()) return;
 			const current = hostCounters();
 			hostStateRevision += 1n;
@@ -696,7 +739,7 @@ export function createReflectDomainCoordinator(
 	};
 
 	const updateHostTimers = (): void => {
-		if (!rootProcess || !hostCertain()) return;
+		if (!rootProcess || paused || !hostCertain()) return;
 		if (hostBusy()) {
 			scheduleTick();
 			return;
@@ -713,7 +756,9 @@ export function createReflectDomainCoordinator(
 			if (event.peer.nodeId !== node.declaration.hostNodeId) return;
 			if (event.peer.status === "offline") markClientUncertain();
 			else {
+				const pausedSnapshot = clientPaused;
 				markClientUncertain();
+				if (pausedSnapshot) return;
 				for (const attachment of attachments.values())
 					attachment.busy = attachment.getBusy();
 				void (async () => {
@@ -727,15 +772,17 @@ export function createReflectDomainCoordinator(
 		if (event.peer.status === "online") {
 			if (peers.has(event.peer.nodeId)) return;
 			peers.set(event.peer.nodeId, {
-				busy: event.peer.metadata.activity === "busy",
+				busy: paused ? false : event.peer.metadata.activity === "busy",
 				activityRevision: 0n,
 				loopRevision: 0n,
 				rootLoops: 0n,
 				allLoops: 0n,
 			});
+			if (paused) deferredPausedPeers.add(event.peer.nodeId);
 			uncertainPeers.add(event.peer.nodeId);
 		} else {
 			if (!peers.has(event.peer.nodeId)) return;
+			deferredPausedPeers.delete(event.peer.nodeId);
 			uncertainPeers.add(event.peer.nodeId);
 		}
 		hostStateRevision += 1n;
@@ -904,8 +951,10 @@ export function createReflectDomainCoordinator(
 					parsed.loopRevision < requiredLoopRevision
 				)
 					return;
+				const wasPaused = clientPaused;
 				acceptedHostEpoch = parsed.counters.domainEpoch;
 				acceptedHostRevision = parsed.counters.revision;
+				clientPaused = parsed.counters.paused;
 				countersValue = parsed.counters;
 				for (const listener of Array.from(listeners)) {
 					try {
@@ -913,6 +962,11 @@ export function createReflectDomainCoordinator(
 					} catch {
 						// Listener failures are isolated from coordinator state.
 					}
+				}
+				if (wasPaused && !parsed.counters.paused) {
+					for (const attachment of attachments.values())
+						attachment.busy = attachment.getBusy();
+					void queueWrite("activity").catch(() => {});
 				}
 			});
 			await queueWrite("activity");
@@ -945,9 +999,12 @@ export function createReflectDomainCoordinator(
 		return opening;
 	};
 
-	return {
+	const coordinator: ReflectDomainCoordinator = {
 		get rootProcess() {
 			return rootProcess;
+		},
+		get paused() {
+			return rootProcess ? paused : clientPaused;
 		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
@@ -1005,9 +1062,14 @@ export function createReflectDomainCoordinator(
 				hostStateRevision = 0n;
 				acceptedHostRevision = 0n;
 				acceptedHostEpoch = undefined;
+				paused = false;
+				clientPaused = false;
+				pausedAtMs = null;
+				pausedAggregateBusy = null;
 				transportHealthy = true;
 
 				peers.clear();
+				deferredPausedPeers.clear();
 				uncertainPeers.clear();
 				snapshotRevision = 0n;
 				snapshotGeneration = 0n;
@@ -1022,7 +1084,13 @@ export function createReflectDomainCoordinator(
 		},
 		async setBusy(instance, busy) {
 			const attachment = attachments.get(instance);
-			if (attachment === undefined || attachment.busy === busy) return;
+			if (
+				attachment === undefined ||
+				paused ||
+				clientPaused ||
+				attachment.busy === busy
+			)
+				return;
 			const wasBusy = rootProcess && hostBusy();
 			attachment.busy = busy;
 			if (rootProcess) {
@@ -1036,6 +1104,7 @@ export function createReflectDomainCoordinator(
 			}
 		},
 		async recordRootLoop() {
+			if (paused || clientPaused) return countersValue ?? hostCounters();
 			if (!rootProcess) {
 				await queueWrite("root-loop");
 				return countersValue ?? zeroCounters();
@@ -1053,6 +1122,7 @@ export function createReflectDomainCoordinator(
 			return countersValue ?? hostCounters();
 		},
 		async recordAllLoop() {
+			if (paused || clientPaused) return countersValue ?? hostCounters();
 			if (!rootProcess) {
 				await queueWrite("all-loop");
 				return countersValue ?? zeroCounters();
@@ -1086,6 +1156,62 @@ export function createReflectDomainCoordinator(
 			return countersValue;
 		},
 	};
+	PAUSE_CONTROLS.set(coordinator, (nextPaused) =>
+		queueLifecycle(async () => {
+			if (!rootProcess || countersValue === undefined || paused === nextPaused)
+				return countersValue;
+			if (nextPaused) {
+				paused = true;
+				pausedAtMs = BigInt(now());
+				pausedAggregateBusy = hostBusy();
+				if (tick !== undefined) clock.clearTimeout(tick);
+				tick = undefined;
+				hostStateRevision += 1n;
+				hostState = { ...hostCounters(), paused: true };
+				await publishHost();
+				return countersValue;
+			}
+			const currentTimeMs = BigInt(now());
+			const pausedDurationMs =
+				pausedAtMs === null ? 0n : currentTimeMs - pausedAtMs;
+			const wasBusy = pausedAggregateBusy ?? hostBusy();
+			for (const attachment of attachments.values())
+				attachment.busy = attachment.getBusy();
+			if (node !== undefined)
+				for (const nodeId of deferredPausedPeers) {
+					const peer = peers.get(nodeId);
+					const live = node
+						.peers()
+						.find(
+							(candidate) =>
+								candidate.nodeId === nodeId && candidate.status === "online",
+						);
+					if (peer !== undefined && live !== undefined)
+						peer.busy = live.metadata.activity === "busy";
+				}
+			deferredPausedPeers.clear();
+			paused = false;
+			pausedAtMs = null;
+			pausedAggregateBusy = null;
+			hostStateRevision += 1n;
+			const current = hostCounters();
+			hostState = {
+				...current,
+				paused: false,
+				endLoopTimeMs:
+					current.endLoopTimeMs === null
+						? hostBusy()
+							? null
+							: currentTimeMs
+						: current.endLoopTimeMs + pausedDurationMs,
+			};
+			applyAggregateBusyTransition(wasBusy, hostBusy());
+			await publishHost();
+			updateHostTimers();
+			return countersValue;
+		}),
+	);
+	return coordinator;
 }
 
 const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v2");

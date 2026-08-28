@@ -7,6 +7,7 @@ export {
 	type ConfigDiagnostic,
 	type ConfigInput,
 	type ConfigResult,
+	type HookPausePair,
 	loadConfigText,
 	type MergeConfigResult,
 	mergeConfig,
@@ -34,9 +35,7 @@ export {
 	type ObservableAgentHubSnapshot,
 } from "./hub.js";
 export {
-	createReflectDomainCoordinator,
 	FATAL_EXIT_CODE,
-	getReflectDomainCoordinator,
 	isReflectDomainFatalError,
 	type ReflectDomainCoordinator,
 	type ReflectDomainCounters,

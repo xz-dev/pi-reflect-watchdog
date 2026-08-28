@@ -1,4 +1,10 @@
+import { parseSemanticHook } from "pi-extension-utils/semantic-hook";
 import { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
+
+export interface HookPausePair {
+	readonly pause: string;
+	readonly resume: string;
+}
 
 export interface WatchdogConfig {
 	rootLoopLimit: number;
@@ -6,6 +12,7 @@ export interface WatchdogConfig {
 	taskMinutes: number;
 	idleResetGapSeconds: number;
 	reflectionPrompt: string;
+	hookPauses: readonly HookPausePair[];
 }
 
 export type ConfigInput = Record<string, unknown>;
@@ -31,10 +38,12 @@ export const BUILT_IN_CONFIG: Readonly<WatchdogConfig> = Object.freeze({
 	taskMinutes: 30,
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
+	hookPauses: Object.freeze([]),
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
 const MAX_REFLECTION_PROMPT_CHARACTERS = 16_384;
+const MAX_HOOK_PAUSE_PAIRS = 64;
 
 function diagnostic(source: string, message: string): ConfigDiagnostic {
 	return { source, message: message.slice(0, MAX_DIAGNOSTIC_LENGTH) };
@@ -54,6 +63,96 @@ function boundedPrompt(value: unknown): value is string {
 		value.trim().length > 0 &&
 		Array.from(value).length <= MAX_REFLECTION_PROMPT_CHARACTERS
 	);
+}
+
+function validHookName(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		parseSemanticHook({ version: 1, name: value }).ok
+	);
+}
+
+function readPairNames(
+	value: unknown,
+): { readonly pause: unknown; readonly resume: unknown } | undefined {
+	try {
+		if (value === null || typeof value !== "object" || Array.isArray(value))
+			return undefined;
+		const proto = Object.getPrototypeOf(value);
+		if (proto !== Object.prototype && proto !== null) return undefined;
+		const pause = Object.getOwnPropertyDescriptor(value, "pause");
+		const resume = Object.getOwnPropertyDescriptor(value, "resume");
+		if (
+			pause === undefined ||
+			resume === undefined ||
+			!("value" in pause) ||
+			!("value" in resume) ||
+			"get" in pause ||
+			"set" in pause ||
+			"get" in resume ||
+			"set" in resume
+		)
+			return undefined;
+		return { pause: pause.value, resume: resume.value };
+	} catch {
+		return undefined;
+	}
+}
+
+function parseHookPauses(
+	source: string,
+	value: unknown,
+): { pairs?: HookPausePair[]; diagnostics: ConfigDiagnostic[] } {
+	if (!Array.isArray(value))
+		return {
+			diagnostics: [diagnostic(source, "hookPauses must be an array")],
+		};
+	if (value.length > MAX_HOOK_PAUSE_PAIRS)
+		return {
+			diagnostics: [
+				diagnostic(
+					source,
+					`hookPauses must contain at most ${MAX_HOOK_PAUSE_PAIRS} pairs`,
+				),
+			],
+		};
+	const pairs: HookPausePair[] = [];
+	const seen = new Set<string>();
+	const diagnostics: ConfigDiagnostic[] = [];
+	for (let index = 0; index < value.length; index += 1) {
+		const names = readPairNames(value[index]);
+		if (names === undefined) {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`hookPauses[${index}] must be a plain object with data properties pause and resume`,
+				),
+			);
+			continue;
+		}
+		const { pause, resume } = names;
+		if (!validHookName(pause) || !validHookName(resume)) {
+			diagnostics.push(
+				diagnostic(
+					source,
+					`hookPauses[${index}] pause and resume must be lowercase kebab-case hook names`,
+				),
+			);
+			continue;
+		}
+		if (pause === resume) {
+			diagnostics.push(
+				diagnostic(source, `hookPauses[${index}] pause and resume must differ`),
+			);
+			continue;
+		}
+		const key = `${pause}\u0000${resume}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		pairs.push(Object.freeze({ pause, resume }));
+	}
+	if (diagnostics.length > 0) return { diagnostics };
+	return { pairs, diagnostics };
 }
 
 export function validateConfig(source: string, value: unknown): ConfigResult {
@@ -94,6 +193,12 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			);
 	}
 
+	if (input.hookPauses !== undefined) {
+		const parsed = parseHookPauses(source, input.hookPauses);
+		diagnostics.push(...parsed.diagnostics);
+		if (parsed.pairs !== undefined) config.hookPauses = parsed.pairs;
+	}
+
 	return { config, diagnostics };
 }
 
@@ -131,6 +236,8 @@ export function mergeConfig(
 			config.idleResetGapSeconds = partial.idleResetGapSeconds;
 		if (partial.reflectionPrompt !== undefined)
 			config.reflectionPrompt = partial.reflectionPrompt;
+		if (partial.hookPauses !== undefined)
+			config.hookPauses = partial.hookPauses.slice();
 	}
 
 	return { config, diagnostics: layers.flatMap((layer) => layer.diagnostics) };

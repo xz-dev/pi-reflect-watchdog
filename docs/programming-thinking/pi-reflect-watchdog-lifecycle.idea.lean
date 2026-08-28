@@ -41,13 +41,19 @@ inductive AttachmentPhase where
   deriving Repr, DecidableEq
 
 -- Process data carries one attachment phase, one run classification, one
--- counter authority, one pending ask, and one active inquiry. No pause exists.
+-- counter authority, paired external pause depths, one pending ask, and one active inquiry.
 structure Counters where
   activeMs : Nat
   activeLoops : Nat
   taskMs : Nat
   rootLoops : Nat
   allLoops : Nat
+  deriving Repr, DecidableEq
+
+structure HookPairState where
+  pauseName : String
+  resumeName : String
+  depth : Nat
   deriving Repr, DecidableEq
 
 structure Limits where
@@ -66,6 +72,7 @@ structure State where
   pending : List Trigger
   inquiryActive : Bool
   correctionQueued : Bool
+  hookPairs : List HookPairState
   deriving Repr, DecidableEq
 
 inductive Event where
@@ -73,6 +80,7 @@ inductive Event where
   | loseMain
   | agentStart (kind : RunKind)
   | observeOtherBusy (busy : Bool)
+  | semanticHook (name : String)
   | activeTick
   | successfulTurn (outcome : TurnOutcome)
   | agentSettled
@@ -96,6 +104,16 @@ def crossed (state : State) : List Trigger :=
     then [.taskTimeLimit] else []
   root ++ all ++ task
 
+
+def paused (state : State) : Bool :=
+  state.hookPairs.any (fun pair => pair.depth > 0)
+
+def applyHook (name : String) (pairs : List HookPairState) : List HookPairState :=
+  pairs.map (fun pair =>
+    if pair.pauseName = name then { pair with depth := pair.depth + 1 }
+    else if pair.resumeName = name then { pair with depth := pair.depth - 1 }
+    else pair)
+
 def mergeTriggers (current additions : List Trigger) : List Trigger :=
   additions.foldl (fun result trigger =>
     if trigger ∈ result then result else result ++ [trigger]) current
@@ -103,7 +121,7 @@ def mergeTriggers (current additions : List Trigger) : List Trigger :=
 -- Ordinary active ticks advance both clocks; reflection ticks are lifecycle
 -- visible but excluded from active and task time without any pause transition.
 def countTick (state : State) : State :=
-  if state.localBusy && state.runKind = .ordinary then
+  if !paused state && state.localBusy && state.runKind = .ordinary then
     let next :=
       { state with counters :=
           { state.counters with
@@ -115,7 +133,7 @@ def countTick (state : State) : State :=
 -- Ordinary successful turns increment the loop counters exactly once.
 -- Reflection turns and unsuccessful outcomes preserve every counter.
 def countTurn (state : State) (outcome : TurnOutcome) : State :=
-  if modelTurnSucceeded outcome && state.runKind = .ordinary then
+  if !paused state && modelTurnSucceeded outcome && state.runKind = .ordinary then
     let next :=
       { state with counters :=
           { state.counters with
@@ -138,6 +156,7 @@ def step (state : State) (event : Event) : State :=
     | .agentStart kind =>
         { state with localBusy := true, runKind := kind }
     | .observeOtherBusy busy => { state with otherBusy := busy }
+    | .semanticHook name => { state with hookPairs := applyHook name state.hookPairs }
     | .activeTick => countTick state
     | .successfulTurn outcome => countTurn state outcome
     | .agentSettled => { state with localBusy := false }
@@ -188,7 +207,8 @@ def initial : State :=
       allLoops := 500 }
     pending := []
     inquiryActive := false
-    correctionQueued := false }
+    correctionQueued := false
+    hookPairs := [{ pauseName := "inquiry-started", resumeName := "inquiry-finished", depth := 0 }] }
 
 -- Safety forbids active work, inquiries, and pending asks after shutdown.
 def Safe (state : State) : Prop :=
@@ -196,7 +216,7 @@ def Safe (state : State) : Prop :=
     state.localBusy = false ∧ state.otherBusy = false ∧
       state.inquiryActive = false ∧ state.pending = []
 
--- Supporting lemmas prove exact outcomes, time/loop exclusion, native queued
+-- Supporting lemmas prove exact outcomes, internal and external time/loop exclusion, native queued
 -- dispatch while work is busy, ownership recovery, correction, and shutdown.
 theorem success_policy_exact (outcome : TurnOutcome) :
     modelTurnSucceeded outcome = true ↔
@@ -224,6 +244,7 @@ theorem failed_ordinary_turn_never_counts
 theorem successful_ordinary_turn_counts_once
     (state : State) (outcome : TurnOutcome)
     (ordinary : state.runKind = .ordinary)
+    (running : paused state = false)
     (success : modelTurnSucceeded outcome = true) :
     (countTurn state outcome).counters.activeLoops =
       state.counters.activeLoops + 1 ∧
@@ -231,7 +252,32 @@ theorem successful_ordinary_turn_counts_once
       state.counters.rootLoops + 1 ∧
     (countTurn state outcome).counters.allLoops =
       state.counters.allLoops + 1 := by
-  simp [countTurn, ordinary, success]
+  simp [countTurn, ordinary, running, success]
+
+
+theorem paused_tick_never_counts
+    (state : State) (isPaused : paused state = true) :
+    (countTick state).counters = state.counters := by
+  simp [countTick, isPaused]
+
+theorem paused_successful_turn_never_counts
+    (state : State) (outcome : TurnOutcome)
+    (isPaused : paused state = true) :
+    (countTurn state outcome).counters = state.counters := by
+  simp [countTurn, isPaused]
+
+theorem unmatched_resume_is_idempotent :
+    let state := { initial with hookPairs :=
+      [{ pauseName := "pause-a", resumeName := "resume-a", depth := 0 }] }
+    step state (.semanticHook "resume-a") = state := by
+  decide
+
+theorem manual_reflection_dispatches_while_paused :
+    let main := step initial .acquireMain
+    let pausedState := step main (.semanticHook "inquiry-started")
+    let queued := step pausedState .queueManualReflection
+    (step queued .dispatchReflection).inquiryActive = true := by
+  decide
 
 theorem manual_reflection_can_dispatch :
     let main := step initial .acquireMain
@@ -282,7 +328,7 @@ theorem shutdown_is_absorbing (state : State) (event : Event)
   simp [step, stopped]
 
 -- Top-level correctness combines exact successful-loop policy, complete
--- internal time/loop exclusion, native queued dispatch/reclaim, correction,
+-- internal/external time and loop exclusion, floor resume, native queued dispatch/reclaim, correction,
 -- and termination.
 theorem process_is_correct :
     (∀ outcome, modelTurnSucceeded outcome = true ↔
@@ -291,6 +337,17 @@ theorem process_is_correct :
       (countTick state).counters = state.counters) ∧
     (∀ state outcome, state.runKind = .reflection →
       (countTurn state outcome).counters = state.counters) ∧
+    (∀ state, paused state = true →
+      (countTick state).counters = state.counters) ∧
+    (∀ state outcome, paused state = true →
+      (countTurn state outcome).counters = state.counters) ∧
+    ((let state := { initial with hookPairs :=
+      [{ pauseName := "pause-a", resumeName := "resume-a", depth := 0 }] }
+      step state (.semanticHook "resume-a") = state)) ∧
+    (let main := step initial .acquireMain
+      let pausedState := step main (.semanticHook "inquiry-started")
+      let queued := step pausedState .queueManualReflection
+      (step queued .dispatchReflection).inquiryActive = true) ∧
     (let main := step initial .acquireMain
       let queued := step main .queueManualReflection
       (step queued .dispatchReflection).inquiryActive = true) ∧
@@ -310,6 +367,7 @@ theorem process_is_correct :
       modelTurnSucceeded outcome = false →
       (countTurn state outcome).counters = state.counters) ∧
     (∀ state outcome, state.runKind = .ordinary →
+      paused state = false →
       modelTurnSucceeded outcome = true →
       (countTurn state outcome).counters.activeLoops =
         state.counters.activeLoops + 1 ∧
@@ -330,6 +388,14 @@ theorem process_is_correct :
   · exact reflection_tick_never_counts
   constructor
   · exact reflection_turn_never_counts
+  constructor
+  · exact paused_tick_never_counts
+  constructor
+  · exact paused_successful_turn_never_counts
+  constructor
+  · exact unmatched_resume_is_idempotent
+  constructor
+  · exact manual_reflection_dispatches_while_paused
   constructor
   · exact manual_reflection_can_dispatch
   constructor
@@ -357,4 +423,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "minimal reflect lifecycle: native queued ask + successful loops; internal time and loops excluded; no pause state"
+  IO.println "reflect lifecycle: native queued ask + successful loops; internal runs and paired external pauses excluded"

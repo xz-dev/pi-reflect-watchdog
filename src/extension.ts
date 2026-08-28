@@ -12,7 +12,15 @@ import {
 	type InquiryAttemptHandle,
 	type InquiryRuntime,
 } from "pi-extension-utils/pi-inquiry";
-import { BUILT_IN_CONFIG, type WatchdogConfig } from "./config.js";
+import {
+	type SemanticHookV1,
+	subscribeSemanticHooks,
+} from "pi-extension-utils/semantic-hook";
+import {
+	BUILT_IN_CONFIG,
+	type HookPausePair,
+	type WatchdogConfig,
+} from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
 import {
@@ -27,6 +35,7 @@ import {
 	isReflectDomainFatalError,
 	type ReflectDomainCoordinator,
 	type ReflectDomainCounters,
+	setReflectDomainPausedForWatchdog,
 } from "./process-domain.js";
 import {
 	buildReflectionPrompt,
@@ -129,6 +138,97 @@ interface Runtime {
 	widgetRegistered: boolean;
 	unsubscribeHub?: () => void;
 	unsubscribeDomain?: () => void;
+	unsubscribeSemanticHooks?: () => void;
+	hookPauseDepths: number[];
+	externallyPaused: boolean;
+	pauseTail: Promise<void>;
+}
+
+function externalPauseActive(runtime: Runtime): boolean {
+	return runtime.hookPauseDepths.some((depth) => depth > 0);
+}
+
+function matchingPairIndexes(
+	pairs: readonly HookPausePair[],
+	envelope: SemanticHookV1,
+	kind: "pause" | "resume",
+): number[] {
+	const matches: number[] = [];
+	for (let index = 0; index < pairs.length; index += 1)
+		if (pairs[index]?.[kind] === envelope.name) matches.push(index);
+	return matches;
+}
+
+function queueExternalPauseTransition(
+	runtime: Runtime,
+	services: RuntimeServices,
+	paused: boolean,
+	force = false,
+): void {
+	if (!owns(runtime) || (!force && runtime.externallyPaused === paused)) return;
+	runtime.externallyPaused = paused;
+	if (paused && runtime.ticker !== undefined) {
+		services.clearTimeout(runtime.ticker);
+		runtime.ticker = undefined;
+	}
+	runtime.pauseTail = runtime.pauseTail
+		.catch(() => {})
+		.then(async () => {
+			if (runtime.stopped || !owns(runtime)) return;
+			const counters = await setReflectDomainPausedForWatchdog(
+				runtime.processDomain,
+				paused,
+			);
+			if (counters !== undefined) runtime.latestCounters = counters;
+			if (paused !== runtime.externallyPaused) {
+				const corrected = await setReflectDomainPausedForWatchdog(
+					runtime.processDomain,
+					runtime.externallyPaused,
+				);
+				if (corrected !== undefined) runtime.latestCounters = corrected;
+			}
+		})
+		.catch((error) => {
+			if (runtime.stopped || runtime.ctx === null) return;
+			const message = error instanceof Error ? error.message : String(error);
+			runtime.ctx.ui.notify(
+				`pi-reflect-watchdog hook pause failed: ${message.slice(0, 160)}`,
+				"warning",
+			);
+		})
+		.finally(() => {
+			if (runtime.stopped) return;
+			latchAutomaticReflection(runtime);
+			refreshWidget(runtime);
+			scheduleRefresh(runtime, services);
+			maybeDispatch(runtime);
+		});
+}
+
+function handlePauseHook(
+	runtime: Runtime,
+	services: RuntimeServices,
+	envelope: SemanticHookV1,
+): void {
+	const pairs = runtime.config.hookPauses;
+	let changed = false;
+	for (const index of matchingPairIndexes(pairs, envelope, "pause")) {
+		const current = runtime.hookPauseDepths[index] ?? 0;
+		runtime.hookPauseDepths[index] =
+			current >= Number.MAX_SAFE_INTEGER
+				? Number.MAX_SAFE_INTEGER
+				: current + 1;
+		changed = true;
+	}
+	for (const index of matchingPairIndexes(pairs, envelope, "resume")) {
+		const current = runtime.hookPauseDepths[index] ?? 0;
+		if (current > 0) {
+			runtime.hookPauseDepths[index] = current - 1;
+			changed = true;
+		}
+	}
+	if (!changed) return;
+	queueExternalPauseTransition(runtime, services, externalPauseActive(runtime));
 }
 
 function scheduleTimer(
@@ -201,7 +301,8 @@ function crossedReasons(
 }
 
 function latchAutomaticReflection(runtime: Runtime): void {
-	if (!owns(runtime) || !runtime.configReady) return;
+	if (!owns(runtime) || !runtime.configReady || runtime.externallyPaused)
+		return;
 	const reasons = crossedReasons(runtime);
 	if (reasons.length === 0) return;
 	for (const reason of reasons) runtime.latched.add(reason);
@@ -284,6 +385,7 @@ function scheduleRefresh(runtime: Runtime, services: RuntimeServices): void {
 	runtime.ticker = undefined;
 	if (
 		!owns(runtime) ||
+		runtime.externallyPaused ||
 		runtime.ctx === null ||
 		!currentCounters(runtime)?.anyBusy
 	)
@@ -352,6 +454,7 @@ function maybeDispatch(runtime: Runtime): void {
 		beginReflection(runtime, manual);
 		return;
 	}
+	if (runtime.externallyPaused) return;
 	const automatic = runtime.pendingAutomatic;
 	if (automatic === undefined) return;
 	runtime.pendingAutomatic = undefined;
@@ -411,9 +514,10 @@ function observe(runtime: Runtime, ctx: ExtensionContext): void {
 	const ordinaryBusy = runtime.localBusy && !internal;
 	if (ordinaryBusy) runtime.hub.markBusy(runtime.attachment);
 	else runtime.hub.markIdle(runtime.attachment);
-	void runtime.processDomain
-		.setBusy(runtime.attachmentInstance, ordinaryBusy)
-		.catch(() => {});
+	if (!runtime.externallyPaused && !runtime.processDomain.paused)
+		void runtime.processDomain
+			.setBusy(runtime.attachmentInstance, ordinaryBusy)
+			.catch(() => {});
 	refreshWidget(runtime);
 }
 
@@ -448,6 +552,12 @@ function syncOwnership(runtime: Runtime, services: RuntimeServices): void {
 	}
 	runtime.claim = nextClaim;
 	if (!owns(runtime)) return;
+	const configuredPause = externalPauseActive(runtime);
+	if (
+		runtime.processDomain.paused !== configuredPause ||
+		runtime.externallyPaused !== configuredPause
+	)
+		queueExternalPauseTransition(runtime, services, configuredPause, true);
 	latchAutomaticReflection(runtime);
 	refreshWidget(runtime);
 	scheduleRefresh(runtime, services);
@@ -462,6 +572,10 @@ function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
 	clearWidget(runtime);
 	runtime.unsubscribeHub?.();
 	runtime.unsubscribeDomain?.();
+	runtime.unsubscribeSemanticHooks?.();
+	runtime.unsubscribeSemanticHooks = undefined;
+	runtime.hookPauseDepths = [];
+	runtime.externallyPaused = false;
 	const attachment = runtime.attachment;
 	if (attachment !== null) runtime.hub.detach(attachment);
 	runtime.attachment = null;
@@ -529,6 +643,9 @@ export function createWatchdogExtension(
 			reflectionSequence: 0,
 			widgetTui: null,
 			widgetRegistered: false,
+			hookPauseDepths: [],
+			externallyPaused: false,
+			pauseTail: Promise.resolve(),
 		};
 
 		pi.on("context", (event) => ({
@@ -599,6 +716,18 @@ export function createWatchdogExtension(
 			const loaded = await services.loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			if (runtime.stopped || runtime.ctx !== ctx) return;
 			runtime.config = loaded.config;
+			runtime.hookPauseDepths = loaded.config.hookPauses.map(() => 0);
+			if (runtime.config.hookPauses.length > 0) {
+				runtime.unsubscribeSemanticHooks = subscribeSemanticHooks(
+					pi.events,
+					(envelope) => handlePauseHook(runtime, services, envelope),
+					(reason) =>
+						ctx.ui.notify(
+							`pi-reflect-watchdog ignored invalid semantic hook: ${reason.slice(0, 160)}`,
+							"warning",
+						),
+				);
+			}
 			runtime.processDomain.setIdleResetGapSeconds(
 				runtime.config.idleResetGapSeconds,
 			);
@@ -673,7 +802,12 @@ export function createWatchdogExtension(
 		);
 
 		pi.on("turn_end", async (event) => {
-			if (!isSuccessfulTurn(event) || runtime.internalRun.kind !== "none")
+			if (
+				!isSuccessfulTurn(event) ||
+				runtime.internalRun.kind !== "none" ||
+				runtime.externallyPaused ||
+				runtime.processDomain.paused
+			)
 				return;
 			if (owns(runtime)) await runtime.processDomain.recordRootLoop();
 			else await runtime.processDomain.recordAllLoop();

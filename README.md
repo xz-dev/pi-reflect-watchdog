@@ -24,11 +24,18 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
   "allLoopLimit": 500,
   "taskMinutes": 30,
   "idleResetGapSeconds": 60,
-  "reflectionPrompt": "Reassess the current route using verified evidence."
+  "reflectionPrompt": "Reassess the current route using verified evidence.",
+  "hookPauses": [
+    { "pause": "inquiry-started", "resume": "inquiry-finished" }
+  ]
 }
 ```
 
-Runtime reset, dynamic limit controls, history/timeline tools, and pause/resume controls are intentionally removed. Change static configuration and reload instead.
+`hookPauses` is watchdog-private configuration. Each distinct pair has an independent nesting depth; duplicate identical pairs collapse to one pair, unmatched resume events are harmless, and counting resumes only after every pair reaches zero. Hook names follow the neutral `pi:semantic-hook:v1` lowercase kebab-case protocol from `pi-extension-utils/semantic-hook`.
+
+Delivery is best-effort to current listeners only: no buffer, replay, acknowledgement, retry, or cross-process forwarding. Producers must publish pause before excluded work and a matching resume on every terminal path. While paused, active/task time and loop counters freeze across the watchdog process domain; explicit `/reflect` remains available.
+
+Runtime reset, dynamic limit controls, history/timeline tools, public pause APIs, and pause/resume commands are intentionally removed. Config-driven semantic-hook pauses are the only external counting control.
 
 ## TUI
 
