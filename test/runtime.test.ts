@@ -4,7 +4,10 @@ import test from "node:test";
 
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import type { WatchdogConfig } from "../src/config.js";
-import { createWatchdogExtension } from "../src/extension.js";
+import {
+	createWatchdogExtension,
+	reflectCooldownState,
+} from "../src/extension.js";
 import {
 	createObservableAgentHub,
 	type ObservableAgentHub,
@@ -23,6 +26,7 @@ class Pi {
 		handler: (args: string, ctx: any) => any;
 	}> = [];
 	readonly messages: Array<{ message: any; options: any }> = [];
+	readonly entries: Array<{ customType: string; data: unknown }> = [];
 
 	readonly events = {
 		on: (channel: string, handler: (data: unknown) => void) => {
@@ -46,6 +50,10 @@ class Pi {
 
 	sendMessage(message: unknown, options: unknown) {
 		this.messages.push({ message, options });
+	}
+
+	appendEntry(customType: string, data: unknown) {
+		this.entries.push({ customType, data });
 	}
 
 	async emit(name: string, event: any, ctx: any) {
@@ -227,17 +235,21 @@ class FakeDomain implements ReflectDomainCoordinator {
 
 function context(
 	sessionId = "root",
-	options: { idle?: boolean; hasUI?: boolean } = {},
+	options: { idle?: boolean; hasUI?: boolean; mode?: "rpc" | "tui" } = {},
 ) {
 	let idle = options.idle ?? true;
 	let pendingMessages = false;
+	let branch: any[] = [];
 	const notifications: string[] = [];
 	const statuses: Array<string | undefined> = [];
 	const widgets: Array<unknown> = [];
-	const manager = { getSessionId: () => sessionId, getBranch: () => [] };
+	const manager = {
+		getSessionId: () => sessionId,
+		getBranch: () => branch,
+	};
 	return {
 		hasUI: options.hasUI ?? true,
-		mode: "rpc",
+		mode: options.mode ?? "rpc",
 		cwd: `/work/${sessionId}`,
 		isProjectTrusted: () => false,
 		isIdle: () => idle,
@@ -248,6 +260,9 @@ function context(
 		},
 		setPendingMessages(value: boolean) {
 			pendingMessages = value;
+		},
+		setBranch(entries: any[]) {
+			branch = entries;
 		},
 		sessionManager: manager,
 		ui: {
@@ -319,6 +334,12 @@ function lastInquiry(pi: Pi) {
 	)?.message;
 }
 
+function lastInquiryFold(pi: Pi) {
+	return pi.messages.findLast(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry-fold"),
+	)?.message;
+}
+
 async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
 	const prompt = lastInquiry(pi);
 	assert.ok(prompt);
@@ -339,6 +360,51 @@ function assistant(text: string) {
 	return { message: { role: "assistant", content: [{ type: "text", text }] } };
 }
 
+function branchMessage(message: any, id: string) {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-08-30T00:00:00.000Z",
+		message,
+	};
+}
+
+function completedReflect(id = "reflect") {
+	const correlation = {
+		version: 1,
+		namespace: "pi-reflect-watchdog",
+		inquiryId: id,
+		attempt: 1,
+	};
+	return [
+		branchMessage(
+			{
+				role: "assistant",
+				stopReason: "stop",
+				content: [],
+				details: { piInquiry: correlation },
+			},
+			`${id}-assistant`,
+		),
+		{
+			type: "custom",
+			id: `${id}-completed`,
+			parentId: null,
+			timestamp: "2026-08-30T00:00:00.000Z",
+			customType: "pi-reflect-watchdog:reflection-completed",
+			data: correlation,
+		},
+	];
+}
+
+function ordinaryLoop(id: string, stopReason = "stop") {
+	return branchMessage(
+		{ role: "assistant", stopReason, content: [{ type: "text", text: id }] },
+		id,
+	);
+}
+
 const validNoIssue =
 	"<reflection><type>NO_ISSUE</type><reason>sound</reason><done>checked</done><current_step>verify</current_step><next_step>continue</next_step></reflection>";
 const validCorrection =
@@ -349,6 +415,105 @@ async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	await pi.emit("agent_start", {}, ctx);
 	await correlateReflection(pi, ctx);
 }
+
+test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-loop boundary", () => {
+	const completed = completedReflect();
+	assert.deepEqual(reflectCooldownState(completed as any), {
+		skipAutomatic: true,
+		remainingLoops: 10,
+	});
+	const nineLoops = [
+		...completed,
+		...Array.from({ length: 9 }, (_, index) =>
+			ordinaryLoop(`ordinary-${index}`),
+		),
+	];
+	assert.deepEqual(reflectCooldownState(nineLoops as any), {
+		skipAutomatic: true,
+		remainingLoops: 1,
+	});
+	assert.deepEqual(
+		reflectCooldownState([...nineLoops, ordinaryLoop("ordinary-10")] as any),
+		{ skipAutomatic: true, remainingLoops: 0 },
+	);
+	assert.deepEqual(
+		reflectCooldownState([
+			...nineLoops,
+			ordinaryLoop("ordinary-10"),
+			ordinaryLoop("ordinary-11", "toolUse"),
+		] as any),
+		{ skipAutomatic: false, remainingLoops: 0 },
+	);
+	const invalidMarker = branchMessage(
+		{
+			role: "assistant",
+			stopReason: "stop",
+			content: [],
+			details: {
+				piInquiry: {
+					version: 1,
+					namespace: "pi-reflect-watchdog",
+					inquiryId: "invalid",
+					attempt: 1,
+				},
+			},
+		},
+		"invalid-assistant",
+	);
+	assert.deepEqual(reflectCooldownState([invalidMarker] as any), {
+		skipAutomatic: false,
+		remainingLoops: 0,
+	});
+	const orphanCompletion = completedReflect("orphan")[1];
+	const laterIncomplete = branchMessage(
+		{
+			role: "assistant",
+			stopReason: "stop",
+			content: [],
+			details: {
+				piInquiry: {
+					version: 1,
+					namespace: "pi-reflect-watchdog",
+					inquiryId: "later-incomplete",
+					attempt: 1,
+				},
+			},
+		},
+		"later-incomplete",
+	);
+	assert.deepEqual(
+		reflectCooldownState([
+			...completed,
+			ordinaryLoop("after-valid"),
+			laterIncomplete,
+			orphanCompletion,
+		] as any),
+		{ skipAutomatic: true, remainingLoops: 9 },
+	);
+});
+
+test("automatic Reflect is consumed during cooldown while manual Reflect bypasses", async () => {
+	const ctx = context("root", { mode: "tui" });
+	const { pi, domain } = install({
+		ctx,
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	ctx.setBranch([...completedReflect(), ordinaryLoop("ordinary-1")]);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(lastInquiry(pi), undefined);
+	assert.equal(domain.resetWrites, 1);
+	assert.equal(
+		ctx.notifications.filter(
+			(message) => message === "Reflect skipped during cooldown.",
+		).length,
+		1,
+	);
+	await pi.commands[0]?.handler("manual bypass", ctx);
+	assert.match(lastInquiry(pi)?.content ?? "", /manual bypass/);
+});
 
 test("paired semantic hooks nest independently, overlap, and keep manual reflect available", async () => {
 	const { pi, ctx, domain } = install({
@@ -651,6 +816,14 @@ test("provisional reflection, valid response, and its turn_end add no activity o
 	assert.equal(domain.allWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(lastInquiryFold(pi));
+	assert.equal(
+		pi.entries.filter(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection-completed",
+		).length,
+		1,
+	);
 	assert.equal(domain.counters().activeMs.value, 0n);
 	assert.equal(domain.counters().taskMs.value, 0n);
 });
@@ -720,6 +893,8 @@ test("invalid XML re-ask remains internal through its successful turn", async ()
 	assert.equal(domain.allWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(lastInquiryFold(pi));
+	assert.equal(pi.entries.length, 0);
 	assert.equal(
 		pi.messages.filter(({ message }) =>
 			String(message.customType ?? "").endsWith(":inquiry"),
@@ -736,6 +911,14 @@ test("invalid XML re-ask remains internal through its successful turn", async ()
 	assert.equal(domain.allWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(lastInquiryFold(pi));
+	assert.equal(
+		pi.entries.filter(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection-completed",
+		).length,
+		1,
+	);
 });
 
 test("route correction starts one ordinary continuation that counts normally", async () => {

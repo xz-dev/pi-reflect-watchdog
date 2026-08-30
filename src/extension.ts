@@ -3,6 +3,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	MessageEndEvent,
+	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
@@ -49,7 +50,7 @@ import {
 } from "./reflection-protocol.js";
 import {
 	createWatchdogWidget,
-	formatDuration,
+	formatWidgetText,
 	WIDGET_KEY,
 	type WidgetState,
 } from "./widget.js";
@@ -57,6 +58,8 @@ import {
 const STATUS_KEY = "pi-reflect-watchdog";
 const REFLECT_COMMAND = "reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
+const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
+const REFLECT_COOLDOWN_LOOPS = 10;
 const ACTIVE_TICK_MS = 1_000;
 const RPC_STATUS_TICK_MS = 30_000;
 
@@ -272,6 +275,82 @@ function safeNumber(value: bigint | undefined): number {
 	);
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function watchdogInquiryKey(value: unknown): string | undefined {
+	const inquiry = record(record(value)?.piInquiry ?? value);
+	return inquiry?.version === 1 &&
+		inquiry.namespace === REFLECTION_INQUIRY_NAMESPACE &&
+		typeof inquiry.inquiryId === "string" &&
+		inquiry.inquiryId.length > 0 &&
+		typeof inquiry.attempt === "number" &&
+		Number.isSafeInteger(inquiry.attempt) &&
+		inquiry.attempt > 0
+		? `${inquiry.inquiryId}:${inquiry.attempt}`
+		: undefined;
+}
+
+function watchdogInquiryAssistant(entry: SessionEntry): string | undefined {
+	if (entry.type !== "message" || entry.message.role !== "assistant")
+		return undefined;
+	return watchdogInquiryKey(record(record(entry.message)?.details)?.piInquiry);
+}
+
+function completedWatchdogReflection(entry: SessionEntry): string | undefined {
+	if (
+		entry.type !== "custom" ||
+		entry.customType !== REFLECTION_COMPLETED_ENTRY
+	)
+		return undefined;
+	return watchdogInquiryKey(entry.data);
+}
+
+export function reflectCooldownState(entries: readonly SessionEntry[]): {
+	readonly skipAutomatic: boolean;
+	readonly remainingLoops: number;
+} {
+	let loopsSinceReflect = 0;
+	const ordinaryAssistant = (entry: SessionEntry): boolean =>
+		entry.type === "message" &&
+		entry.message.role === "assistant" &&
+		watchdogInquiryAssistant(entry) === undefined &&
+		(entry.message.stopReason === "stop" ||
+			entry.message.stopReason === "toolUse");
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry === undefined) continue;
+		const completedInquiry = completedWatchdogReflection(entry);
+		if (completedInquiry !== undefined) {
+			for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+				const assistant = entries[candidate];
+				if (
+					assistant !== undefined &&
+					watchdogInquiryAssistant(assistant) === completedInquiry
+				)
+					return {
+						skipAutomatic: loopsSinceReflect <= REFLECT_COOLDOWN_LOOPS,
+						remainingLoops: Math.max(
+							0,
+							REFLECT_COOLDOWN_LOOPS - loopsSinceReflect,
+						),
+					};
+			}
+			continue;
+		}
+		if (!ordinaryAssistant(entry)) continue;
+		loopsSinceReflect += 1;
+	}
+	return { skipAutomatic: false, remainingLoops: 0 };
+}
+
+function currentCooldown(runtime: Runtime) {
+	return reflectCooldownState(runtime.ctx?.sessionManager.getBranch() ?? []);
+}
+
 function thresholdSnapshot(runtime: Runtime): ReflectionThresholdSnapshot {
 	const counters = currentCounters(runtime);
 	return {
@@ -335,12 +414,12 @@ function statusState(runtime: Runtime): WidgetState {
 		rootLoopLimit: runtime.config.rootLoopLimit,
 		allLoops: safeNumber(counters?.allLoops.value),
 		allLoopLimit: runtime.config.allLoopLimit,
+		cooldownRemainingLoops: currentCooldown(runtime).remainingLoops,
 	};
 }
 
 function statusText(runtime: Runtime): string {
-	const state = statusState(runtime);
-	return `Reflect Watchdog | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m · root ${state.rootLoops}/${state.rootLoopLimit} · all ${state.allLoops}/${state.allLoopLimit}`;
+	return formatWidgetText(statusState(runtime));
 }
 
 function refreshWidget(runtime: Runtime): void {
@@ -460,6 +539,11 @@ function maybeDispatch(runtime: Runtime): void {
 	runtime.pendingAutomatic = undefined;
 	runtime.latched.clear();
 	void runtime.processDomain.resetReminderCycle().catch(() => {});
+	if (currentCooldown(runtime).skipAutomatic) {
+		if (runtime.ctx?.mode === "tui")
+			runtime.ctx.ui.notify("Reflect skipped during cooldown.", "info");
+		return;
+	}
 	beginReflection(runtime, automatic);
 }
 
@@ -859,6 +943,7 @@ export function createWatchdogExtension(
 							triggerTurn: false,
 						});
 					finishReflection(runtime, planned);
+					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
 					return;
 				}
 				const fold = active.handle.cancel();

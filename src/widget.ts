@@ -20,6 +20,7 @@ export interface WidgetState {
 	rootLoopLimit: number;
 	allLoops: number;
 	allLoopLimit: number;
+	cooldownRemainingLoops?: number;
 }
 
 export function formatDuration(ms: number): string {
@@ -33,7 +34,8 @@ export function formatDuration(ms: number): string {
 
 export function formatWidgetText(state: WidgetState): string {
 	return (
-		`Reflect Watchdog | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops` +
+		`Reflect Watchdog${state.cooldownRemainingLoops ? ` (${state.cooldownRemainingLoops} loops disable)` : ""}` +
+		` | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops` +
 		` · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
 		` · root ${state.rootLoops}/${state.rootLoopLimit}` +
 		` · all ${state.allLoops}/${state.allLoopLimit}`
@@ -42,7 +44,8 @@ export function formatWidgetText(state: WidgetState): string {
 
 export function formatCompactWidgetText(state: WidgetState): string {
 	return (
-		`RW | a ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops}` +
+		`RW${state.cooldownRemainingLoops ? ` (${state.cooldownRemainingLoops} loops disable)` : ""}` +
+		` | a ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops}` +
 		` · t ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
 		` · r ${state.rootLoops}/${state.rootLoopLimit}` +
 		` · all ${state.allLoops}/${state.allLoopLimit}`

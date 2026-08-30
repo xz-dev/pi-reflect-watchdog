@@ -70,6 +70,32 @@ test("live state renders the exact approved example format", () => {
 	);
 });
 
+test("cooldown suffix renders only while loops remain", () => {
+	const state: WidgetState = {
+		activity: { active: false, elapsedMs: 0, loops: 0 },
+		taskElapsedMs: 0,
+		taskMinutes: 30,
+		rootLoops: 0,
+		rootLoopLimit: 100,
+		allLoops: 0,
+		allLoopLimit: 500,
+		cooldownRemainingLoops: 3,
+	};
+	assert.match(
+		formatWidgetText(state),
+		/^Reflect Watchdog \(3 loops disable\) \| active/,
+	);
+	assert.match(formatCompactWidgetText(state), /^RW \(3 loops disable\) \| a/);
+	assert.doesNotMatch(
+		formatWidgetText({ ...state, cooldownRemainingLoops: 0 }),
+		/loops disable/,
+	);
+	assert.doesNotMatch(
+		formatCompactWidgetText({ ...state, cooldownRemainingLoops: 0 }),
+		/loops disable/,
+	);
+});
+
 test("component switches to compact text before final truncation", () => {
 	let width = 200;
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
