@@ -39,18 +39,10 @@ const DIST_FILES = [
 	"widget.js",
 ];
 
-const RELEASE_OWNER = "pi-reflect-watchdog-release-tree-v1";
-
 export const PACK_ALLOWLIST = [
 	...ROOT_FILES,
 	"package.json",
 	...DIST_FILES.map((name) => `dist/${name}`),
-].sort();
-export const RELEASE_ALLOWLIST = [
-	...PACK_ALLOWLIST,
-	".npmrc",
-	"package-lock.json",
-	"provenance.json",
 ].sort();
 
 function stableJson(value) {
@@ -61,27 +53,6 @@ function distManifest(source) {
 	const manifest = structuredClone(source);
 	manifest.pi = { ...manifest.pi, extensions: ["./dist/extension.js"] };
 	return manifest;
-}
-
-function releaseManifest(source) {
-	const manifest = distManifest(source);
-	delete manifest.scripts;
-	delete manifest.devDependencies;
-	delete manifest.files;
-	return manifest;
-}
-
-function releaseLock(source, manifest) {
-	const lock = structuredClone(source);
-	lock.packages[""] = {
-		name: manifest.name,
-		version: manifest.version,
-		license: manifest.license,
-		dependencies: manifest.dependencies,
-		engines: manifest.engines,
-		peerDependencies: manifest.peerDependencies,
-	};
-	return lock;
 }
 
 function contains(parent, child) {
@@ -162,27 +133,6 @@ export async function assertSafeOutputPath(root, outputDirectory) {
 	return resolvedOutput;
 }
 
-async function assertReplaceableReleaseOutput(outputDirectory) {
-	if (!(await pathExists(outputDirectory))) return;
-	const entries = await readdir(outputDirectory);
-	if (entries.length === 0) return;
-	let provenance;
-	try {
-		provenance = JSON.parse(
-			await readFile(path.join(outputDirectory, "provenance.json"), "utf8"),
-		);
-	} catch {
-		throw new Error(
-			`Refusing to replace nonempty output without the pi-reflect-watchdog ownership sentinel: ${outputDirectory}`,
-		);
-	}
-	if (provenance?.owner !== RELEASE_OWNER) {
-		throw new Error(
-			`Refusing to replace nonempty output without the pi-reflect-watchdog ownership sentinel: ${outputDirectory}`,
-		);
-	}
-}
-
 async function copyPayload(root, outputDirectory) {
 	await mkdir(path.join(outputDirectory, "dist"), { recursive: true });
 	for (const name of ROOT_FILES)
@@ -196,23 +146,6 @@ async function copyPayload(root, outputDirectory) {
 
 async function sourceManifest(root) {
 	return JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
-}
-
-async function replaceWithStagedDirectory(outputDirectory, stage) {
-	const existed = await pathExists(outputDirectory);
-	if (!existed) {
-		await rename(stage, outputDirectory);
-		return;
-	}
-	const backup = `${outputDirectory}.previous-${crypto.randomUUID()}`;
-	await rename(outputDirectory, backup);
-	try {
-		await rename(stage, outputDirectory);
-	} catch (error) {
-		await rename(backup, outputDirectory);
-		throw error;
-	}
-	await rm(backup, { recursive: true, force: true });
 }
 
 export async function createPackStage({ root, outputDirectory }) {
@@ -234,46 +167,6 @@ export async function createPackStage({ root, outputDirectory }) {
 			stableJson(distManifest(await sourceManifest(root))),
 		);
 		await rename(stage, safeOutput);
-	} finally {
-		await rm(stage, { recursive: true, force: true });
-	}
-	return safeOutput;
-}
-
-export async function createReleaseTree({
-	root,
-	outputDirectory,
-	sourceCommit,
-}) {
-	if (!/^[0-9a-f]{40}$/.test(sourceCommit))
-		throw new Error("sourceCommit must be a full 40-character Git OID");
-	const safeOutput = await assertSafeOutputPath(root, outputDirectory);
-	await assertReplaceableReleaseOutput(safeOutput);
-	await mkdir(path.dirname(safeOutput), { recursive: true });
-	const stage = await mkdtemp(
-		path.join(path.dirname(safeOutput), `.${path.basename(safeOutput)}.tmp-`),
-	);
-	try {
-		await copyPayload(root, stage);
-		await cp(path.join(root, ".npmrc"), path.join(stage, ".npmrc"));
-		const manifest = releaseManifest(await sourceManifest(root));
-		const sourceLock = JSON.parse(
-			await readFile(path.join(root, "package-lock.json"), "utf8"),
-		);
-		await writeFile(
-			path.join(stage, "package-lock.json"),
-			stableJson(releaseLock(sourceLock, manifest)),
-		);
-		await writeFile(path.join(stage, "package.json"), stableJson(manifest));
-		await writeFile(
-			path.join(stage, "provenance.json"),
-			stableJson({
-				owner: RELEASE_OWNER,
-				source: "master",
-				commit: sourceCommit,
-			}),
-		);
-		await replaceWithStagedDirectory(safeOutput, stage);
 	} finally {
 		await rm(stage, { recursive: true, force: true });
 	}

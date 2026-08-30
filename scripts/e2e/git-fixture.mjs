@@ -1,9 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { cp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 
-import { createReleaseTree } from "../distribution.mjs";
 import { PI_BIN, ROOT, runBoundedProcess, terminateChild } from "./harness.mjs";
 
 export const MASTER_FIXTURE_ALLOWLIST = [
@@ -144,12 +143,8 @@ async function addInvalidInstallBranch(source) {
 	run("git", ["checkout", "master"], { cwd: source });
 }
 
-export async function createGitFixture(
-	base,
-	{ releaseTree: candidateReleaseTree } = {},
-) {
+export async function createGitFixture(base) {
 	const source = path.join(base, "source");
-	const releaseTree = candidateReleaseTree ?? path.join(base, "release-tree");
 	const remoteParent = path.join(base, "remotes", "xz-dev");
 	const bare = path.join(remoteParent, "pi-reflect-watchdog.git");
 	let daemon;
@@ -159,36 +154,6 @@ export async function createGitFixture(
 		run("git", ["init", "-b", "master"], { cwd: source });
 		commitAll(source, "master fixture");
 		const masterOid = run("git", ["rev-parse", "HEAD"], { cwd: source });
-		if (!candidateReleaseTree)
-			await createReleaseTree({
-				root: source,
-				outputDirectory: releaseTree,
-				sourceCommit: masterOid,
-			});
-		run("git", ["checkout", "--orphan", "release"], { cwd: source });
-		run("git", ["rm", "-rf", "."], { cwd: source });
-		for (const name of await readdir(releaseTree))
-			await cp(path.join(releaseTree, name), path.join(source, name), {
-				recursive: true,
-			});
-		run("git", ["add", "-A"], { cwd: source });
-		run(
-			"git",
-			[
-				"-c",
-				"user.name=E2E",
-				"-c",
-				"user.email=e2e@example.invalid",
-				"-c",
-				"commit.gpgsign=false",
-				"commit",
-				"-m",
-				"release fixture",
-			],
-			{ cwd: source },
-		);
-		const releaseOid = run("git", ["rev-parse", "HEAD"], { cwd: source });
-		run("git", ["checkout", "master"], { cwd: source });
 		await addInvalidInstallBranch(source);
 		run("git", ["clone", "--bare", source, bare]);
 		run("git", ["symbolic-ref", "HEAD", "refs/heads/master"], { cwd: bare });
@@ -216,10 +181,8 @@ export async function createGitFixture(
 		const baseSource = `git:git://127.0.0.1:${port}/xz-dev/pi-reflect-watchdog.git`;
 		return {
 			masterSource: `${baseSource}@master`,
-			releaseSource: `${baseSource}@release`,
 			invalidInstallSource: `${baseSource}@invalid-install`,
 			masterOid,
-			releaseOid,
 			daemonPid: daemon.pid,
 			stop: () =>
 				terminateChild(daemon, { termTimeoutMs: 2_000, killTimeoutMs: 2_000 }),

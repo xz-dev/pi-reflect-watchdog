@@ -6,12 +6,10 @@ import {
 	mkdir,
 	readdir,
 	readFile,
-	realpath,
 	writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { RELEASE_ALLOWLIST } from "../../scripts/distribution.mjs";
 import {
 	modelConfig,
 	startFakeProvider,
@@ -551,51 +549,39 @@ test("stock Pi loads global and trusted-project watchdog configuration", async (
 	assert.equal(accepted.success, true);
 });
 
-test("stock Pi installs master and release from actual local Git remotes with exact source paths", async (t) => {
+test("stock Pi installs master from an actual local Git remote with the exact source path", async (t) => {
 	const resources = await createTestResources(
 		t,
 		"pi-reflect-watchdog-git-e2e-",
 	);
 	const fixture = await createGitFixture(resources.base);
 	resources.add(() => fixture.stop());
-	for (const [name, source, entry] of [
-		["master", fixture.masterSource, path.join("src", "extension.ts")],
-		["release", fixture.releaseSource, path.join("dist", "extension.js")],
-	]) {
-		const isolated = await createIsolatedEnvironment(
-			path.join(resources.base, name),
-		);
-		await installGitPackage({
-			source,
-			cwd: isolated.workspace,
-			env: isolated.env,
-		});
-		const managed = managedGitPath(isolated.agentDir);
-		const rpc = new RpcPi({ cwd: isolated.workspace, env: isolated.env });
-		resources.add(() => rpc.close());
-		await assertSingleWatchdogCommand(rpc, path.join(managed, entry));
-		const commands = await rpc.request({ type: "get_commands" });
-		const watchdog = commands.data.commands.find(
-			(command) => command.name === "reflect",
-		);
-		assert.equal(
-			await realpath(watchdog.sourceInfo.path),
-			await realpath(path.join(managed, entry)),
-		);
-		const tracked = execFileSync(
-			"git",
-			["ls-tree", "-r", "--name-only", "HEAD"],
-			{ cwd: managed, encoding: "utf8" },
-		)
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.sort();
-		assert.deepEqual(
-			tracked,
-			name === "master" ? MASTER_FIXTURE_ALLOWLIST : RELEASE_ALLOWLIST,
-		);
-	}
+	const isolated = await createIsolatedEnvironment(resources.base, "master");
+	await installGitPackage({
+		source: fixture.masterSource,
+		cwd: isolated.workspace,
+		env: isolated.env,
+	});
+	const managed = managedGitPath(isolated.agentDir);
+	const rpc = new RpcPi({ cwd: isolated.workspace, env: isolated.env });
+	resources.add(() => rpc.close());
+	const entry = path.join(managed, "src", "extension.ts");
+	await assertSingleWatchdogCommand(rpc, entry);
+	const commands = await rpc.request({ type: "get_commands" });
+	const watchdog = commands.data.commands.find(
+		(command) => command.name === "reflect",
+	);
+	assert.equal(watchdog.sourceInfo.path, entry);
+	const tracked = execFileSync(
+		"git",
+		["ls-tree", "-r", "--name-only", "HEAD"],
+		{ cwd: managed, encoding: "utf8" },
+	)
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.sort();
+	assert.deepEqual(tracked, MASTER_FIXTURE_ALLOWLIST);
 });
 
 test("failed stock Git installation is bounded and resource cleanup removes its checkout and daemon", async (t) => {

@@ -55,7 +55,6 @@ RW | a 12m40s/137 · t 12m40s/30m · r 37/100 · all 128/500
 
 ```bash
 pi install git:github.com/xz-dev/pi-reflect-watchdog@master
-pi install git:github.com/xz-dev/pi-reflect-watchdog@release
 ```
 
 ## Development
