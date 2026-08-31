@@ -4,127 +4,159 @@ import type {
 	ProcessDomainDataMessage,
 	ProcessDomainEvent,
 	ProcessDomainNode,
+	ProcessDomainPeer,
 } from "pi-extension-utils/process-domain";
 import {
 	createReflectDomainCoordinator,
+	FATAL_EXIT_CODE,
 	type ReflectDomainClock,
-	type ReflectDomainCounters,
+	ReflectDomainFatalError,
 	setReflectDomainPausedForWatchdog,
 } from "../src/process-domain.js";
 
+interface SentMessage {
+	readonly targetNodeId: string;
+	readonly channel: string;
+	readonly value: unknown;
+}
+
 class FakeNode implements ProcessDomainNode {
+	readonly declaration = {
+		version: 1 as const,
+		domainId: "epoch",
+		endpoint: "tcp://127.0.0.1:46001",
+		capability: "capability",
+		hostNodeId: "host",
+	};
+	readonly sent: SentMessage[] = [];
 	readonly nodeId: string;
-	readonly transport = "ipc" as const;
-	readonly endpoint = "ipc://temporary";
-	readonly declaration;
-	readonly sent: Array<{ targetId: string; channel: string; value: unknown }> =
-		[];
-	readonly broadcasts: Array<{ channel: string; value: unknown }> = [];
-	closeCount = 0;
-	sendError: Error | null = null;
-	broadcastError: Error | null = null;
-	sendBarrier: Promise<void> | null = null;
+	readonly role: "host" | "client";
+	readonly transport = "tcp-loopback" as const;
+	readonly endpoint = "tcp://127.0.0.1:46001";
+	closed = false;
+	sendError: Error | undefined;
+	sendBarrier:
+		| { readonly entered: () => void; readonly wait: Promise<void> }
+		| undefined;
+	private readonly eventListeners = new Set<
+		(event: ProcessDomainEvent) => void
+	>();
 	private readonly channelListeners = new Map<
 		string,
 		Set<(message: ProcessDomainDataMessage) => void>
 	>();
-	private readonly eventListeners = new Set<
-		(event: ProcessDomainEvent) => void
-	>();
-	private readonly peerValues = new Map<
-		string,
-		ReturnType<ProcessDomainNode["peers"]>[number]
-	>();
+	private readonly currentPeers = new Map<string, ProcessDomainPeer>();
 
-	constructor(
-		readonly role: "host" | "client",
-		nodeId: string = role,
-	) {
+	constructor(role: "host" | "client", nodeId: string = role) {
+		this.role = role;
 		this.nodeId = nodeId;
-		this.declaration = {
-			version: 1 as const,
-			domainId: "domain",
-			endpoint: this.endpoint,
-			capability: "capability",
-			hostNodeId: "host",
-		};
+		if (role === "client")
+			this.currentPeers.set("host", {
+				nodeId: "host",
+				status: "online",
+				metadata: {
+					role: "pi-reflect-watchdog",
+					protocol: "3",
+					incarnation: "host-incarnation",
+				},
+				connectedAt: 1,
+			});
 	}
 
-	peers() {
-		return Array.from(this.peerValues.values());
+	peers(): readonly ProcessDomainPeer[] {
+		return Array.from(this.currentPeers.values());
 	}
 
-	async send(targetId: string, channel: string, value: unknown): Promise<void> {
-		this.sent.push({ targetId, channel, value });
-		if (this.sendBarrier !== null) await this.sendBarrier;
-		if (this.sendError !== null) throw this.sendError;
+	async send(targetNodeId: string, channel: string, value: unknown) {
+		if (this.sendError) throw this.sendError;
+		this.sent.push({ targetNodeId, channel, value });
+		const barrier = this.sendBarrier;
+		if (barrier !== undefined) {
+			barrier.entered();
+			await barrier.wait;
+		}
 	}
 
-	async broadcast(channel: string, value: unknown): Promise<void> {
-		this.broadcasts.push({ channel, value });
-		if (this.broadcastError !== null) throw this.broadcastError;
+	async broadcast(channel: string, value: unknown) {
+		for (const peer of this.currentPeers.values())
+			if (peer.status === "online")
+				await this.send(peer.nodeId, channel, value);
 	}
 
-	async reportLifecycle(): Promise<void> {}
+	async reportLifecycle() {}
+
+	subscribeEvents(listener: (event: ProcessDomainEvent) => void) {
+		this.eventListeners.add(listener);
+		return () => this.eventListeners.delete(listener);
+	}
 
 	subscribe(
 		channel: string,
 		listener: (message: ProcessDomainDataMessage) => void,
-	): () => void {
+	) {
 		const listeners = this.channelListeners.get(channel) ?? new Set();
 		listeners.add(listener);
 		this.channelListeners.set(channel, listeners);
 		return () => listeners.delete(listener);
 	}
 
-	subscribeEvents(listener: (event: ProcessDomainEvent) => void): () => void {
-		this.eventListeners.add(listener);
-		return () => this.eventListeners.delete(listener);
-	}
-
-	async close(): Promise<void> {
-		this.closeCount += 1;
-	}
-
-	emitChannel(channel: string, value: unknown, senderId = "child"): void {
-		const message: ProcessDomainDataMessage = {
-			id: "message",
-			channel,
-			value,
-			senderId,
-			targetId: this.nodeId,
-			receivedAt: Date.now(),
-		};
-		for (const listener of this.channelListeners.get(channel) ?? [])
-			listener(message);
-	}
-
 	emitPeer(
 		nodeId: string,
 		status: "online" | "offline",
-		activity: "idle" | "busy" = "idle",
-	): void {
-		const peer = {
-			nodeId,
-			status,
-			metadata: { activity },
-			connectedAt: Date.now(),
-			...(status === "offline" ? { disconnectedAt: Date.now() } : {}),
-		} as const;
-		this.peerValues.set(nodeId, peer);
+		incarnation = "peer-incarnation",
+	) {
+		const peer = this.setPeerStatus(nodeId, status, incarnation);
 		for (const listener of this.eventListeners)
 			listener({ type: "peer", peer });
+	}
+
+	setPeerStatus(
+		nodeId: string,
+		status: "online" | "offline",
+		incarnation = "peer-incarnation",
+	): ProcessDomainPeer {
+		const peer: ProcessDomainPeer = {
+			nodeId,
+			status,
+			metadata: {
+				role: "pi-reflect-watchdog",
+				protocol: "3",
+				incarnation,
+			},
+			connectedAt: 1,
+		};
+		this.currentPeers.set(nodeId, peer);
+		return peer;
+	}
+
+	emitChannel(
+		channel: string,
+		value: unknown,
+		senderId = this.declaration.hostNodeId,
+		receivedAt = 1,
+	) {
+		for (const listener of this.channelListeners.get(channel) ?? [])
+			listener({
+				id: "message",
+				senderId,
+				targetId: this.nodeId,
+				channel,
+				value,
+				receivedAt,
+			});
+	}
+
+	async close() {
+		this.closed = true;
 	}
 }
 
 function fakeClock() {
 	const callbacks: Array<{ callback: () => void; cancelled: boolean }> = [];
-	const delays: number[] = [];
 	const clock: ReflectDomainClock = {
-		setTimeout(callback, delayMs) {
+		setTimeout(callback) {
 			const handle = { callback, cancelled: false, unref() {} };
 			callbacks.push(handle);
-			delays.push(delayMs);
 			return handle as unknown as ReturnType<typeof setTimeout>;
 		},
 		clearTimeout(handle) {
@@ -140,7 +172,7 @@ function fakeClock() {
 			}
 		}
 	};
-	return { clock, callbacks, delays, fireNext };
+	return { clock, callbacks, fireNext };
 }
 
 async function flush(): Promise<void> {
@@ -148,577 +180,757 @@ async function flush(): Promise<void> {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-const counterSends = (node: FakeNode) =>
-	node.sent.filter(
-		(entry) => entry.channel === "pi-reflect-watchdog.counters.v2",
-	);
+function deferred(): {
+	readonly promise: Promise<void>;
+	readonly resolve: () => void;
+} {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
 
-test("process-domain pause freezes local and child writes and reconciles live activity on resume", async () => {
-	const node = new FakeNode("host");
-	const time = fakeClock();
-	let nowMs = 10_000;
-	let liveBusy = true;
-	const coordinator = createReflectDomainCoordinator({
-		open: async () => node,
-		clock: time.clock,
-		activeTickMs: 250,
-		now: () => nowMs,
-	});
-	const instance = {};
-	await coordinator.attach(instance, {
-		getBusy: () => liveBusy,
-		onFatal() {},
-	});
-	assert.equal(coordinator.counters()?.anyBusy, true);
-	await coordinator.setBusy(instance, false);
-	await coordinator.setBusy(instance, true);
-	time.fireNext();
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, 250n);
-	await setReflectDomainPausedForWatchdog(coordinator, true);
-	assert.equal(coordinator.paused, true);
-	const frozen = coordinator.counters();
-	await coordinator.setBusy(instance, false);
-	await coordinator.recordRootLoop();
-	node.emitPeer("child", "online", "busy");
-	await flush();
-	node.emitChannel("pi-reflect-watchdog.activity.v2", {
-		revision: "1",
-		busy: true,
-	});
-	node.emitChannel("pi-reflect-watchdog.loop.v2", {
-		revision: "1",
-		rootLoops: "0",
-		allLoops: "1",
-	});
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, frozen?.activeMs.value);
-	assert.equal(coordinator.counters()?.localBusy, true);
-	assert.equal(coordinator.counters()?.otherBusy, false);
-	assert.equal(
-		coordinator.counters()?.rootLoops.value,
-		frozen?.rootLoops.value,
-	);
-	assert.equal(coordinator.counters()?.allLoops.value, frozen?.allLoops.value);
-
-	liveBusy = false;
-	nowMs += 10_000;
-	await setReflectDomainPausedForWatchdog(coordinator, false);
-	assert.equal(coordinator.paused, false);
-	assert.equal(coordinator.counters()?.localBusy, false);
-	assert.equal(coordinator.counters()?.otherBusy, true);
-	assert.equal(coordinator.counters()?.anyBusy, true);
-	await coordinator.detach(instance);
-});
-
-test("paused duration shifts an existing idle timestamp and resume-to-idle records now", async () => {
-	const node = new FakeNode("host");
-	let nowMs = 1_000;
-	let liveBusy = true;
-	const coordinator = createReflectDomainCoordinator({
-		open: async () => node,
-		now: () => nowMs,
-	});
-	const instance = {};
-	await coordinator.attach(instance, {
-		getBusy: () => liveBusy,
-		onFatal() {},
-	});
-	liveBusy = false;
-	await coordinator.setBusy(instance, false);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, 1_000n);
-	await setReflectDomainPausedForWatchdog(coordinator, true);
-	nowMs = 11_000;
-	await setReflectDomainPausedForWatchdog(coordinator, false);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, 11_000n);
-
-	liveBusy = true;
-	await coordinator.setBusy(instance, true);
-	await setReflectDomainPausedForWatchdog(coordinator, true);
-	liveBusy = false;
-	nowMs = 21_000;
-	await setReflectDomainPausedForWatchdog(coordinator, false);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, 21_000n);
-	await coordinator.detach(instance);
-});
-
-test("root owns root/domain counters and child loop increments aggregate", async () => {
-	const node = new FakeNode("host");
-	const coordinator = createReflectDomainCoordinator({
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	const first = await coordinator.recordRootLoop();
-	assert.equal(first.rootLoops.value, 1n);
-	assert.equal(first.allLoops.value, 1n);
-
-	node.emitPeer("child", "online");
-	await flush();
-	node.emitChannel("pi-reflect-watchdog.activity.v2", {
-		revision: "1",
+function checkpoint(
+	incarnation: string,
+	contributorId: string,
+	overrides: Partial<{
+		accountingGeneration: string;
+		seq: string;
+		busy: boolean;
+		rootLoops: string;
+		allLoops: string;
+		resumeReceipt: string | null;
+	}> = {},
+) {
+	return {
+		version: 3,
+		incarnation,
+		contributorId,
+		accountingGeneration: "0",
+		seq: "1",
 		busy: false,
-	});
-	await flush();
-	node.emitChannel("pi-reflect-watchdog.loop.v2", {
-		revision: "1",
 		rootLoops: "0",
-		allLoops: "1",
-	});
-	await flush();
-	const counters = coordinator.counters();
-	assert.equal(counters?.rootLoops.value, 1n);
-	assert.equal(counters?.allLoops.value, 2n);
-	assert.deepEqual(counterSends(node).at(-1)?.value, {
-		revision: "5",
-		generation: "5",
-		domainEpoch: "domain",
-		certain: true,
+		allLoops: "0",
+		resumeReceipt: null,
+		...overrides,
+	};
+}
+
+function latest(node: FakeNode, channel: string): SentMessage {
+	const found = node.sent.filter((entry) => entry.channel === channel).at(-1);
+	assert.ok(found, `missing ${channel}`);
+	return found;
+}
+
+function counterWire(
+	overrides: Partial<{
+		revision: string;
+		generation: string;
+		accountingGeneration: string;
+		paused: boolean;
+		anyBusy: boolean;
+		localBusy: boolean;
+		otherBusy: boolean;
+		rootLoops: string;
+		allLoops: string;
+		checkpointAcks: readonly unknown[];
+	}> = {},
+) {
+	return {
+		version: 3,
+		revision: "1",
+		generation: "1",
+		accountingGeneration: "0",
+		domainEpoch: "epoch",
 		paused: false,
 		anyBusy: false,
 		localBusy: false,
 		otherBusy: false,
 		endLoopTimeMs: null,
 		activeMs: "0",
-		activeLoops: "2",
+		activeLoops: "0",
 		taskMs: "0",
-		rootLoops: "1",
-		allLoops: "2",
-		activityRevisions: [{ nodeId: "child", revision: "1" }],
-		loopRevisions: [{ nodeId: "child", revision: "1" }],
-	});
-	await coordinator.detach(instance);
-	assert.equal(node.closeCount, 1);
-});
+		rootLoops: "0",
+		allLoops: "0",
+		checkpointAcks: [],
+		...overrides,
+	};
+}
 
-test("active tick freezes at aggregate idle and only a strict idle-gap overflow resets all counters", async () => {
+test("abrupt peer death removes live busy state and replacement resumes accounting", async () => {
 	const node = new FakeNode("host");
 	const time = fakeClock();
-	let nowMs = 10_000;
+	let nowMs = 1_000;
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
 		clock: time.clock,
-		activeTickMs: 250,
-		idleResetGapMs: 60_000,
+		activeTickMs: 100,
 		now: () => nowMs,
 	});
 	const instance = {};
 	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+		nowMs,
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	nowMs = 1_100;
+	time.fireNext();
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, 100n);
+
+	node.emitPeer("child", "offline", "incarnation-a");
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, false);
 	await coordinator.recordRootLoop();
-	await coordinator.setBusy(instance, true);
-	assert.deepEqual(time.delays, [250]);
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+
+	node.emitPeer("child", "online", "incarnation-b");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-b", "contributor-b", { busy: true }),
+		"child",
+		nowMs,
+	);
+	await flush();
+	nowMs = 1_200;
+	time.fireNext();
+	await flush();
+	assert.equal(coordinator.counters()?.activeMs.value, 200n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
+	await coordinator.detach(instance);
+});
+
+test("offline projection reaches counters and subscribers before an earlier send releases", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	const observations: boolean[] = [];
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	const unsubscribe = coordinator.subscribe((counters) =>
+		observations.push(counters.anyBusy),
+	);
+	const entered = deferred();
+	const release = deferred();
+	node.sendBarrier = { entered: entered.resolve, wait: release.promise };
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+	);
+	await entered.promise;
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	const busyRevision = coordinator.counters()?.revision ?? 0n;
+
+	node.emitPeer("child", "offline", "incarnation-a");
+	assert.equal(coordinator.counters()?.anyBusy, false);
+	assert.ok((coordinator.counters()?.revision ?? 0n) > busyRevision);
+	assert.equal(observations.at(-1), false);
+	assert.ok(observations.includes(true));
+
+	node.sendBarrier = undefined;
+	release.resolve();
+	await flush();
+	unsubscribe();
+	await coordinator.detach(instance);
+});
+
+test("send-discovered offline session triggers a second synchronous projection", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	const observations: boolean[] = [];
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+	);
+	await flush();
+	const unsubscribe = coordinator.subscribe((counters) =>
+		observations.push(counters.anyBusy),
+	);
+	node.setPeerStatus("child", "offline", "incarnation-a");
+	node.sendError = new Error("send failed");
+
+	await coordinator.recordAllLoop();
+	assert.equal(coordinator.counters()?.anyBusy, false);
+	assert.equal(coordinator.counters()?.allLoops.value, 1n);
+	assert.deepEqual(observations.slice(-2), [true, false]);
+	unsubscribe();
+	await coordinator.detach(instance);
+});
+
+test("retained reconnect restores exact loop delta when checkpoint ACK was lost", async () => {
+	const node = new FakeNode("host");
+	let nowMs = 0;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		now: () => nowMs,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", {
+			rootLoops: "1",
+			allLoops: "2",
+		}),
+		"child",
+		nowMs,
+	);
+	await flush();
+	const firstAck = (
+		latest(node, "pi-reflect-watchdog.counters.v3").value as {
+			checkpointAcks: Array<{ resumeReceipt: string }>;
+		}
+	).checkpointAcks[0]?.resumeReceipt;
+	assert.ok(firstAck);
+	nowMs = 1_000;
+	node.emitPeer("child", "offline", "incarnation-a");
+	await flush();
+	nowMs = 9_000;
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-b", {
+			seq: "2",
+			rootLoops: "2",
+			allLoops: "5",
+			resumeReceipt: null,
+		}),
+		"child",
+		nowMs,
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.rootLoops.value, 2n);
+	assert.equal(coordinator.counters()?.allLoops.value, 5n);
+	const replayAck = (
+		latest(node, "pi-reflect-watchdog.counters.v3").value as {
+			checkpointAcks: Array<{ resumeReceipt: string }>;
+		}
+	).checkpointAcks[0]?.resumeReceipt;
+	assert.equal(replayAck, firstAck);
+	await coordinator.detach(instance);
+});
+
+test("ledger-expired reconnect needs receipt and seeds current totals as baseline", async () => {
+	const node = new FakeNode("host");
+	let nowMs = 0;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		now: () => nowMs,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", {
+			rootLoops: "2",
+			allLoops: "3",
+		}),
+		"child",
+		nowMs,
+	);
+	await flush();
+	const receipt = (
+		latest(node, "pi-reflect-watchdog.counters.v3").value as {
+			checkpointAcks: Array<{ resumeReceipt: string }>;
+		}
+	).checkpointAcks[0]?.resumeReceipt;
+	assert.ok(receipt);
+	node.emitPeer("child", "offline", "incarnation-a");
+	await flush();
+	nowMs = 11_000;
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-b", {
+			seq: "2",
+			busy: true,
+			rootLoops: "100",
+			allLoops: "100",
+			resumeReceipt: receipt,
+		}),
+		"child",
+		nowMs,
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	assert.equal(coordinator.counters()?.rootLoops.value, 2n);
+	assert.equal(coordinator.counters()?.allLoops.value, 3n);
+	await coordinator.detach(instance);
+});
+
+test("compatible peer joining while paused receives current control snapshot", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+
+	node.emitPeer("child", "online", "incarnation-a");
+	await flush();
+	const wire = latest(node, "pi-reflect-watchdog.counters.v3").value as {
+		accountingGeneration: string;
+		paused: boolean;
+	};
+	assert.equal(wire.accountingGeneration, "1");
+	assert.equal(wire.paused, true);
+	await coordinator.detach(instance);
+});
+
+test("compatible peer joining after pause and resume receives advanced generation", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+	await setReflectDomainPausedForWatchdog(coordinator, false);
+
+	node.emitPeer("child", "online", "incarnation-a");
+	await flush();
+	const wire = latest(node, "pi-reflect-watchdog.counters.v3").value as {
+		accountingGeneration: string;
+		paused: boolean;
+	};
+	assert.equal(wire.accountingGeneration, "2");
+	assert.equal(wire.paused, false);
+	await coordinator.detach(instance);
+});
+
+test("pause generations drop live peers and require fresh generation checkpoint", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+	);
+	await flush();
+	const receipt = (
+		latest(node, "pi-reflect-watchdog.counters.v3").value as {
+			checkpointAcks: Array<{ resumeReceipt: string }>;
+		}
+	).checkpointAcks[0]?.resumeReceipt;
+	assert.ok(receipt);
+
+	await setReflectDomainPausedForWatchdog(coordinator, true);
+	assert.equal(coordinator.counters()?.paused, true);
+	assert.equal(coordinator.counters()?.anyBusy, false);
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "stale-contributor", {
+			seq: "2",
+			busy: true,
+			resumeReceipt: receipt,
+		}),
+		"child",
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, false);
+
+	await setReflectDomainPausedForWatchdog(coordinator, false);
+	const resumed = latest(node, "pi-reflect-watchdog.counters.v3").value as {
+		accountingGeneration: string;
+		paused: boolean;
+	};
+	assert.equal(resumed.accountingGeneration, "2");
+	assert.equal(resumed.paused, false);
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "fresh-contributor", {
+			accountingGeneration: "2",
+			seq: "3",
+			busy: true,
+			resumeReceipt: receipt,
+		}),
+		"child",
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	await coordinator.detach(instance);
+});
+
+test("client accepts pause control without ACK then gates resumed counters on fresh ACK", async () => {
+	const node = new FakeNode("client", "client-a");
+	let liveBusy = true;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => liveBusy,
+		onFatal() {},
+	});
+	const initial = latest(node, "pi-reflect-watchdog.checkpoint.v3").value as {
+		incarnation: string;
+		contributorId: string;
+		seq: string;
+	};
+
+	node.emitChannel(
+		"pi-reflect-watchdog.counters.v3",
+		counterWire({
+			revision: "1",
+			accountingGeneration: "1",
+			paused: true,
+		}),
+	);
+	await flush();
+	assert.equal(coordinator.paused, true);
+	assert.equal(coordinator.counters()?.paused, true);
+
+	liveBusy = false;
+	node.emitChannel(
+		"pi-reflect-watchdog.counters.v3",
+		counterWire({
+			revision: "2",
+			generation: "2",
+			accountingGeneration: "2",
+			paused: false,
+		}),
+	);
+	await flush();
+	assert.equal(coordinator.counters(), undefined);
+	const resumed = latest(node, "pi-reflect-watchdog.checkpoint.v3").value as {
+		incarnation: string;
+		contributorId: string;
+		accountingGeneration: string;
+		seq: string;
+		busy: boolean;
+	};
+	assert.equal(resumed.incarnation, initial.incarnation);
+	assert.notEqual(resumed.contributorId, initial.contributorId);
+	assert.equal(resumed.accountingGeneration, "2");
+	assert.equal(resumed.busy, false);
+
+	node.emitChannel(
+		"pi-reflect-watchdog.counters.v3",
+		counterWire({
+			revision: "3",
+			generation: "3",
+			accountingGeneration: "2",
+			checkpointAcks: [
+				{
+					nodeId: "client-a",
+					incarnation: resumed.incarnation,
+					contributorId: resumed.contributorId,
+					accountingGeneration: "2",
+					seq: resumed.seq,
+					resumeReceipt: "receipt",
+				},
+			],
+		}),
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.generation, 3n);
+	assert.equal(coordinator.paused, false);
+	await coordinator.detach(instance);
+});
+
+test("lost initial ACK is recovered from pause control and resume does not replay loops", async () => {
+	const hostNode = new FakeNode("host");
+	const clientNode = new FakeNode("client", "client-a");
+	let liveBusy = false;
+	const host = createReflectDomainCoordinator({ open: async () => hostNode });
+	const client = createReflectDomainCoordinator({
+		open: async () => clientNode,
+	});
+	const hostInstance = {};
+	const clientInstance = {};
+	await host.attach(hostInstance, { getBusy: () => false, onFatal() {} });
+	await client.attach(clientInstance, {
+		getBusy: () => liveBusy,
+		onFatal() {},
+	});
+	await client.recordRootLoop();
+	const initial = latest(clientNode, "pi-reflect-watchdog.checkpoint.v3")
+		.value as {
+		incarnation: string;
+		contributorId: string;
+		rootLoops: string;
+		resumeReceipt: string | null;
+	};
+	hostNode.emitPeer("client-a", "online", initial.incarnation);
+	hostNode.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		initial,
+		"client-a",
+	);
+	await flush();
+	const accepted = latest(hostNode, "pi-reflect-watchdog.counters.v3")
+		.value as {
+		checkpointAcks: Array<{ resumeReceipt: string }>;
+	};
+	const receipt = accepted.checkpointAcks[0]?.resumeReceipt;
+	assert.ok(receipt);
+	assert.equal(host.counters()?.rootLoops.value, 1n);
+	// Deliberately do not deliver the initial ACK to the client.
+
+	await setReflectDomainPausedForWatchdog(host, true);
+	const paused = latest(hostNode, "pi-reflect-watchdog.counters.v3").value as {
+		checkpointAcks: Array<{ resumeReceipt: string }>;
+	};
+	assert.equal(paused.checkpointAcks[0]?.resumeReceipt, receipt);
+	clientNode.emitChannel("pi-reflect-watchdog.counters.v3", paused);
+	await flush();
+	assert.equal(client.paused, true);
+
+	liveBusy = true;
+	await setReflectDomainPausedForWatchdog(host, false);
+	const resumed = latest(hostNode, "pi-reflect-watchdog.counters.v3").value;
+	clientNode.emitChannel("pi-reflect-watchdog.counters.v3", resumed);
+	await flush();
+	const fresh = latest(clientNode, "pi-reflect-watchdog.checkpoint.v3")
+		.value as {
+		accountingGeneration: string;
+		busy: boolean;
+		contributorId: string;
+		resumeReceipt: string | null;
+	};
+	assert.equal(fresh.accountingGeneration, "2");
+	assert.equal(fresh.busy, true);
+	assert.notEqual(fresh.contributorId, initial.contributorId);
+	assert.equal(fresh.resumeReceipt, receipt);
+
+	hostNode.emitChannel("pi-reflect-watchdog.checkpoint.v3", fresh, "client-a");
+	await flush();
+	assert.equal(host.counters()?.anyBusy, true);
+	assert.equal(host.counters()?.rootLoops.value, 1n);
+	await client.detach(clientInstance);
+	await host.detach(hostInstance);
+});
+
+test("replacement identity fences delayed checkpoint and leave", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-old");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-old", "contributor-old", { busy: true }),
+		"child",
+	);
+	await flush();
+	node.emitPeer("child", "offline", "incarnation-old");
+	node.emitPeer("child", "online", "incarnation-new");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-new", "contributor-new", { busy: true }),
+		"child",
+	);
+	await flush();
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-old", "contributor-old", {
+			seq: "2",
+			busy: false,
+			rootLoops: "9",
+			allLoops: "9",
+		}),
+		"child",
+	);
+	node.emitChannel(
+		"pi-reflect-watchdog.leave.v3",
+		{
+			version: 3,
+			incarnation: "incarnation-old",
+			contributorId: "contributor-old",
+		},
+		"child",
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	await coordinator.detach(instance);
+});
+
+test("v2 and malformed messages fail closed", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.activity.v2",
+		{
+			revision: "1",
+			busy: true,
+		},
+		"child",
+	);
+	node.emitChannel(
+		"pi-reflect-watchdog.loop.v2",
+		{
+			revision: "1",
+			rootLoops: "100",
+			allLoops: "100",
+		},
+		"child",
+	);
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		{
+			...checkpoint("incarnation-a", "contributor-a"),
+			allLoops: "not-a-counter",
+		},
+		"child",
+	);
+	await flush();
+	assert.equal(coordinator.counters()?.anyBusy, false);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	await coordinator.detach(instance);
+});
+
+test("local attachments, loops, tick projection, and reminder reset share reducer state", async () => {
+	const node = new FakeNode("host");
+	const time = fakeClock();
+	let nowMs = 5_000;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+		clock: time.clock,
+		activeTickMs: 250,
+		now: () => nowMs,
+	});
+	const first = {};
+	const second = {};
+	await coordinator.attach(first, { getBusy: () => true, onFatal() {} });
+	await coordinator.attach(second, { getBusy: () => false, onFatal() {} });
+	assert.equal(coordinator.counters()?.localBusy, true);
+	nowMs = 5_250;
 	time.fireNext();
 	await flush();
 	assert.equal(coordinator.counters()?.activeMs.value, 250n);
-	assert.equal(coordinator.counters()?.taskMs.value, 250n);
-	assert.equal(coordinator.counters()?.activeLoops.value, 1n);
-
-	await coordinator.setBusy(instance, false);
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, 250n);
-	assert.equal(coordinator.counters()?.taskMs.value, 250n);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, 10_000n);
-	assert.equal(
-		time.callbacks.filter((entry) => !entry.cancelled).length,
-		0,
-		"all-idle freezes immediately without scheduling a debounce",
-	);
-
-	nowMs = 70_000;
-	await coordinator.setBusy(instance, true);
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, 250n);
-	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
-	assert.equal(coordinator.counters()?.allLoops.value, 1n);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, null);
-
-	await coordinator.setBusy(instance, false);
-	await flush();
-	nowMs = 130_001;
-	await coordinator.setBusy(instance, true);
-	await flush();
-	assert.equal(coordinator.counters()?.activeMs.value, 0n);
-	assert.equal(coordinator.counters()?.activeLoops.value, 0n);
-	assert.equal(coordinator.counters()?.taskMs.value, 0n);
-	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
-	assert.equal(coordinator.counters()?.allLoops.value, 0n);
-	assert.equal(coordinator.counters()?.endLoopTimeMs, null);
-	await coordinator.detach(instance);
-});
-
-test("attach and reconnect query the live busy source", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	let busy = true;
-	let probes = 0;
-	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, {
-		getBusy: () => {
-			probes += 1;
-			return busy;
-		},
-		onFatal() {},
-	});
-	assert.equal(probes, 1);
-	assert.deepEqual(node.sent.at(-1)?.value, { revision: "1", busy: true });
-
-	busy = false;
-	node.emitPeer("host", "online");
-	await flush();
-	assert.equal(probes, 2);
-	assert.deepEqual(
-		node.sent
-			.filter(
-				(message) => message.channel === "pi-reflect-watchdog.activity.v2",
-			)
-			.at(-1)?.value,
-		{ revision: "2", busy: false },
-	);
-	await coordinator.detach(instance);
-});
-
-test("client suppresses activity and loops from authoritative pause until a live-state resume write", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	let busy = false;
-	let probes = 0;
-	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, {
-		getBusy: () => {
-			probes += 1;
-			return busy;
-		},
-		onFatal() {},
-	});
-	assert.equal(probes, 1);
-
-	node.emitChannel(
-		"pi-reflect-watchdog.counters.v2",
-		{
-			revision: "1",
-			generation: "1",
-			domainEpoch: "domain",
-			certain: true,
-			paused: true,
-			anyBusy: false,
-			localBusy: false,
-			otherBusy: false,
-			endLoopTimeMs: null,
-			activeMs: "0",
-			activeLoops: "0",
-			taskMs: "0",
-			rootLoops: "0",
-			allLoops: "0",
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
-			loopRevisions: [],
-		},
-		"host",
-	);
-	assert.equal(coordinator.paused, true);
-	const sentWhilePaused = node.sent.length;
-	busy = true;
-	await coordinator.setBusy(instance, true);
+	await coordinator.recordRootLoop();
 	await coordinator.recordAllLoop();
-	assert.equal(node.sent.length, sentWhilePaused);
-
-	busy = false;
-	node.emitPeer("host", "online");
-	await flush();
-	assert.equal(probes, 1);
-	assert.equal(node.sent.length, sentWhilePaused);
-
-	node.emitChannel(
-		"pi-reflect-watchdog.counters.v2",
-		{
-			revision: "2",
-			generation: "2",
-			domainEpoch: "domain",
-			certain: true,
-			paused: false,
-			anyBusy: false,
-			localBusy: false,
-			otherBusy: false,
-			endLoopTimeMs: null,
-			activeMs: "0",
-			activeLoops: "0",
-			taskMs: "0",
-			rootLoops: "0",
-			allLoops: "0",
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
-			loopRevisions: [],
-		},
-		"host",
-	);
-	await flush();
-	assert.equal(coordinator.paused, false);
-	assert.equal(probes, 2);
-	assert.deepEqual(node.sent.at(-1)?.value, { revision: "2", busy: false });
-	await coordinator.detach(instance);
-});
-
-test("client requires snapshot echoes for activity and loop revisions", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	const seen: ReflectDomainCounters[] = [];
-	coordinator.subscribe((counters) => seen.push(counters));
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	assert.deepEqual(node.sent.at(-1)?.value, { revision: "1", busy: false });
-	await coordinator.recordAllLoop();
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		revision: "1",
-		rootLoops: "0",
-		allLoops: "1",
-	});
-
-	node.emitChannel(
-		"pi-reflect-watchdog.counters.v2",
-		{
-			revision: "1",
-			generation: "1",
-			domainEpoch: "domain",
-			certain: true,
-			paused: false,
-			anyBusy: false,
-			localBusy: false,
-			otherBusy: false,
-			endLoopTimeMs: null,
-			activeMs: "0",
-			activeLoops: "0",
-			taskMs: "0",
-			rootLoops: "0",
-			allLoops: "0",
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
-			loopRevisions: [],
-		},
-		"host",
-	);
-	assert.equal(coordinator.counters(), undefined);
-	node.emitChannel(
-		"pi-reflect-watchdog.counters.v2",
-		{
-			revision: "2",
-			generation: "2",
-			domainEpoch: "domain",
-			certain: true,
-			paused: false,
-			anyBusy: false,
-			localBusy: false,
-			otherBusy: false,
-			endLoopTimeMs: null,
-			activeMs: "0",
-			activeLoops: "0",
-			taskMs: "0",
-			rootLoops: "0",
-			allLoops: "1",
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
-			loopRevisions: [{ nodeId: "child", revision: "1" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.counters()?.allLoops.value, 1n);
-	node.emitChannel(
-		"pi-reflect-watchdog.counters.v2",
-		{
-			revision: "1",
-			generation: "1",
-			domainEpoch: "domain",
-			certain: true,
-			paused: false,
-			anyBusy: false,
-			localBusy: false,
-			otherBusy: false,
-			endLoopTimeMs: null,
-			activeMs: "0",
-			activeLoops: "0",
-			taskMs: "0",
-			rootLoops: "0",
-			allLoops: "0",
-			activityRevisions: [{ nodeId: "child", revision: "1" }],
-			loopRevisions: [{ nodeId: "child", revision: "1" }],
-		},
-		"host",
-	);
-	assert.equal(coordinator.counters()?.allLoops.value, 1n);
-	assert.equal(seen.length, 1);
-	await coordinator.detach(instance);
-});
-
-test("host transport errors revoke certainty while a peer is still tracked", async () => {
-	const node = new FakeNode("host");
-	let transportError: ((error: Error) => void) | undefined;
-	const coordinator = createReflectDomainCoordinator({
-		open: async (options) => {
-			transportError = options?.onError;
-			return node;
-		},
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v2", {
-		revision: "1",
-		busy: false,
-	});
-	await flush();
-	assert.equal(coordinator.counters()?.certain, true);
-	transportError?.(new Error("read loop failed"));
-	assert.equal(coordinator.counters()?.certain, false);
-	await coordinator.detach(instance);
-});
-
-test("graceful leave stays certain even if the closed channel reports an error", async () => {
-	const node = new FakeNode("host");
-	let transportError: ((error: Error) => void) | undefined;
-	const coordinator = createReflectDomainCoordinator({
-		open: async (options) => {
-			transportError = options?.onError;
-			return node;
-		},
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v2", {
-		revision: "1",
-		busy: false,
-	});
-	await flush();
-	node.emitChannel("pi-reflect-watchdog.leave.v2", { version: 1 });
-	await flush();
-	assert.equal(coordinator.counters()?.certain, true);
-	transportError?.(new Error("closed peer channel"));
-	assert.equal(coordinator.counters()?.certain, true);
-	await coordinator.detach(instance);
-});
-
-test("host counter-send rejection revokes certainty", async () => {
-	const node = new FakeNode("host");
-	const coordinator = createReflectDomainCoordinator({
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	node.emitPeer("child", "online");
-	node.sendError = new Error("broadcast failed");
-	await assert.rejects(coordinator.recordRootLoop(), /broadcast failed/);
-	assert.equal(coordinator.counters()?.certain, false);
-	node.sendError = null;
-	await coordinator.detach(instance);
-});
-
-test("cumulative loop state repairs a missing intermediate write", async () => {
-	const node = new FakeNode("host");
-	const coordinator = createReflectDomainCoordinator({
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	node.emitPeer("child", "online");
-	node.emitChannel("pi-reflect-watchdog.activity.v2", {
-		revision: "1",
-		busy: false,
-	});
-	await flush();
-
-	// Revision 1 was lost. Revision 2 carries both cumulative events.
-	node.emitChannel("pi-reflect-watchdog.loop.v2", {
-		revision: "2",
-		rootLoops: "1",
-		allLoops: "2",
-	});
-	await flush();
 	assert.equal(coordinator.counters()?.rootLoops.value, 1n);
 	assert.equal(coordinator.counters()?.allLoops.value, 2n);
-	const lastCounterSend = counterSends(node).at(-1)?.value;
-	assert.ok(lastCounterSend);
-	assert.deepEqual(
-		(lastCounterSend as { loopRevisions: unknown }).loopRevisions,
-		[{ nodeId: "child", revision: "2" }],
+	await coordinator.resetReminderCycle();
+	assert.equal(coordinator.counters()?.activeMs.value, 250n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	await coordinator.detach(first);
+	assert.equal(coordinator.counters()?.localBusy, false);
+	await coordinator.detach(second);
+	assert.equal(node.closed, true);
+});
+
+test("client reconnect republishes current state with fresh contributor", async () => {
+	const node = new FakeNode("client", "client-a");
+	let liveBusy = false;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => liveBusy,
+		onFatal() {},
+	});
+	const initial = latest(node, "pi-reflect-watchdog.checkpoint.v3").value as {
+		contributorId: string;
+		seq: string;
+	};
+	node.emitPeer("host", "offline", "host-incarnation");
+	liveBusy = true;
+	node.emitPeer("host", "online", "host-incarnation");
+	await flush();
+	const replay = latest(node, "pi-reflect-watchdog.checkpoint.v3").value as {
+		contributorId: string;
+		seq: string;
+		busy: boolean;
+	};
+	assert.notEqual(replay.contributorId, initial.contributorId);
+	assert.ok(BigInt(replay.seq) > BigInt(initial.seq));
+	assert.equal(replay.busy, true);
+	await coordinator.detach(instance);
+});
+
+test("transient offline writes recover without fatal reporting", async () => {
+	const node = new FakeNode("client", "client-a");
+	const fatals: Error[] = [];
+	let liveBusy = false;
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, {
+		getBusy: () => liveBusy,
+		onFatal: (error) => fatals.push(error),
+	});
+	node.sendError = new Error("process-domain host is offline");
+	liveBusy = true;
+	await coordinator.setBusy(instance, true);
+	assert.equal(fatals.length, 0);
+	assert.equal(coordinator.counters(), undefined);
+	node.sendError = undefined;
+	node.emitPeer("host", "online", "host-incarnation");
+	await flush();
+	assert.equal(
+		(
+			latest(node, "pi-reflect-watchdog.checkpoint.v3").value as {
+				busy: boolean;
+			}
+		).busy,
+		true,
 	);
 	await coordinator.detach(instance);
 });
 
-test("failed loop write is replayed cumulatively after reconnect", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
+test("initialization failure reports typed fatal and allows retry", async () => {
+	let attempts = 0;
+	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
-	node.sendError = new Error("offline");
-	await assert.rejects(coordinator.recordRootLoop(), /offline/);
-	node.sendError = null;
-	node.emitPeer("host", "online");
-	await flush();
-	assert.deepEqual(node.sent.at(-1)?.value, {
-		revision: "1",
-		rootLoops: "1",
-		allLoops: "1",
-	});
-	await coordinator.detach(instance);
-});
-
-test("offline writes stay recoverable and reconnect republishes current state", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	let busy = false;
-	await coordinator.attach(instance, { getBusy: () => busy, onFatal() {} });
-	node.sendError = new Error("offline");
-	busy = true;
-	const write = coordinator.setBusy(instance, true);
-	assert.equal(coordinator.counters(), undefined);
-	await assert.rejects(write, /offline/);
-	node.sendError = null;
-	node.emitPeer("host", "online");
-	await flush();
-	assert.deepEqual(node.sent.at(-1)?.value, { revision: "3", busy: true });
-	await coordinator.detach(instance);
-});
-
-test("transient host-offline writes resolve without fatal reporting", async () => {
-	const node = new FakeNode("client", "child");
-	node.emitPeer("host", "online");
-	let fatalCount = 0;
-	const coordinator = createReflectDomainCoordinator({
-		env: { PI_EXTENSION_UTILS_PROCESS_DOMAIN: "declaration" },
-		open: async () => node,
-	});
-	const instance = {};
-	let busy = false;
-	await coordinator.attach(instance, {
-		getBusy: () => busy,
-		onFatal() {
-			fatalCount += 1;
+		open: async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("boom");
+			return node;
 		},
 	});
-	node.sendError = new Error("process-domain host is offline");
-	busy = true;
-	await coordinator.setBusy(instance, true);
-	assert.equal(fatalCount, 0);
-	assert.equal(coordinator.counters(), undefined);
-	node.sendError = null;
-	node.emitPeer("host", "online");
-	await flush();
-	assert.deepEqual(node.sent.at(-1)?.value, { revision: "3", busy: true });
-	await coordinator.detach(instance);
+	const first = {};
+	const firstFatals: Error[] = [];
+	await assert.rejects(
+		coordinator.attach(first, {
+			getBusy: () => false,
+			onFatal: (error) => firstFatals.push(error),
+		}),
+		(error: unknown) =>
+			error instanceof ReflectDomainFatalError &&
+			error.code === "DOMAIN_UNRECOVERABLE",
+	);
+	assert.equal(firstFatals.length, 1);
+	const second = {};
+	await coordinator.attach(second, { getBusy: () => false, onFatal() {} });
+	assert.equal(coordinator.rootProcess, true);
+	await coordinator.detach(second);
+});
+
+test("exports sysexits-style fatal status", () => {
+	assert.equal(FATAL_EXIT_CODE, 78);
 });

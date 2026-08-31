@@ -255,7 +255,7 @@ function addLoopDelta(
 	};
 }
 
-function checkpointDelta(
+export function checkpointLoopDelta(
 	entry: CheckpointLedgerEntry,
 	checkpoint: PeerCheckpoint,
 ): { readonly root: bigint; readonly all: bigint } | null {
@@ -297,7 +297,7 @@ function synchronizationDeltaAllowed(
 ): boolean {
 	if (!validAcceptedLoopDelta(delta, checkpoint)) return false;
 	if (previous !== undefined) {
-		const exact = checkpointDelta(previous, checkpoint);
+		const exact = checkpointLoopDelta(previous, checkpoint);
 		return exact !== null && sameLoopDelta(delta, exact);
 	}
 	return (

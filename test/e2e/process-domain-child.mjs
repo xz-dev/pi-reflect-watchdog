@@ -1,5 +1,9 @@
 import { openProcessDomain } from "pi-extension-utils/process-domain";
-import { createReflectDomainCoordinator } from "../../dist/process-domain.js";
+
+const { createReflectDomainCoordinator } = await import(
+	process.env.PI_WATCHDOG_PROCESS_DOMAIN_MODULE ??
+		new URL("../../dist/process-domain.js", import.meta.url).href
+);
 
 const env = {
 	PI_EXTENSION_UTILS_PROCESS_DOMAIN:

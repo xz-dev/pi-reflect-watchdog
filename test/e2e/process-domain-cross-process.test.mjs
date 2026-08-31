@@ -4,9 +4,15 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { openProcessDomain } from "pi-extension-utils/process-domain";
 import { createReflectDomainCoordinator } from "../../dist/process-domain.js";
-import { ROOT } from "../../scripts/e2e/harness.mjs";
+import {
+	createIsolatedEnvironment,
+	createTestResources,
+	installPackedArtifact,
+	ROOT,
+} from "../../scripts/e2e/harness.mjs";
 
 const open = (options) =>
 	openProcessDomain({
@@ -27,12 +33,81 @@ async function waitFor(predicate, label, timeoutMs = 5_000) {
 	throw new Error(`timed out waiting for ${label}`);
 }
 
-function spawnChild(declaration) {
+class MinimalPi {
+	constructor() {
+		this.handlers = new Map();
+		this.messages = [];
+		this.commands = [];
+		this.entries = [];
+		this.bus = new Map();
+		this.events = {
+			on: (channel, handler) => {
+				const handlers = this.bus.get(channel) ?? new Set();
+				handlers.add(handler);
+				this.bus.set(channel, handlers);
+				return () => handlers.delete(handler);
+			},
+			emit: (channel, value) => {
+				for (const handler of this.bus.get(channel) ?? []) handler(value);
+			},
+		};
+	}
+
+	on(name, handler) {
+		this.handlers.set(name, handler);
+	}
+
+	registerCommand(name, command) {
+		this.commands.push({ name, handler: command.handler });
+	}
+
+	sendMessage(message, options) {
+		this.messages.push({ message, options });
+	}
+
+	appendEntry(customType, data) {
+		this.entries.push({ customType, data });
+	}
+
+	async emit(name, event, context) {
+		return await this.handlers.get(name)?.(event, context);
+	}
+}
+
+function minimalContext(sessionId) {
+	let idle = true;
+	return {
+		hasUI: true,
+		mode: "rpc",
+		cwd: `/work/${sessionId}`,
+		isProjectTrusted: () => false,
+		isIdle: () => idle,
+		hasPendingMessages: () => false,
+		abort() {},
+		setIdle(value) {
+			idle = value;
+		},
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getBranch: () => [],
+		},
+		ui: {
+			notify() {},
+			setStatus() {},
+			setWidget() {},
+		},
+	};
+}
+
+function spawnChild(declaration, processDomainModule) {
 	const child = fork(path.join(ROOT, "test/e2e/process-domain-child.mjs"), {
 		cwd: ROOT,
 		env: {
 			...process.env,
 			PI_EXTENSION_UTILS_PROCESS_DOMAIN: declaration,
+			...(processDomainModule
+				? { PI_WATCHDOG_PROCESS_DOMAIN_MODULE: processDomainModule }
+				: {}),
 		},
 		stdio: ["ignore", "pipe", "pipe", "ipc"],
 	});
@@ -173,7 +248,7 @@ test("wrong capability fails closed with status 78 and sanitized output", {
 	assert.equal(output.includes(decoded.endpoint), false);
 });
 
-test("real process transport preserves reflect-owned state across heartbeat recovery", {
+test("real process transport removes stopped peer immediately and resumes from checkpoint", {
 	timeout: 20_000,
 }, async (t) => {
 	const env = {};
@@ -181,7 +256,7 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 		env,
 		open,
 		activeTickMs: 100,
-		idleResetGapMs: 300,
+		idleResetGapMs: 10_000,
 	});
 	const instance = {};
 	await root.attach(instance, { getBusy: () => false, onFatal() {} });
@@ -191,30 +266,21 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 	const child = spawnChild(declaration);
 	t.after(() => child.stop());
 	await child.ready();
-	await child.command("idle");
-	await waitFor(
-		() => root.counters()?.certain === true,
-		"initial child activity acknowledgement",
-	);
 
 	await child.command("root-loop");
 	await child.command("all-loop");
+	await child.command("busy");
 	await waitFor(
 		() =>
 			root.counters()?.rootLoops.value === 1n &&
-			root.counters()?.allLoops.value === 2n,
-		"cross-process loop aggregation",
-	);
-
-	await child.command("busy");
-	await waitFor(
-		() => (root.counters()?.activeMs.value ?? 0n) >= 100n,
-		"cross-process active tick",
+			root.counters()?.allLoops.value === 2n &&
+			(root.counters()?.activeMs.value ?? 0n) >= 100n,
+		"initial checkpoint aggregation",
 	);
 	child.process.kill("SIGSTOP");
 	await waitFor(
-		() => root.counters()?.certain === false,
-		"heartbeat uncertainty",
+		() => root.counters()?.anyBusy === false,
+		"stopped peer removal",
 		4_000,
 	);
 	const frozen = root.counters()?.activeMs.value;
@@ -223,16 +289,14 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 
 	child.process.kill("SIGCONT");
 	await waitFor(
-		() => root.counters()?.certain === true,
-		"fresh activity after heartbeat recovery",
+		() => root.counters()?.anyBusy === true,
+		"checkpoint recovery",
 		5_000,
 	);
 	await waitFor(
 		() => (root.counters()?.activeMs.value ?? 0n) > (frozen ?? 0n),
 		"active tick resumes after recovery",
 	);
-
-	const activeBeforeInternalAsk = root.counters()?.activeMs.value;
 	await child.command("all-loop");
 	await waitFor(
 		() =>
@@ -240,18 +304,137 @@ test("real process transport preserves reflect-owned state across heartbeat reco
 			root.counters()?.activeLoops.value === 3n,
 		"post-recovery loop",
 	);
-	assert.ok(
-		(root.counters()?.activeMs.value ?? 0n) >= (activeBeforeInternalAsk ?? 0n),
-	);
 
-	const revisionBeforeLeave = root.counters()?.revision;
 	await child.stop();
 	await waitFor(
-		() =>
-			root.counters()?.certain === true &&
-			revisionBeforeLeave !== undefined &&
-			root.counters()?.revision > revisionBeforeLeave,
+		() => root.counters()?.anyBusy === false,
 		"graceful child leave",
 		10_000,
 	);
+});
+
+test("packed abrupt loss preserves replacement accounting and automatic Reflect", {
+	timeout: 60_000,
+}, async (t) => {
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-checkpoint-v3-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	const moduleUrl = pathToFileURL(
+		path.join(artifact.packagePath, "dist", "process-domain.js"),
+	).href;
+	const extensionUrl = pathToFileURL(
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	).href;
+	const packedDomain = await import(moduleUrl);
+	const packedExtension = await import(extensionUrl);
+	const env = {};
+	const root = packedDomain.createReflectDomainCoordinator({
+		env,
+		open,
+		activeTickMs: 100,
+	});
+	const pi = new MinimalPi();
+	const context = minimalContext("packed-root");
+	packedExtension.createWatchdogExtension({
+		processDomain: root,
+		services: {
+			loadConfig: async () => ({
+				config: {
+					rootLoopLimit: 3,
+					allLoopLimit: 500,
+					taskMinutes: 30,
+					idleResetGapSeconds: 60,
+					reflectionPrompt: "Inspect current work and return reflection XML.",
+					hookPauses: [],
+				},
+				diagnostics: [],
+			}),
+		},
+	})(pi);
+	await pi.emit("session_start", {}, context);
+	t.after(async () => {
+		await pi.emit("session_shutdown", {}, context);
+	});
+	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
+	assert.ok(declaration);
+
+	const first = spawnChild(declaration, moduleUrl);
+	t.after(() => first.stop());
+	await first.ready();
+	await first.command("busy");
+	await first.command("root-loop");
+	await waitFor(
+		() =>
+			root.counters()?.anyBusy === true &&
+			root.counters()?.rootLoops.value === 1n &&
+			(root.counters()?.activeMs.value ?? 0n) >= 100n &&
+			(root.counters()?.taskMs.value ?? 0n) >= 100n,
+		"first packed contributor",
+	);
+	const firstExit = once(first.process, "exit");
+	first.process.kill("SIGKILL");
+	await firstExit;
+	await waitFor(
+		() => root.counters()?.anyBusy === false,
+		"first SIGKILL contributor removal",
+		5_000,
+	);
+	assert.equal(root.counters()?.rootLoops.value, 1n);
+	const frozenActiveMs = root.counters()?.activeMs.value ?? 0n;
+	const frozenTaskMs = root.counters()?.taskMs.value ?? 0n;
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(root.counters()?.activeMs.value, frozenActiveMs);
+	assert.equal(root.counters()?.taskMs.value, frozenTaskMs);
+
+	const replacement = spawnChild(declaration, moduleUrl);
+	t.after(() => replacement.stop());
+	await replacement.ready();
+	await replacement.command("busy");
+	await replacement.command("root-loop");
+	await waitFor(
+		() =>
+			root.counters()?.anyBusy === true &&
+			root.counters()?.rootLoops.value === 2n &&
+			(root.counters()?.activeMs.value ?? 0n) > frozenActiveMs &&
+			(root.counters()?.taskMs.value ?? 0n) > frozenTaskMs,
+		"replacement packed contributor",
+		5_000,
+	);
+	const replacementExit = once(replacement.process, "exit");
+	replacement.process.kill("SIGKILL");
+	await replacementExit;
+	await waitFor(
+		() => root.counters()?.anyBusy === false,
+		"replacement SIGKILL contributor removal",
+		5_000,
+	);
+
+	context.setIdle(false);
+	await pi.emit("agent_start", {}, context);
+	await pi.emit(
+		"turn_end",
+		{ message: { role: "assistant", stopReason: "stop" } },
+		context,
+	);
+	await waitFor(
+		() =>
+			pi.messages.some(({ message }) =>
+				String(message?.customType ?? "").endsWith(":inquiry"),
+			),
+		"automatic Reflect after abrupt peer loss",
+	);
+	const inquiry = pi.messages.findLast(({ message }) =>
+		String(message?.customType ?? "").endsWith(":inquiry"),
+	);
+	assert.match(inquiry?.message?.content ?? "", /ROOT_LOOP_LIMIT/);
+	assert.deepEqual(inquiry?.options, {
+		triggerTurn: true,
+		deliverAs: "steer",
+	});
 });

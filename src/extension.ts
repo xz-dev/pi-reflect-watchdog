@@ -597,8 +597,7 @@ function safeToDispatch(runtime: Runtime): boolean {
 	return (
 		owns(runtime) &&
 		runtime.ctx !== null &&
-		runtime.activeReflection === undefined &&
-		currentCounters(runtime)?.certain === true
+		runtime.activeReflection === undefined
 	);
 }
 

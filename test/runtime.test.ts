@@ -222,7 +222,6 @@ class FakeDomain implements ReflectDomainCoordinator {
 			domainEpoch: "domain",
 			revision: this.revision,
 			generation: this.revision,
-			certain: true,
 			paused: this.paused,
 			anyBusy: false,
 			localBusy: false,

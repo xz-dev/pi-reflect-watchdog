@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import {
 	isProcessDomainOpenError,
 	type openProcessDomain,
@@ -7,13 +8,23 @@ import {
 	type ProcessDomainNode,
 	type ProcessDomainOpenErrorCode,
 } from "pi-extension-utils/process-domain";
+import {
+	type AcceptedLoopDelta,
+	type CheckpointLedgerEntry,
+	type CollectionState,
+	checkpointLoopDelta,
+	createCollectionState,
+	type PeerCheckpoint,
+	reduceCollectionState,
+	snapshotCollectionState,
+} from "./collection-state.js";
 
 export const FATAL_EXIT_CODE = 78;
 
-const ACTIVITY_CHANNEL = "pi-reflect-watchdog.activity.v2";
-const LOOP_CHANNEL = "pi-reflect-watchdog.loop.v2";
-const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v2";
-const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v2";
+const CHECKPOINT_CHANNEL = "pi-reflect-watchdog.checkpoint.v3";
+const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v3";
+const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v3";
+const PRIVATE_PROTOCOL_VERSION = 3;
 const ACTIVE_TICK_MS = 1_000;
 const IDLE_RESET_GAP_MS = 60_000;
 
@@ -47,6 +58,7 @@ const TRANSIENT_TRANSPORT_MESSAGES = [
 	"process-domain host is offline",
 	"process-domain host disconnected",
 	"process-domain peer disconnected",
+	"process-domain peer replaced",
 	"process-domain acknowledgement timed out",
 	"process-domain connection timed out",
 	"process-domain connection closed",
@@ -74,7 +86,6 @@ export interface ReflectDomainCounters {
 	readonly domainEpoch: string;
 	readonly revision: bigint;
 	readonly generation: bigint;
-	readonly certain: boolean;
 	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
@@ -88,27 +99,33 @@ export interface ReflectDomainCounters {
 	readonly allLoops: ReflectCounterValue;
 }
 
-interface ActivityWire {
-	readonly revision: string;
+interface CheckpointWire {
+	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
+	readonly incarnation: string;
+	readonly contributorId: string;
+	readonly accountingGeneration: string;
+	readonly seq: string;
 	readonly busy: boolean;
-}
-
-interface LoopWire {
-	readonly revision: string;
 	readonly rootLoops: string;
 	readonly allLoops: string;
+	readonly resumeReceipt: string | null;
 }
 
-interface RevisionWire {
+interface CheckpointAckWire {
 	readonly nodeId: string;
-	readonly revision: string;
+	readonly incarnation: string;
+	readonly contributorId: string;
+	readonly accountingGeneration: string;
+	readonly seq: string;
+	readonly resumeReceipt: string;
 }
 
 interface CountersWire {
+	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
 	readonly revision: string;
 	readonly generation: string;
+	readonly accountingGeneration: string;
 	readonly domainEpoch: string;
-	readonly certain: boolean;
 	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
@@ -119,28 +136,46 @@ interface CountersWire {
 	readonly taskMs: string;
 	readonly rootLoops: string;
 	readonly allLoops: string;
-	readonly activityRevisions: readonly RevisionWire[];
-	readonly loopRevisions: readonly RevisionWire[];
+	readonly checkpointAcks: readonly CheckpointAckWire[];
 }
 
-interface PeerActivity {
-	busy: boolean;
-	activityRevision: bigint;
-	loopRevision: bigint;
-	rootLoops: bigint;
-	allLoops: bigint;
+interface LeaveWire {
+	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
+	readonly incarnation: string;
+	readonly contributorId: string;
 }
 
 interface Attachment {
+	readonly contributorId: string;
 	busy: boolean;
 	readonly getBusy: () => boolean;
 	readonly onFatal: (error: Error) => void;
 }
 
+interface PeerSession {
+	readonly nodeId: string;
+	readonly incarnation: string;
+	readonly contributorId: string;
+	readonly replayKey: string;
+	readonly accountingGeneration: bigint;
+	readonly seq: bigint;
+	readonly resumeReceipt: string;
+}
+
+interface ReplayRegistryEntry {
+	readonly replayKey: string;
+	readonly ack: CheckpointAckWire;
+}
+
+interface HostPublication {
+	readonly wire: CountersWire;
+	readonly targets: readonly string[];
+}
+
 interface ParsedCounterMessage {
 	readonly counters: ReflectDomainCounters;
-	readonly activityRevision: bigint;
-	readonly loopRevision: bigint;
+	readonly accountingGeneration: bigint;
+	readonly checkpointAck: CheckpointAckWire | undefined;
 }
 
 export interface ReflectDomainCoordinator {
@@ -207,34 +242,25 @@ export interface ReflectDomainOptions {
 	readonly now?: () => number;
 }
 
+function id(): string {
+	return randomBytes(16).toString("base64url");
+}
+
 function counter(value = 0n): ReflectCounterValue {
 	return { value };
 }
 
-function zeroCounters(
-	state: {
-		readonly domainEpoch?: string;
-		readonly revision?: bigint;
-		readonly generation?: bigint;
-		readonly certain?: boolean;
-		readonly anyBusy?: boolean;
-		readonly localBusy?: boolean;
-		readonly otherBusy?: boolean;
-	} = {},
-): ReflectDomainCounters {
-	const domainEpoch = state.domainEpoch ?? "pending";
-	const generation = state.generation ?? 0n;
+function zeroCounters(domainEpoch = "pending"): ReflectDomainCounters {
 	return {
 		domainEpoch,
-		revision: state.revision ?? 0n,
-		generation,
-		certain: state.certain ?? false,
+		revision: 0n,
+		generation: 0n,
 		paused: false,
-		anyBusy: state.anyBusy ?? false,
-		localBusy: state.localBusy ?? false,
-		otherBusy: state.otherBusy ?? false,
+		anyBusy: false,
+		localBusy: false,
+		otherBusy: false,
 		endLoopTimeMs: null,
-		fence: { domainEpoch, generation },
+		fence: { domainEpoch, generation: 0n },
 		activeMs: counter(),
 		activeLoops: counter(),
 		taskMs: counter(),
@@ -251,7 +277,6 @@ function sameCounters(
 		left.domainEpoch === right.domainEpoch &&
 		left.revision === right.revision &&
 		left.generation === right.generation &&
-		left.certain === right.certain &&
 		left.paused === right.paused &&
 		left.anyBusy === right.anyBusy &&
 		left.localBusy === right.localBusy &&
@@ -269,7 +294,7 @@ function validId(value: unknown): value is string {
 	return typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
-function validRevision(value: unknown): value is string {
+function validPositive(value: unknown): value is string {
 	return typeof value === "string" && /^[1-9]\d*$/.test(value);
 }
 
@@ -277,55 +302,58 @@ function validCounterValue(value: unknown): value is string {
 	return typeof value === "string" && /^\d+$/.test(value);
 }
 
-function parseRevisionMap(value: unknown): Map<string, bigint> | null {
-	if (!Array.isArray(value)) return null;
-	const parsed = new Map<string, bigint>();
-	for (const entry of value) {
-		if (
-			typeof entry !== "object" ||
-			entry === null ||
-			!validId((entry as Partial<RevisionWire>).nodeId) ||
-			!validRevision((entry as Partial<RevisionWire>).revision) ||
-			parsed.has((entry as RevisionWire).nodeId)
-		) {
-			return null;
-		}
-		parsed.set(
-			(entry as RevisionWire).nodeId,
-			BigInt((entry as RevisionWire).revision),
-		);
-	}
-	return parsed;
-}
-
-function parseActivity(
-	value: unknown,
-): { busy: boolean; revision: bigint } | null {
+function parseCheckpoint(value: unknown): CheckpointWire | null {
 	if (typeof value !== "object" || value === null) return null;
-	const wire = value as Partial<ActivityWire>;
-	if (typeof wire.busy !== "boolean" || !validRevision(wire.revision))
-		return null;
-	return { busy: wire.busy, revision: BigInt(wire.revision) };
-}
-
-function parseLoop(value: unknown): {
-	revision: bigint;
-	rootLoops: bigint;
-	allLoops: bigint;
-} | null {
-	if (typeof value !== "object" || value === null) return null;
-	const wire = value as Partial<LoopWire>;
+	const wire = value as Partial<CheckpointWire>;
 	if (
-		!validRevision(wire.revision) ||
+		wire.version !== PRIVATE_PROTOCOL_VERSION ||
+		!validId(wire.incarnation) ||
+		!validId(wire.contributorId) ||
+		!validCounterValue(wire.accountingGeneration) ||
+		!validPositive(wire.seq) ||
+		typeof wire.busy !== "boolean" ||
 		!validCounterValue(wire.rootLoops) ||
-		!validCounterValue(wire.allLoops)
+		!validCounterValue(wire.allLoops) ||
+		(wire.resumeReceipt !== null && !validId(wire.resumeReceipt))
 	)
 		return null;
-	const revision = BigInt(wire.revision);
-	const rootLoops = BigInt(wire.rootLoops);
-	const allLoops = BigInt(wire.allLoops);
-	if (allLoops !== revision || rootLoops > allLoops) return null;
-	return { revision, rootLoops, allLoops };
+	if (BigInt(wire.rootLoops) > BigInt(wire.allLoops)) return null;
+	return wire as CheckpointWire;
+}
+
+function parseLeave(value: unknown): LeaveWire | null {
+	if (typeof value !== "object" || value === null) return null;
+	const wire = value as Partial<LeaveWire>;
+	return wire.version === PRIVATE_PROTOCOL_VERSION &&
+		validId(wire.incarnation) &&
+		validId(wire.contributorId)
+		? (wire as LeaveWire)
+		: null;
+}
+
+function parseCheckpointAcks(
+	value: unknown,
+): readonly CheckpointAckWire[] | null {
+	if (!Array.isArray(value)) return null;
+	const parsed: CheckpointAckWire[] = [];
+	const nodes = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "object" || entry === null) return null;
+		const ack = entry as Partial<CheckpointAckWire>;
+		if (
+			!validId(ack.nodeId) ||
+			!validId(ack.incarnation) ||
+			!validId(ack.contributorId) ||
+			!validCounterValue(ack.accountingGeneration) ||
+			!validPositive(ack.seq) ||
+			!validId(ack.resumeReceipt) ||
+			nodes.has(ack.nodeId)
+		)
+			return null;
+		nodes.add(ack.nodeId);
+		parsed.push(ack as CheckpointAckWire);
+	}
+	return parsed;
 }
 
 function parseCounters(
@@ -334,13 +362,13 @@ function parseCounters(
 ): ParsedCounterMessage | null {
 	if (typeof value !== "object" || value === null) return null;
 	const wire = value as Partial<CountersWire>;
-	const activityRevisions = parseRevisionMap(wire.activityRevisions);
-	const loopRevisions = parseRevisionMap(wire.loopRevisions);
+	const checkpointAcks = parseCheckpointAcks(wire.checkpointAcks);
 	if (
-		!validRevision(wire.revision) ||
-		!validRevision(wire.generation) ||
+		wire.version !== PRIVATE_PROTOCOL_VERSION ||
+		!validPositive(wire.revision) ||
+		!validPositive(wire.generation) ||
+		!validCounterValue(wire.accountingGeneration) ||
 		!validId(wire.domainEpoch) ||
-		typeof wire.certain !== "boolean" ||
 		typeof wire.paused !== "boolean" ||
 		typeof wire.anyBusy !== "boolean" ||
 		typeof wire.localBusy !== "boolean" ||
@@ -351,45 +379,34 @@ function parseCounters(
 		!validCounterValue(wire.taskMs) ||
 		!validCounterValue(wire.rootLoops) ||
 		!validCounterValue(wire.allLoops) ||
-		activityRevisions === null ||
-		loopRevisions === null
-	) {
+		checkpointAcks === null
+	)
 		return null;
-	}
-	const generation = BigInt(wire.generation);
+	const snapshotGeneration = BigInt(wire.generation);
 	return {
 		counters: {
 			domainEpoch: wire.domainEpoch,
 			revision: BigInt(wire.revision),
-			generation,
-			certain: wire.certain,
+			generation: snapshotGeneration,
 			paused: wire.paused,
 			anyBusy: wire.anyBusy,
 			localBusy: wire.localBusy,
 			otherBusy: wire.otherBusy,
 			endLoopTimeMs:
 				wire.endLoopTimeMs === null ? null : BigInt(wire.endLoopTimeMs),
-			fence: { domainEpoch: wire.domainEpoch, generation },
+			fence: {
+				domainEpoch: wire.domainEpoch,
+				generation: snapshotGeneration,
+			},
 			activeMs: counter(BigInt(wire.activeMs)),
 			activeLoops: counter(BigInt(wire.activeLoops)),
 			taskMs: counter(BigInt(wire.taskMs)),
 			rootLoops: counter(BigInt(wire.rootLoops)),
 			allLoops: counter(BigInt(wire.allLoops)),
 		},
-		activityRevision: activityRevisions.get(nodeId) ?? 0n,
-		loopRevision: loopRevisions.get(nodeId) ?? 0n,
+		accountingGeneration: BigInt(wire.accountingGeneration),
+		checkpointAck: checkpointAcks.find((ack) => ack.nodeId === nodeId),
 	};
-}
-
-function revisionMap(
-	value: ReadonlyMap<string, bigint>,
-): readonly RevisionWire[] {
-	return Array.from(value)
-		.filter(([, revision]) => revision > 0n)
-		.map(([nodeId, revision]) => ({
-			nodeId,
-			revision: revision.toString(),
-		}));
 }
 
 export function createReflectDomainCoordinator(
@@ -406,40 +423,38 @@ export function createReflectDomainCoordinator(
 	const activeTickMs = options.activeTickMs ?? ACTIVE_TICK_MS;
 	const now = options.now ?? Date.now;
 	let idleResetGapMs = options.idleResetGapMs ?? IDLE_RESET_GAP_MS;
+	const processIncarnation = id();
+	const receiptSecret = randomBytes(32);
 	const attachments = new Map<object, Attachment>();
 	const listeners = new Set<(counters: ReflectDomainCounters) => void>();
-	const peers = new Map<string, PeerActivity>();
-	const deferredPausedPeers = new Set<string>();
-	const uncertainPeers = new Set<string>();
+	const peerSessions = new Map<string, PeerSession>();
+	const controlPeers = new Set<string>();
+	const replayRegistry = new Map<string, ReplayRegistryEntry>();
+	let nextAttachmentId = 0;
 	let node: ProcessDomainNode | undefined;
 	let rootProcess = false;
 	let opening: Promise<void> | undefined;
 	let countersValue: ReflectDomainCounters | undefined;
-	let hostState: ReflectDomainCounters | undefined;
-	let hostStateRevision = 0n;
+	let collectionState: CollectionState | undefined;
+	let snapshotRevision = 0n;
+	let snapshotGeneration = 0n;
 	let acceptedHostRevision = 0n;
 	let acceptedHostEpoch: string | undefined;
-	let paused = false;
 	let clientPaused = false;
-	let pausedAtMs: bigint | null = null;
-	let pausedAggregateBusy: boolean | null = null;
-	let transportHealthy = true;
+	let clientAccountingGeneration = 0n;
+	let clientContributorId = id();
+	let clientResumeReceipt: string | null = null;
+	let localCheckpointSeq = 0n;
+	let requiredCheckpointSeq = 0n;
+	let localRootLoops = 0n;
+	let localAllLoops = 0n;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
-	let unsubscribeActivity: (() => void) | undefined;
-	let unsubscribeLoops: (() => void) | undefined;
+	let unsubscribeCheckpoint: (() => void) | undefined;
 	let unsubscribeCounters: (() => void) | undefined;
 	let unsubscribeLeave: (() => void) | undefined;
 	let writeTail = Promise.resolve();
 	let lifecycleTail = Promise.resolve();
-	let snapshotRevision = 0n;
-	let snapshotGeneration = 0n;
-	let localActivityRevision = 0n;
-	let localLoopRevision = 0n;
-	let localRootLoops = 0n;
-	let localAllLoops = 0n;
-	let requiredActivityRevision = 0n;
-	let requiredLoopRevision = 0n;
 
 	const desiredActivity = (): boolean =>
 		Array.from(attachments.values()).some((attachment) => attachment.busy);
@@ -457,7 +472,7 @@ export function createReflectDomainCoordinator(
 		}
 	};
 
-	const markClientUncertain = (): void => {
+	const clearClientCounters = (): void => {
 		countersValue = undefined;
 	};
 
@@ -479,98 +494,132 @@ export function createReflectDomainCoordinator(
 		return result;
 	};
 
-	const markTransportUncertain = (forceTransport = false): void => {
-		if (node === undefined) return;
-		if (!rootProcess) {
-			markClientUncertain();
-			return;
-		}
-		let changed = false;
-		if (forceTransport && transportHealthy) {
-			transportHealthy = false;
-			changed = true;
-		}
-		for (const peer of node.peers()) {
-			if (
-				peer.status === "offline" &&
-				peers.has(peer.nodeId) &&
-				!uncertainPeers.has(peer.nodeId)
-			) {
-				uncertainPeers.add(peer.nodeId);
-				changed = true;
-			}
-		}
-		if (!changed) return;
-		hostStateRevision += 1n;
-		const current = countersValue ?? hostCounters();
-		if (!current.certain) return;
-		snapshotRevision += 1n;
-		snapshotGeneration += 1n;
-		const domainEpoch = node.declaration.domainId;
-		notify({
-			...current,
-			domainEpoch,
-			revision: snapshotRevision,
-			generation: snapshotGeneration,
-			certain: false,
-			fence: { domainEpoch, generation: snapshotGeneration },
-		});
-	};
-
-	const reportFatal = (error: Error, forceTransport = false): void => {
-		markTransportUncertain(forceTransport);
+	const reportError = (error: Error): void => {
 		for (const attachment of attachments.values()) {
 			try {
 				attachment.onFatal(error);
 			} catch {
-				// Fatal ownership remains with the host adapter.
+				// Error reporting cannot corrupt coordinator state.
 			}
 		}
 	};
 
-	const hostCounters = (): ReflectDomainCounters => hostState ?? zeroCounters();
+	const receiptFor = (replayKey: string): string =>
+		createHmac("sha256", receiptSecret)
+			.update(node?.declaration.domainId ?? "pending")
+			.update("\0")
+			.update(replayKey)
+			.digest("base64url");
 
-	const hostBusy = (): boolean => {
-		if (desiredActivity()) return true;
-		for (const peer of peers.values()) if (peer.busy) return true;
-		return false;
+	const replayKeyFor = (nodeId: string, incarnation: string): string =>
+		`${nodeId}:${incarnation}`;
+
+	const retainedLedger = (
+		replayKey: string,
+		atMs: number,
+	): CheckpointLedgerEntry | undefined => {
+		const entry = collectionState?.ledger.get(replayKey);
+		return entry !== undefined &&
+			(entry.replayUntilMs === null || atMs <= entry.replayUntilMs)
+			? entry
+			: undefined;
 	};
 
-	const hostCertain = (): boolean =>
-		transportHealthy && uncertainPeers.size === 0;
+	const reduce = (event: Parameters<typeof reduceCollectionState>[1]): void => {
+		if (collectionState !== undefined)
+			collectionState = reduceCollectionState(collectionState, event);
+	};
 
-	const publishHostNow = async (): Promise<void> => {
-		if (!rootProcess || node === undefined) return;
-		const currentNode = node;
-		const current = hostCounters();
-		const publishedStateRevision = hostStateRevision;
-		snapshotRevision += 1n;
-		snapshotGeneration += 1n;
-		const domainEpoch = currentNode.declaration.domainId;
-		const counters: ReflectDomainCounters = {
-			...current,
+	const localAndOtherBusy = (): {
+		readonly localBusy: boolean;
+		readonly otherBusy: boolean;
+	} => {
+		let localBusy = false;
+		let otherBusy = false;
+		for (const contributor of collectionState?.live.values() ?? []) {
+			if (!contributor.busy) continue;
+			if (contributor.kind === "local") localBusy = true;
+			else otherBusy = true;
+		}
+		return { localBusy, otherBusy };
+	};
+
+	const projectHostCounters = (): ReflectDomainCounters => {
+		if (node === undefined || collectionState === undefined)
+			return zeroCounters();
+		const snapshot = snapshotCollectionState(collectionState, now());
+		const busy = localAndOtherBusy();
+		const domainEpoch = node.declaration.domainId;
+		return {
 			domainEpoch,
 			revision: snapshotRevision,
 			generation: snapshotGeneration,
-			certain: uncertainPeers.size === 0,
-			paused,
-			anyBusy: hostBusy(),
-			localBusy: desiredActivity(),
-			otherBusy: [...peers.values()].some((peer) => peer.busy),
+			paused: snapshot.paused,
+			anyBusy: snapshot.anyBusy,
+			localBusy: busy.localBusy,
+			otherBusy: busy.otherBusy,
+			endLoopTimeMs:
+				!snapshot.paused &&
+				!snapshot.anyBusy &&
+				collectionState.accounting.idleSinceMs !== null
+					? BigInt(collectionState.accounting.idleSinceMs)
+					: null,
 			fence: { domainEpoch, generation: snapshotGeneration },
+			activeMs: counter(snapshot.activeMs),
+			activeLoops: counter(snapshot.activeLoops),
+			taskMs: counter(snapshot.taskMs),
+			rootLoops: counter(snapshot.rootLoops),
+			allLoops: counter(snapshot.allLoops),
 		};
-		const activityRevisions = new Map<string, bigint>();
-		const loopRevisions = new Map<string, bigint>();
-		for (const [nodeId, peer] of peers) {
-			activityRevisions.set(nodeId, peer.activityRevision);
-			loopRevisions.set(nodeId, peer.loopRevision);
+	};
+
+	const checkpointAcks = (): readonly CheckpointAckWire[] => {
+		if (node === undefined) return Object.freeze([]);
+		const acks: CheckpointAckWire[] = [];
+		for (const nodeId of controlPeers) {
+			const peer = node
+				.peers()
+				.find((candidate) => candidate.nodeId === nodeId);
+			if (
+				peer?.status !== "online" ||
+				peer.metadata.protocol !== String(PRIVATE_PROTOCOL_VERSION) ||
+				!validId(peer.metadata.incarnation)
+			)
+				continue;
+			const entry = replayRegistry.get(
+				replayKeyFor(nodeId, peer.metadata.incarnation),
+			);
+			if (entry !== undefined) acks.push(entry.ack);
 		}
-		const message: CountersWire = {
-			revision: snapshotRevision.toString(),
-			generation: snapshotGeneration.toString(),
-			domainEpoch,
-			certain: counters.certain,
-			paused,
+		return Object.freeze(acks);
+	};
+
+	const removePeerSession = (nodeId: string, atMs = now()): boolean => {
+		const session = peerSessions.get(nodeId);
+		if (session === undefined) return false;
+		reduce({
+			type: "peer-offline",
+			contributorId: session.contributorId,
+			atMs,
+		});
+		peerSessions.delete(nodeId);
+		return true;
+	};
+
+	const captureHostPublication = (): HostPublication | undefined => {
+		if (!rootProcess || node === undefined || collectionState === undefined)
+			return undefined;
+		snapshotRevision += 1n;
+		snapshotGeneration += 1n;
+		const counters = projectHostCounters();
+		notify(counters);
+		const wire: CountersWire = Object.freeze({
+			version: PRIVATE_PROTOCOL_VERSION,
+			revision: counters.revision.toString(),
+			generation: counters.generation.toString(),
+			accountingGeneration: collectionState.accounting.generation.toString(),
+			domainEpoch: counters.domainEpoch,
+			paused: counters.paused,
 			anyBusy: counters.anyBusy,
 			localBusy: counters.localBusy,
 			otherBusy: counters.otherBusy,
@@ -580,167 +629,86 @@ export function createReflectDomainCoordinator(
 			taskMs: counters.taskMs.value.toString(),
 			rootLoops: counters.rootLoops.value.toString(),
 			allLoops: counters.allLoops.value.toString(),
-			activityRevisions: revisionMap(activityRevisions),
-			loopRevisions: revisionMap(loopRevisions),
-		};
-		const targets = [...peers.keys()].filter((nodeId) =>
-			currentNode
-				.peers()
-				.some((peer) => peer.nodeId === nodeId && peer.status === "online"),
-		);
-		await Promise.all(
-			targets.map((nodeId) =>
-				currentNode.send(nodeId, COUNTERS_CHANNEL, message),
-			),
-		);
-		transportHealthy = true;
-		if (publishedStateRevision === hostStateRevision) notify(counters);
+			checkpointAcks: checkpointAcks(),
+		});
+		return Object.freeze({
+			wire,
+			targets: Object.freeze(Array.from(controlPeers)),
+		});
 	};
 
-	const publishHost = (): Promise<void> =>
-		queueTransport(async () => {
+	const sendHostPublication = async (
+		publication: HostPublication,
+	): Promise<void> => {
+		if (node === undefined) return;
+		let firstError: unknown;
+		await Promise.all(
+			publication.targets.map(async (nodeId) => {
+				try {
+					await node?.send(nodeId, COUNTERS_CHANNEL, publication.wire);
+				} catch (error) {
+					const peer = node
+						?.peers()
+						.find((candidate) => candidate.nodeId === nodeId);
+					if (peer?.status === "offline") {
+						const controlRemoved = controlPeers.delete(nodeId);
+						const sessionRemoved = removePeerSession(nodeId);
+						if (controlRemoved || sessionRemoved)
+							void publishHost().catch(() => {});
+						return;
+					}
+					if (isTransientTransportError(error)) return;
+					firstError ??= error;
+				}
+			}),
+		);
+		if (firstError !== undefined) throw firstError;
+	};
+
+	const publishHost = (): Promise<void> => {
+		const publication = captureHostPublication();
+		if (publication === undefined) return Promise.resolve();
+		updateHostTimers();
+		return queueTransport(async () => {
 			try {
-				await publishHostNow();
+				await sendHostPublication(publication);
 			} catch (error) {
-				reportFatal(
+				const reported =
 					error instanceof Error
 						? error
-						: new Error("reflection transport write failed"),
-					true,
-				);
-				throw error;
+						: new Error("reflection transport write failed");
+				reportError(reported);
+				throw reported;
 			}
 		});
-
-	const applyHostActivity = (message: ProcessDomainDataMessage): void => {
-		if (!rootProcess || node === undefined || paused) return;
-		const peer = node
-			.peers()
-			.find((candidate) => candidate.nodeId === message.senderId);
-		if (peer?.status !== "online") return;
-		const activity = parseActivity(message.value);
-		const current = peers.get(message.senderId);
-		if (
-			activity === null ||
-			current === undefined ||
-			activity.revision <= current.activityRevision
-		)
-			return;
-		const wasBusy = hostBusy();
-		current.busy = activity.busy;
-		current.activityRevision = activity.revision;
-		hostStateRevision += 1n;
-		uncertainPeers.delete(message.senderId);
-		applyAggregateBusyTransition(wasBusy, hostBusy());
-		void publishHost()
-			.then(updateHostTimers)
-			.catch(() => {});
-	};
-
-	const applyHostLoop = (message: ProcessDomainDataMessage): void => {
-		if (!rootProcess || node === undefined) return;
-		const peer = node
-			.peers()
-			.find((candidate) => candidate.nodeId === message.senderId);
-		if (peer?.status !== "online") return;
-		const loop = parseLoop(message.value);
-		const current = peers.get(message.senderId);
-		if (
-			loop === null ||
-			current === undefined ||
-			loop.revision <= current.loopRevision ||
-			loop.rootLoops < current.rootLoops ||
-			loop.allLoops < current.allLoops
-		)
-			return;
-		const rootDelta = loop.rootLoops - current.rootLoops;
-		const allDelta = loop.allLoops - current.allLoops;
-		current.loopRevision = loop.revision;
-		current.rootLoops = loop.rootLoops;
-		current.allLoops = loop.allLoops;
-		hostStateRevision += 1n;
-		if (!paused) {
-			const currentCounters = hostCounters();
-			hostState = {
-				...currentCounters,
-				activeLoops: counter(currentCounters.activeLoops.value + allDelta),
-				rootLoops: counter(currentCounters.rootLoops.value + rootDelta),
-				allLoops: counter(currentCounters.allLoops.value + allDelta),
-			};
-		}
-		void publishHost().catch(() => {});
-	};
-
-	const clearEveryCounter = (current: ReflectDomainCounters) => ({
-		...current,
-		endLoopTimeMs: null,
-		activeMs: counter(),
-		activeLoops: counter(),
-		taskMs: counter(),
-		rootLoops: counter(),
-		allLoops: counter(),
-	});
-
-	const clearReminderCounters = (current: ReflectDomainCounters) => ({
-		...current,
-		taskMs: counter(),
-		rootLoops: counter(),
-		allLoops: counter(),
-	});
-
-	const applyAggregateBusyTransition = (
-		wasBusy: boolean,
-		isBusy: boolean,
-	): void => {
-		if (!rootProcess || paused || wasBusy === isBusy) return;
-		const current = hostCounters();
-		if (!isBusy) {
-			hostState = {
-				...current,
-				anyBusy: false,
-				localBusy: false,
-				otherBusy: false,
-				endLoopTimeMs: BigInt(now()),
-			};
-			return;
-		}
-		const gapExceeded =
-			current.endLoopTimeMs !== null &&
-			BigInt(now()) > current.endLoopTimeMs + BigInt(idleResetGapMs);
-		const resumed = gapExceeded ? clearEveryCounter(current) : current;
-		hostState = {
-			...resumed,
-			anyBusy: true,
-			localBusy: desiredActivity(),
-			otherBusy: [...peers.values()].some((peer) => peer.busy),
-			endLoopTimeMs: null,
-		};
 	};
 
 	const scheduleTick = (): void => {
-		if (!rootProcess || node === undefined || tick !== undefined || paused)
+		if (
+			!rootProcess ||
+			node === undefined ||
+			tick !== undefined ||
+			collectionState === undefined ||
+			!snapshotCollectionState(collectionState, now()).anyBusy
+		)
 			return;
 		tick = clock.setTimeout(() => {
 			tick = undefined;
-			if (!rootProcess || paused || !hostCertain()) return;
-			if (!hostBusy()) return;
-			const current = hostCounters();
-			hostStateRevision += 1n;
-			hostState = {
-				...current,
-				activeMs: counter(current.activeMs.value + BigInt(activeTickMs)),
-				taskMs: counter(current.taskMs.value + BigInt(activeTickMs)),
-			};
+			if (
+				!rootProcess ||
+				collectionState === undefined ||
+				!snapshotCollectionState(collectionState, now()).anyBusy
+			)
+				return;
 			void publishHost().catch(() => {});
 			scheduleTick();
-			return;
 		}, activeTickMs);
 		tick.unref?.();
 	};
 
 	const updateHostTimers = (): void => {
-		if (!rootProcess || paused || !hostCertain()) return;
-		if (hostBusy()) {
+		if (!rootProcess || collectionState === undefined) return;
+		if (snapshotCollectionState(collectionState, now()).anyBusy) {
 			scheduleTick();
 			return;
 		}
@@ -750,135 +718,248 @@ export function createReflectDomainCoordinator(
 		}
 	};
 
+	const classifySynchronization = (
+		replayKey: string,
+		checkpoint: PeerCheckpoint,
+		resumeReceipt: string | null,
+		atMs: number,
+	): { readonly delta: AcceptedLoopDelta; readonly receipt: string } | null => {
+		const expectedReceipt = receiptFor(replayKey);
+		if (resumeReceipt !== null && resumeReceipt !== expectedReceipt)
+			return null;
+		const registered = replayRegistry.get(replayKey);
+		const previous = retainedLedger(replayKey, atMs);
+		if (registered === undefined) {
+			if (resumeReceipt !== null) return null;
+			return {
+				delta: {
+					root: checkpoint.rootLoops,
+					all: checkpoint.allLoops,
+				},
+				receipt: expectedReceipt,
+			};
+		}
+		if (registered.ack.resumeReceipt !== expectedReceipt) return null;
+		if (previous !== undefined) {
+			const delta = checkpointLoopDelta(previous, checkpoint);
+			return delta === null ? null : { delta, receipt: expectedReceipt };
+		}
+		if (resumeReceipt !== expectedReceipt) return null;
+		return { delta: { root: 0n, all: 0n }, receipt: expectedReceipt };
+	};
+
+	const applyHostCheckpoint = (message: ProcessDomainDataMessage): void => {
+		if (!rootProcess || node === undefined || collectionState === undefined)
+			return;
+		const wire = parseCheckpoint(message.value);
+		if (wire === null) return;
+		const peer = node
+			.peers()
+			.find((candidate) => candidate.nodeId === message.senderId);
+		if (
+			peer?.status !== "online" ||
+			peer.metadata.protocol !== String(PRIVATE_PROTOCOL_VERSION) ||
+			peer.metadata.incarnation !== wire.incarnation
+		)
+			return;
+		const checkpoint: PeerCheckpoint = {
+			generation: BigInt(wire.accountingGeneration),
+			seq: BigInt(wire.seq),
+			busy: wire.busy,
+			rootLoops: BigInt(wire.rootLoops),
+			allLoops: BigInt(wire.allLoops),
+		};
+		if (checkpoint.generation !== collectionState.accounting.generation) return;
+		const replayKey = replayKeyFor(message.senderId, wire.incarnation);
+		const current = peerSessions.get(message.senderId);
+		let next: CollectionState;
+		let receipt: string;
+		if (
+			current !== undefined &&
+			current.incarnation === wire.incarnation &&
+			current.contributorId === wire.contributorId
+		) {
+			if (
+				wire.resumeReceipt !== null &&
+				wire.resumeReceipt !== current.resumeReceipt
+			)
+				return;
+			const previous = retainedLedger(replayKey, message.receivedAt);
+			if (previous === undefined) return;
+			const delta = checkpointLoopDelta(previous, checkpoint);
+			if (delta === null) return;
+			next = reduceCollectionState(collectionState, {
+				type: "peer-checkpoint-verified",
+				contributorId: wire.contributorId,
+				checkpoint,
+				acceptedLoopDelta: delta,
+				atMs: message.receivedAt,
+			});
+			receipt = current.resumeReceipt;
+		} else {
+			const classified = classifySynchronization(
+				replayKey,
+				checkpoint,
+				wire.resumeReceipt,
+				message.receivedAt,
+			);
+			if (classified === null) return;
+			if (current !== undefined)
+				reduce({
+					type: "peer-offline",
+					contributorId: current.contributorId,
+					atMs: message.receivedAt,
+				});
+			next = reduceCollectionState(collectionState, {
+				type: "peer-synchronized",
+				contributorId: wire.contributorId,
+				replayKey,
+				acceptedLoopDelta: classified.delta,
+				checkpoint,
+				atMs: message.receivedAt,
+			});
+			receipt = classified.receipt;
+		}
+		if (next === collectionState) return;
+		collectionState = next;
+		controlPeers.add(message.senderId);
+		const ack: CheckpointAckWire = Object.freeze({
+			nodeId: message.senderId,
+			incarnation: wire.incarnation,
+			contributorId: wire.contributorId,
+			accountingGeneration: checkpoint.generation.toString(),
+			seq: checkpoint.seq.toString(),
+			resumeReceipt: receipt,
+		});
+		replayRegistry.set(replayKey, Object.freeze({ replayKey, ack }));
+		peerSessions.set(message.senderId, {
+			nodeId: message.senderId,
+			incarnation: wire.incarnation,
+			contributorId: wire.contributorId,
+			replayKey,
+			accountingGeneration: checkpoint.generation,
+			seq: checkpoint.seq,
+			resumeReceipt: receipt,
+		});
+		void publishHost()
+			.then(updateHostTimers)
+			.catch(() => {});
+	};
+
+	const queueCheckpoint = (): Promise<void> => {
+		if (node === undefined || rootProcess || clientPaused)
+			return Promise.resolve();
+		const seq = ++localCheckpointSeq;
+		requiredCheckpointSeq = seq;
+		clearClientCounters();
+		const target = node.declaration.hostNodeId;
+		const wire: CheckpointWire = {
+			version: PRIVATE_PROTOCOL_VERSION,
+			incarnation: processIncarnation,
+			contributorId: clientContributorId,
+			accountingGeneration: clientAccountingGeneration.toString(),
+			seq: seq.toString(),
+			busy: desiredActivity(),
+			rootLoops: localRootLoops.toString(),
+			allLoops: localAllLoops.toString(),
+			resumeReceipt: clientResumeReceipt,
+		};
+		return queueTransport(async () => {
+			if (node === undefined || rootProcess || clientPaused) return;
+			try {
+				await node.send(target, CHECKPOINT_CHANNEL, wire);
+			} catch (error) {
+				if (isTransientTransportError(error)) {
+					clearClientCounters();
+					return;
+				}
+				const reported =
+					error instanceof Error
+						? error
+						: new Error("reflection transport write failed");
+				reportError(reported);
+				throw reported;
+			}
+		});
+	};
+
+	const acceptClientCounters = (
+		parsed: ParsedCounterMessage,
+		opened: ProcessDomainNode,
+	): void => {
+		if (
+			parsed.counters.domainEpoch !== opened.declaration.domainId ||
+			(acceptedHostEpoch !== undefined &&
+				parsed.counters.domainEpoch !== acceptedHostEpoch) ||
+			parsed.counters.revision <= acceptedHostRevision
+		)
+			return;
+		acceptedHostEpoch = parsed.counters.domainEpoch;
+		acceptedHostRevision = parsed.counters.revision;
+		const ack = parsed.checkpointAck;
+		if (ack?.incarnation === processIncarnation)
+			clientResumeReceipt = ack.resumeReceipt;
+		const generationChanged =
+			parsed.accountingGeneration !== clientAccountingGeneration;
+		const wasPaused = clientPaused;
+		clientAccountingGeneration = parsed.accountingGeneration;
+		clientPaused = parsed.counters.paused;
+		if (generationChanged) {
+			clientContributorId = id();
+			requiredCheckpointSeq = 0n;
+		}
+		if (clientPaused) {
+			notify(parsed.counters);
+			return;
+		}
+		if (generationChanged || wasPaused) {
+			for (const attachment of attachments.values())
+				attachment.busy = attachment.getBusy();
+			clearClientCounters();
+			void queueCheckpoint().catch(() => {});
+			return;
+		}
+		if (
+			ack === undefined ||
+			ack.incarnation !== processIncarnation ||
+			ack.contributorId !== clientContributorId ||
+			BigInt(ack.accountingGeneration) !== clientAccountingGeneration ||
+			BigInt(ack.seq) < requiredCheckpointSeq
+		)
+			return;
+		clientResumeReceipt = ack.resumeReceipt;
+		notify(parsed.counters);
+	};
+
 	const handleTransportEvent = (event: ProcessDomainEvent): void => {
 		if (event.type !== "peer" || node === undefined) return;
 		if (!rootProcess) {
 			if (event.peer.nodeId !== node.declaration.hostNodeId) return;
-			if (event.peer.status === "offline") markClientUncertain();
-			else {
-				const pausedSnapshot = clientPaused;
-				markClientUncertain();
-				if (pausedSnapshot) return;
-				for (const attachment of attachments.values())
-					attachment.busy = attachment.getBusy();
-				void (async () => {
-					await queueWrite("activity");
-					await queueLoopSnapshot();
-				})().catch(() => {});
-			}
+			clearClientCounters();
+			if (event.peer.status === "offline" || clientPaused) return;
+			for (const attachment of attachments.values())
+				attachment.busy = attachment.getBusy();
+			clientContributorId = id();
+			void queueCheckpoint().catch(() => {});
 			return;
 		}
-		const wasBusy = hostBusy();
-		if (event.peer.status === "online") {
-			if (peers.has(event.peer.nodeId)) return;
-			peers.set(event.peer.nodeId, {
-				busy: paused ? false : event.peer.metadata.activity === "busy",
-				activityRevision: 0n,
-				loopRevision: 0n,
-				rootLoops: 0n,
-				allLoops: 0n,
-			});
-			if (paused) deferredPausedPeers.add(event.peer.nodeId);
-			uncertainPeers.add(event.peer.nodeId);
-		} else {
-			if (!peers.has(event.peer.nodeId)) return;
-			deferredPausedPeers.delete(event.peer.nodeId);
-			uncertainPeers.add(event.peer.nodeId);
+		if (event.peer.status === "offline") {
+			const controlRemoved = controlPeers.delete(event.peer.nodeId);
+			const sessionRemoved = removePeerSession(event.peer.nodeId);
+			if (controlRemoved || sessionRemoved)
+				void publishHost()
+					.then(updateHostTimers)
+					.catch(() => {});
+			return;
 		}
-		hostStateRevision += 1n;
-		applyAggregateBusyTransition(wasBusy, hostBusy());
-		void publishHost().catch(() => {});
-		updateHostTimers();
-	};
-
-	const queueWrite = (
-		kind: "activity" | "root-loop" | "all-loop",
-	): Promise<void> => {
-		const clientWrite =
-			node !== undefined && !rootProcess
-				? kind === "activity"
-					? {
-							kind,
-							revision: ++localActivityRevision,
-							busy: desiredActivity(),
-						}
-					: {
-							kind,
-							revision: ++localLoopRevision,
-							rootLoops:
-								kind === "root-loop" ? ++localRootLoops : localRootLoops,
-							allLoops: ++localAllLoops,
-						}
-				: undefined;
-		if (clientWrite?.kind === "activity") {
-			requiredActivityRevision = clientWrite.revision;
-			markClientUncertain();
-		} else if (clientWrite !== undefined) {
-			requiredLoopRevision = clientWrite.revision;
-			markClientUncertain();
+		if (
+			event.peer.metadata.protocol === String(PRIVATE_PROTOCOL_VERSION) &&
+			validId(event.peer.metadata.incarnation)
+		) {
+			controlPeers.add(event.peer.nodeId);
+			void publishHost().catch(() => {});
 		}
-		return queueTransport(async () => {
-			if (node === undefined || rootProcess || clientWrite === undefined)
-				return;
-			try {
-				if (clientWrite.kind === "activity") {
-					await node.send(node.declaration.hostNodeId, ACTIVITY_CHANNEL, {
-						revision: clientWrite.revision.toString(),
-						busy: clientWrite.busy,
-					} satisfies ActivityWire);
-					return;
-				}
-				await node.send(node.declaration.hostNodeId, LOOP_CHANNEL, {
-					revision: clientWrite.revision.toString(),
-					rootLoops: clientWrite.rootLoops.toString(),
-					allLoops: clientWrite.allLoops.toString(),
-				} satisfies LoopWire);
-			} catch (error) {
-				if (!rootProcess && isTransientTransportError(error)) {
-					// Reconnect replays activity and the cumulative loop snapshot.
-					markClientUncertain();
-					return;
-				}
-				reportFatal(
-					error instanceof Error
-						? error
-						: new Error("reflection transport write failed"),
-				);
-				throw error;
-			}
-		});
-	};
-
-	const queueLoopSnapshot = (): Promise<void> => {
-		if (node === undefined || rootProcess || localLoopRevision === 0n)
-			return Promise.resolve();
-		const target = node.declaration.hostNodeId;
-		const revision = localLoopRevision;
-		const rootLoops = localRootLoops;
-		const allLoops = localAllLoops;
-		requiredLoopRevision = revision;
-		markClientUncertain();
-		return queueTransport(async () => {
-			if (node === undefined || rootProcess) return;
-			try {
-				await node.send(target, LOOP_CHANNEL, {
-					revision: revision.toString(),
-					rootLoops: rootLoops.toString(),
-					allLoops: allLoops.toString(),
-				} satisfies LoopWire);
-			} catch (error) {
-				if (!rootProcess && isTransientTransportError(error)) {
-					markClientUncertain();
-					return;
-				}
-				reportFatal(
-					error instanceof Error
-						? error
-						: new Error("reflection transport write failed"),
-				);
-				throw error;
-			}
-		});
+		// Online peers remain isolated until a validated checkpoint arrives.
 	};
 
 	const ensureOpen = (): Promise<void> => {
@@ -891,9 +972,26 @@ export function createReflectDomainCoordinator(
 					metadata: {
 						role: "pi-reflect-watchdog",
 						pid: String(process.pid),
-						activity: desiredActivity() ? "busy" : "idle",
+						protocol: String(PRIVATE_PROTOCOL_VERSION),
+						incarnation: processIncarnation,
 					},
-					onError: (error) => reportFatal(error, rootProcess && peers.size > 0),
+					onError: (error) => {
+						if (!rootProcess) clearClientCounters();
+						else if (node !== undefined) {
+							let changed = false;
+							for (const peer of node.peers())
+								if (peer.status === "offline") {
+									const controlRemoved = controlPeers.delete(peer.nodeId);
+									const sessionRemoved = removePeerSession(peer.nodeId);
+									changed = controlRemoved || sessionRemoved || changed;
+								}
+							if (changed)
+								void publishHost()
+									.then(updateHostTimers)
+									.catch(() => {});
+						}
+						reportError(error);
+					},
 				});
 			} catch (error) {
 				throw new ReflectDomainFatalError(
@@ -904,36 +1002,42 @@ export function createReflectDomainCoordinator(
 			}
 			node = opened;
 			rootProcess = opened.role === "host";
+			unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
 			if (rootProcess) {
-				hostState = zeroCounters({
-					domainEpoch: opened.declaration.domainId,
-					certain: true,
+				collectionState = createCollectionState({
+					nowMs: now(),
+					idleResetGapMs,
 				});
-				countersValue = hostState;
-				transportHealthy = true;
-
-				snapshotRevision = 0n;
-				snapshotGeneration = 0n;
-				unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
-				unsubscribeActivity = opened.subscribe(
-					ACTIVITY_CHANNEL,
-					applyHostActivity,
+				for (const attachment of attachments.values())
+					reduce({
+						type: "local-activity",
+						contributorId: attachment.contributorId,
+						busy: attachment.busy,
+						atMs: now(),
+					});
+				unsubscribeCheckpoint = opened.subscribe(
+					CHECKPOINT_CHANNEL,
+					applyHostCheckpoint,
 				);
-				unsubscribeLoops = opened.subscribe(LOOP_CHANNEL, applyHostLoop);
 				unsubscribeLeave = opened.subscribe(LEAVE_CHANNEL, (message) => {
-					const wasBusy = hostBusy();
-					if (!peers.delete(message.senderId)) return;
-					uncertainPeers.delete(message.senderId);
-					hostStateRevision += 1n;
-					applyAggregateBusyTransition(wasBusy, hostBusy());
+					const leave = parseLeave(message.value);
+					const session = peerSessions.get(message.senderId);
+					if (
+						leave === null ||
+						session === undefined ||
+						session.incarnation !== leave.incarnation ||
+						session.contributorId !== leave.contributorId
+					)
+						return;
+					removePeerSession(message.senderId, message.receivedAt);
 					void publishHost()
 						.then(updateHostTimers)
 						.catch(() => {});
 				});
 				await publishHost();
+				updateHostTimers();
 				return;
 			}
-			unsubscribeEvents = opened.subscribeEvents(handleTransportEvent);
 			unsubscribeCounters = opened.subscribe(COUNTERS_CHANNEL, (message) => {
 				if (message.senderId !== opened.declaration.hostNodeId) return;
 				const host = opened
@@ -941,35 +1045,9 @@ export function createReflectDomainCoordinator(
 					.find((peer) => peer.nodeId === opened.declaration.hostNodeId);
 				if (host?.status !== "online") return;
 				const parsed = parseCounters(message.value, opened.nodeId);
-				if (
-					parsed === null ||
-					parsed.counters.domainEpoch !== opened.declaration.domainId ||
-					(acceptedHostEpoch !== undefined &&
-						parsed.counters.domainEpoch !== acceptedHostEpoch) ||
-					parsed.counters.revision <= acceptedHostRevision ||
-					parsed.activityRevision < requiredActivityRevision ||
-					parsed.loopRevision < requiredLoopRevision
-				)
-					return;
-				const wasPaused = clientPaused;
-				acceptedHostEpoch = parsed.counters.domainEpoch;
-				acceptedHostRevision = parsed.counters.revision;
-				clientPaused = parsed.counters.paused;
-				countersValue = parsed.counters;
-				for (const listener of Array.from(listeners)) {
-					try {
-						listener(parsed.counters);
-					} catch {
-						// Listener failures are isolated from coordinator state.
-					}
-				}
-				if (wasPaused && !parsed.counters.paused) {
-					for (const attachment of attachments.values())
-						attachment.busy = attachment.getBusy();
-					void queueWrite("activity").catch(() => {});
-				}
+				if (parsed !== null) acceptClientCounters(parsed, opened);
 			});
-			await queueWrite("activity");
+			await queueCheckpoint();
 		})().catch(async (error) => {
 			const fatal = isReflectDomainFatalError(error)
 				? error
@@ -978,15 +1056,13 @@ export function createReflectDomainCoordinator(
 						"failed to publish initial reflect-watchdog state",
 						{ cause: error },
 					);
-			reportFatal(fatal);
+			reportError(fatal);
 			unsubscribeEvents?.();
-			unsubscribeActivity?.();
-			unsubscribeLoops?.();
+			unsubscribeCheckpoint?.();
 			unsubscribeCounters?.();
 			unsubscribeLeave?.();
 			unsubscribeEvents = undefined;
-			unsubscribeActivity = undefined;
-			unsubscribeLoops = undefined;
+			unsubscribeCheckpoint = undefined;
 			unsubscribeCounters = undefined;
 			unsubscribeLeave = undefined;
 			const failedNode = node;
@@ -999,25 +1075,75 @@ export function createReflectDomainCoordinator(
 		return opening;
 	};
 
+	const closeCoordinator = async (): Promise<void> => {
+		await writeTail.catch(() => {});
+		unsubscribeEvents?.();
+		unsubscribeCheckpoint?.();
+		unsubscribeCounters?.();
+		unsubscribeLeave?.();
+		unsubscribeEvents = undefined;
+		unsubscribeCheckpoint = undefined;
+		unsubscribeCounters = undefined;
+		unsubscribeLeave = undefined;
+		if (tick !== undefined) clock.clearTimeout(tick);
+		tick = undefined;
+		const closing = node;
+		node = undefined;
+		rootProcess = false;
+		opening = undefined;
+		countersValue = undefined;
+		collectionState = undefined;
+		snapshotRevision = 0n;
+		snapshotGeneration = 0n;
+		acceptedHostRevision = 0n;
+		acceptedHostEpoch = undefined;
+		clientPaused = false;
+		clientAccountingGeneration = 0n;
+		clientContributorId = id();
+		clientResumeReceipt = null;
+		localCheckpointSeq = 0n;
+		requiredCheckpointSeq = 0n;
+		localRootLoops = 0n;
+		localAllLoops = 0n;
+		peerSessions.clear();
+		controlPeers.clear();
+		replayRegistry.clear();
+		await closing?.close();
+	};
+
 	const coordinator: ReflectDomainCoordinator = {
 		get rootProcess() {
 			return rootProcess;
 		},
 		get paused() {
-			return rootProcess ? paused : clientPaused;
+			return rootProcess
+				? (collectionState?.accounting.paused ?? false)
+				: clientPaused;
 		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
 				if (attachments.has(instance)) return;
-				attachments.set(instance, {
+				const attachment: Attachment = {
+					contributorId: `attachment-${++nextAttachmentId}`,
 					busy: attachOptions.getBusy(),
 					getBusy: attachOptions.getBusy,
 					onFatal: attachOptions.onFatal,
-				});
+				};
+				attachments.set(instance, attachment);
 				const alreadyOpen = node !== undefined;
 				try {
 					await ensureOpen();
-					if (alreadyOpen) await queueWrite("activity");
+					if (!alreadyOpen) return;
+					if (rootProcess) {
+						reduce({
+							type: "local-activity",
+							contributorId: attachment.contributorId,
+							busy: attachment.busy,
+							atMs: now(),
+						});
+						await publishHost();
+						updateHostTimers();
+					} else await queueCheckpoint();
 				} catch (error) {
 					attachments.delete(instance);
 					throw error;
@@ -1026,116 +1152,74 @@ export function createReflectDomainCoordinator(
 		},
 		detach(instance) {
 			return queueLifecycle(async () => {
-				if (!attachments.delete(instance)) return;
+				const attachment = attachments.get(instance);
+				if (attachment === undefined) return;
+				attachments.delete(instance);
 				if (attachments.size !== 0) {
-					await queueWrite("activity");
+					if (rootProcess) {
+						reduce({
+							type: "local-detached",
+							contributorId: attachment.contributorId,
+							atMs: now(),
+						});
+						await publishHost();
+						updateHostTimers();
+					} else await queueCheckpoint();
 					return;
 				}
 				if (node !== undefined && !rootProcess) {
+					const leave: LeaveWire = {
+						version: PRIVATE_PROTOCOL_VERSION,
+						incarnation: processIncarnation,
+						contributorId: clientContributorId,
+					};
 					await queueTransport(() =>
 						node === undefined
 							? Promise.resolve()
-							: node.send(node.declaration.hostNodeId, LEAVE_CHANNEL, {
-									version: 1,
-								}),
+							: node.send(node.declaration.hostNodeId, LEAVE_CHANNEL, leave),
 					).catch(() => {});
 				}
-				await writeTail.catch(() => {});
-				unsubscribeEvents?.();
-				unsubscribeActivity?.();
-				unsubscribeLoops?.();
-				unsubscribeCounters?.();
-				unsubscribeLeave?.();
-				unsubscribeEvents = undefined;
-				unsubscribeActivity = undefined;
-				unsubscribeLoops = undefined;
-				unsubscribeCounters = undefined;
-				unsubscribeLeave = undefined;
-				if (tick !== undefined) clock.clearTimeout(tick);
-				tick = undefined;
-				const closing = node;
-				node = undefined;
-				rootProcess = false;
-				opening = undefined;
-				countersValue = undefined;
-				hostState = undefined;
-				hostStateRevision = 0n;
-				acceptedHostRevision = 0n;
-				acceptedHostEpoch = undefined;
-				paused = false;
-				clientPaused = false;
-				pausedAtMs = null;
-				pausedAggregateBusy = null;
-				transportHealthy = true;
-
-				peers.clear();
-				deferredPausedPeers.clear();
-				uncertainPeers.clear();
-				snapshotRevision = 0n;
-				snapshotGeneration = 0n;
-				localActivityRevision = 0n;
-				localLoopRevision = 0n;
-				localRootLoops = 0n;
-				localAllLoops = 0n;
-				requiredActivityRevision = 0n;
-				requiredLoopRevision = 0n;
-				await closing?.close();
+				await closeCoordinator();
 			});
 		},
 		async setBusy(instance, busy) {
 			const attachment = attachments.get(instance);
-			if (
-				attachment === undefined ||
-				paused ||
-				clientPaused ||
-				attachment.busy === busy
-			)
-				return;
-			const wasBusy = rootProcess && hostBusy();
+			if (attachment === undefined || attachment.busy === busy) return;
 			attachment.busy = busy;
 			if (rootProcess) {
-				hostStateRevision += 1n;
-				applyAggregateBusyTransition(wasBusy, hostBusy());
-			}
-			await queueWrite("activity");
-			if (rootProcess) {
+				reduce({
+					type: "local-activity",
+					contributorId: attachment.contributorId,
+					busy,
+					atMs: now(),
+				});
 				await publishHost();
 				updateHostTimers();
-			}
+			} else if (!clientPaused) await queueCheckpoint();
 		},
 		async recordRootLoop() {
-			if (paused || clientPaused) return countersValue ?? hostCounters();
+			if (this.paused) return countersValue ?? zeroCounters();
 			if (!rootProcess) {
-				await queueWrite("root-loop");
+				localRootLoops += 1n;
+				localAllLoops += 1n;
+				await queueCheckpoint();
 				return countersValue ?? zeroCounters();
 			}
-			const current = hostCounters();
-			hostStateRevision += 1n;
-			hostState = {
-				...current,
-				activeLoops: counter(current.activeLoops.value + 1n),
-				rootLoops: counter(current.rootLoops.value + 1n),
-				allLoops: counter(current.allLoops.value + 1n),
-			};
+			reduce({ type: "local-loop", scope: "root", atMs: now() });
 			await publishHost();
 			updateHostTimers();
-			return countersValue ?? hostCounters();
+			return countersValue ?? projectHostCounters();
 		},
 		async recordAllLoop() {
-			if (paused || clientPaused) return countersValue ?? hostCounters();
+			if (this.paused) return countersValue ?? zeroCounters();
 			if (!rootProcess) {
-				await queueWrite("all-loop");
+				localAllLoops += 1n;
+				await queueCheckpoint();
 				return countersValue ?? zeroCounters();
 			}
-			const current = hostCounters();
-			hostStateRevision += 1n;
-			hostState = {
-				...current,
-				activeLoops: counter(current.activeLoops.value + 1n),
-				allLoops: counter(current.allLoops.value + 1n),
-			};
+			reduce({ type: "local-loop", scope: "all", atMs: now() });
 			await publishHost();
-			return countersValue ?? hostCounters();
+			return countersValue ?? projectHostCounters();
 		},
 		counters() {
 			return countersValue;
@@ -1145,67 +1229,42 @@ export function createReflectDomainCoordinator(
 			return () => listeners.delete(listener);
 		},
 		setIdleResetGapSeconds(seconds) {
-			if (Number.isSafeInteger(seconds) && seconds > 0)
-				idleResetGapMs = seconds * 1_000;
+			if (!Number.isSafeInteger(seconds) || seconds <= 0) return;
+			idleResetGapMs = seconds * 1_000;
+			if (collectionState !== undefined) {
+				collectionState = { ...collectionState, idleResetGapMs };
+				void publishHost().catch(() => {});
+			}
 		},
 		async resetReminderCycle() {
-			if (!rootProcess || countersValue === undefined) return countersValue;
-			hostStateRevision += 1n;
-			hostState = clearReminderCounters(hostCounters());
+			if (!rootProcess || collectionState === undefined) return countersValue;
+			reduce({ type: "reminder-accepted", atMs: now() });
 			await publishHost();
 			return countersValue;
 		},
 	};
 	PAUSE_CONTROLS.set(coordinator, (nextPaused) =>
 		queueLifecycle(async () => {
-			if (!rootProcess || countersValue === undefined || paused === nextPaused)
+			if (
+				!rootProcess ||
+				collectionState === undefined ||
+				collectionState.accounting.paused === nextPaused
+			)
 				return countersValue;
-			if (nextPaused) {
-				paused = true;
-				pausedAtMs = BigInt(now());
-				pausedAggregateBusy = hostBusy();
-				if (tick !== undefined) clock.clearTimeout(tick);
-				tick = undefined;
-				hostStateRevision += 1n;
-				hostState = { ...hostCounters(), paused: true };
-				await publishHost();
-				return countersValue;
-			}
-			const currentTimeMs = BigInt(now());
-			const pausedDurationMs =
-				pausedAtMs === null ? 0n : currentTimeMs - pausedAtMs;
-			const wasBusy = pausedAggregateBusy ?? hostBusy();
-			for (const attachment of attachments.values())
-				attachment.busy = attachment.getBusy();
-			if (node !== undefined)
-				for (const nodeId of deferredPausedPeers) {
-					const peer = peers.get(nodeId);
-					const live = node
-						.peers()
-						.find(
-							(candidate) =>
-								candidate.nodeId === nodeId && candidate.status === "online",
-						);
-					if (peer !== undefined && live !== undefined)
-						peer.busy = live.metadata.activity === "busy";
+			reduce({ type: "pause-changed", paused: nextPaused, atMs: now() });
+			peerSessions.clear();
+			if (tick !== undefined) clock.clearTimeout(tick);
+			tick = undefined;
+			if (!nextPaused)
+				for (const attachment of attachments.values()) {
+					attachment.busy = attachment.getBusy();
+					reduce({
+						type: "local-activity",
+						contributorId: attachment.contributorId,
+						busy: attachment.busy,
+						atMs: now(),
+					});
 				}
-			deferredPausedPeers.clear();
-			paused = false;
-			pausedAtMs = null;
-			pausedAggregateBusy = null;
-			hostStateRevision += 1n;
-			const current = hostCounters();
-			hostState = {
-				...current,
-				paused: false,
-				endLoopTimeMs:
-					current.endLoopTimeMs === null
-						? hostBusy()
-							? null
-							: currentTimeMs
-						: current.endLoopTimeMs + pausedDurationMs,
-			};
-			applyAggregateBusyTransition(wasBusy, hostBusy());
 			await publishHost();
 			updateHostTimers();
 			return countersValue;
@@ -1214,7 +1273,7 @@ export function createReflectDomainCoordinator(
 	return coordinator;
 }
 
-const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v2");
+const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v3");
 type SharedHost = typeof globalThis & { [SHARED]?: ReflectDomainCoordinator };
 
 export function getReflectDomainCoordinator(): ReflectDomainCoordinator {

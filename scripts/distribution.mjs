@@ -21,6 +21,8 @@ const DIST_FILES = [
 	"config-loader.js",
 	"config.d.ts",
 	"config.js",
+	"collection-state.d.ts",
+	"collection-state.js",
 	"extension.d.ts",
 	"extension.js",
 	"hub.d.ts",
