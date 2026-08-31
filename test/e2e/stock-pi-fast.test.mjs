@@ -300,7 +300,7 @@ export default function producer(pi) {
 	);
 });
 
-test("packed stock Pi sends a root-loop reflection to its continuation provider request", {
+test("packed stock Pi completes one root-loop reflection without redispatching during cooldown", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -374,14 +374,8 @@ test("packed stock Pi sends a root-loop reflection to its continuation provider 
 	await new Promise((resolve) => setTimeout(resolve, 250));
 	assert.equal(
 		provider.requests.length,
-		4,
-		"stock Pi performs one terminal continuation after the internal response",
-	);
-	const terminalMessages = JSON.stringify(provider.requests[3].body.messages);
-	assert.doesNotMatch(
-		terminalMessages,
-		/Your previous reflection response was invalid/,
-		"the terminal continuation is not a recursive XML re-ask",
+		3,
+		"completed evidence prevents the latched automatic reflection from redispatching during cooldown",
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(
@@ -411,6 +405,8 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	});
 	const reflectionXml =
 		"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>pause</current_step><next_step>apply corrected route</next_step></reflection>";
+	const followupReflectionXml =
+		"<reflection><type>NO_ISSUE</type><reason>corrected route is sound</reason><done>follow-up checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>";
 	const provider = await startFakeProvider({
 		responsePlan: ({ requestIndex }) => ({
 			delay: 20,
@@ -419,7 +415,9 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 					content:
 						requestIndex === 0
 							? reflectionXml
-							: "correction applied automatically",
+							: requestIndex === 2
+								? followupReflectionXml
+								: "correction applied automatically",
 				},
 			],
 		}),
@@ -465,8 +463,11 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	const continuationMessages = JSON.stringify(
 		provider.requests[1].body.messages,
 	);
-	assert.match(continuationMessages, /Continue the current task/);
-	assert.match(continuationMessages, /Do not emit reflection XML/);
+	assert.match(
+		continuationMessages,
+		/Continue the current task using this corrected route\./,
+	);
+	assert.doesNotMatch(continuationMessages, /Do not emit reflection XML/);
 	assert.match(continuationMessages, /Next step: apply corrected route/);
 	assert.equal(
 		provider.requests[1].body.messages.some(
@@ -482,6 +483,28 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(last.data.text, "correction applied automatically");
+
+	const followupAccepted = await rpc.request({
+		type: "prompt",
+		message: "/reflect verify the corrected route",
+	});
+	assert.equal(followupAccepted.success, true);
+	await waitForProviderRequests(provider, 3);
+	const followupMessages = JSON.stringify(provider.requests[2].body.messages);
+	assert.match(
+		followupMessages,
+		/Previous completed reflection \(reference only\):/,
+	);
+	assert.match(followupMessages, /Reflection · ROUTE_CORRECTION/);
+	assert.match(followupMessages, /Reason: change route/);
+	assert.match(followupMessages, /User supplement: verify the corrected route/);
+	assert.equal(
+		followupMessages.includes(reflectionXml),
+		false,
+		"the next reflection receives the plain report, not prior XML",
+	);
+	await waitForProviderResponse(provider.requests[2]);
+	await rpc.waitFor((message) => message.type === "agent_settled");
 
 	const sessionDirectory = isolated.env.PI_CODING_AGENT_SESSION_DIR;
 	const sessionFiles = (await readdir(sessionDirectory, { recursive: true }))

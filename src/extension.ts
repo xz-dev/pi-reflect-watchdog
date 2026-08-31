@@ -58,6 +58,7 @@ import {
 const STATUS_KEY = "pi-reflect-watchdog";
 const REFLECT_COMMAND = "reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
+const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
 const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
 const REFLECT_COOLDOWN_LOOPS = 10;
 const ACTIVE_TICK_MS = 1_000;
@@ -113,6 +114,16 @@ interface ActiveReflection extends PendingReflection {
 	readonly inquiry: InquiryRuntime;
 	handle: InquiryAttemptHandle;
 	planned?: ReflectionDecision | { readonly error: string };
+}
+
+interface ReflectionResult {
+	readonly version: 1;
+	readonly timestamp: string;
+	readonly reasons: readonly ReflectionTriggerReason[];
+	readonly thresholds: ReflectionThresholdSnapshot;
+	readonly userSupplement?: string;
+	readonly decision: ReflectionDecision;
+	readonly report: string;
 }
 
 interface Runtime {
@@ -298,6 +309,103 @@ function watchdogInquiryAssistant(entry: SessionEntry): string | undefined {
 	if (entry.type !== "message" || entry.message.role !== "assistant")
 		return undefined;
 	return watchdogInquiryKey(record(record(entry.message)?.details)?.piInquiry);
+}
+
+function parseReflectionResult(value: unknown): ReflectionResult | undefined {
+	const result = record(value);
+	const decision = record(result?.decision);
+	const thresholds = record(result?.thresholds);
+	if (
+		result?.version !== 1 ||
+		typeof result.timestamp !== "string" ||
+		Number.isNaN(Date.parse(result.timestamp)) ||
+		!Array.isArray(result.reasons) ||
+		result.reasons.length === 0 ||
+		!result.reasons.every(
+			(reason) =>
+				reason === "ROOT_LOOP_LIMIT" ||
+				reason === "ALL_LOOP_LIMIT" ||
+				reason === "TASK_TIME_LIMIT" ||
+				reason === "USER_REQUEST",
+		) ||
+		thresholds === undefined ||
+		![
+			"activeMs",
+			"activeLoops",
+			"taskMs",
+			"taskMinutes",
+			"rootLoops",
+			"rootLoopLimit",
+			"allLoops",
+			"allLoopLimit",
+		].every(
+			(key) =>
+				typeof thresholds[key] === "number" &&
+				Number.isSafeInteger(thresholds[key]) &&
+				Number(thresholds[key]) >= 0,
+		) ||
+		decision === undefined ||
+		(decision.type !== "NO_ISSUE" && decision.type !== "ROUTE_CORRECTION") ||
+		!["reason", "done", "currentStep", "nextStep"].every(
+			(key) =>
+				typeof decision[key] === "string" &&
+				String(decision[key]).trim().length > 0,
+		) ||
+		typeof result.report !== "string" ||
+		result.report.trim().length === 0 ||
+		(result.userSupplement !== undefined &&
+			typeof result.userSupplement !== "string")
+	)
+		return undefined;
+	return result as unknown as ReflectionResult;
+}
+
+function latestReflection(runtime: Runtime): ReflectionResult | undefined {
+	const branch = runtime.ctx?.sessionManager.getBranch() ?? [];
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		if (
+			entry?.type !== "custom" ||
+			entry.customType !== REFLECTION_RESULT_ENTRY
+		)
+			continue;
+		const result = parseReflectionResult(entry.data);
+		if (result !== undefined) return result;
+	}
+	return undefined;
+}
+
+function formatReflectionReport(
+	active: PendingReflection,
+	decision: ReflectionDecision,
+): string {
+	const supplement = active.userSupplement?.trim();
+	return [
+		`Reflection · ${decision.type}`,
+		`Time: ${active.timestamp}`,
+		`Trigger: ${active.reasons.join(", ")}`,
+		`Thresholds: active=${active.thresholds.activeMs}ms/${active.thresholds.activeLoops} loops; task=${active.thresholds.taskMs}ms/${active.thresholds.taskMinutes}m; root=${active.thresholds.rootLoops}/${active.thresholds.rootLoopLimit}; all=${active.thresholds.allLoops}/${active.thresholds.allLoopLimit}`,
+		`User supplement: ${supplement ? supplement : "(none)"}`,
+		`Reason: ${decision.reason}`,
+		`Done: ${decision.done}`,
+		`Current step: ${decision.currentStep}`,
+		`Next step: ${decision.nextStep}`,
+	].join("\n");
+}
+
+function reflectionResult(
+	active: PendingReflection,
+	decision: ReflectionDecision,
+): ReflectionResult {
+	return {
+		version: 1,
+		timestamp: active.timestamp,
+		reasons: active.reasons,
+		thresholds: active.thresholds,
+		userSupplement: active.userSupplement,
+		decision,
+		report: formatReflectionReport(active, decision),
+	};
 }
 
 function completedWatchdogReflection(entry: SessionEntry): string | undefined {
@@ -514,10 +622,15 @@ function beginReflection(runtime: Runtime, pending: PendingReflection): void {
 		handle: inquiry.attempt(1),
 	};
 	runtime.internalRun = { kind: "provisional", attempt: 1 };
+	const previous = latestReflection(runtime);
 	sendActiveReflection(
 		runtime,
 		buildReflectionPrompt({
 			semanticPrefix: runtime.config.reflectionPrompt,
+			previousReflection:
+				previous === undefined
+					? undefined
+					: { timestamp: previous.timestamp, report: previous.report },
 			timestamp: pending.timestamp,
 			reasons: pending.reasons,
 			thresholds: pending.thresholds,
@@ -560,6 +673,8 @@ function queueManualReflection(runtime: Runtime, supplement?: string): void {
 	maybeDispatch(runtime);
 }
 
+// Queue dispatch is deliberately caller-owned so completed evidence can be
+// appended before a latched reflection is reconsidered.
 function finishReflection(
 	runtime: Runtime,
 	decision?: ReflectionDecision,
@@ -574,7 +689,7 @@ function finishReflection(
 			{
 				customType: `${REFLECTION_INQUIRY_NAMESPACE}:route-correction`,
 				content: [
-					"Continue the current task using this corrected route. Do not emit reflection XML.",
+					"Continue the current task using this corrected route.",
 					`Reason: ${decision.reason}`,
 					`Done: ${decision.done}`,
 					`Current step: ${decision.currentStep}`,
@@ -588,7 +703,6 @@ function finishReflection(
 	} else if (decision !== undefined && runtime.ctx?.mode === "tui") {
 		runtime.ctx.ui.notify(`Reflect watchdog: ${decision.reason}`, "info");
 	}
-	maybeDispatch(runtime);
 }
 
 function observe(runtime: Runtime, ctx: ExtensionContext): void {
@@ -908,12 +1022,6 @@ export function createWatchdogExtension(
 				runtime.internalRun = { kind: "none" };
 				if (planned !== undefined && "error" in planned) {
 					if (active.attempt < MAX_REFLECTION_REASKS) {
-						const fold = active.handle.complete();
-						if (fold !== null)
-							pi.sendMessage(fold, {
-								deliverAs: "steer",
-								triggerTurn: false,
-							});
 						active.attempt += 1;
 						active.planned = undefined;
 						sendActiveReflection(
@@ -933,9 +1041,11 @@ export function createWatchdogExtension(
 						"warning",
 					);
 					finishReflection(runtime);
+					maybeDispatch(runtime);
 					return;
 				}
 				if (planned !== undefined) {
+					const result = reflectionResult(active, planned);
 					const fold = active.handle.complete();
 					if (fold !== null)
 						pi.sendMessage(fold, {
@@ -943,7 +1053,9 @@ export function createWatchdogExtension(
 							triggerTurn: false,
 						});
 					finishReflection(runtime, planned);
+					pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
 					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
+					maybeDispatch(runtime);
 					return;
 				}
 				const fold = active.handle.cancel();
@@ -953,6 +1065,7 @@ export function createWatchdogExtension(
 						triggerTurn: false,
 					});
 				finishReflection(runtime);
+				maybeDispatch(runtime);
 				return;
 			}
 			latchAutomaticReflection(runtime);

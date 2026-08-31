@@ -85,3 +85,34 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 	assert.match(prompt, /MAX_REFLECTION_TOOL_CALLS|10 tool calls/);
 	assert.match(prompt, /current_step/);
 });
+
+test("reflection prompt places the previous report before current trigger context", () => {
+	const previousReport = [
+		"Reflection · NO_ISSUE",
+		"Time: 2026-08-16T12:00:00.000+00:00",
+		"Reason: previous route was sound",
+	].join("\n");
+	const prompt = buildReflectionPrompt({
+		semanticPrefix: "Review the route.",
+		previousReflection: {
+			timestamp: "2026-08-16T12:00:00.000+00:00",
+			report: previousReport,
+		},
+		timestamp: "2026-08-16T13:00:00.000+00:00",
+		reasons: ["USER_REQUEST"],
+		thresholds: {
+			activeMs: 4,
+			activeLoops: 3,
+			taskMs: 4,
+			taskMinutes: 30,
+			rootLoops: 3,
+			rootLoopLimit: 100,
+			allLoops: 5,
+			allLoopLimit: 500,
+		},
+	});
+	const previous = prompt.indexOf(previousReport);
+	const current = prompt.indexOf("[Plugin-generated reflection context]");
+	assert.ok(previous > prompt.indexOf("Review the route."));
+	assert.ok(previous < current);
+});

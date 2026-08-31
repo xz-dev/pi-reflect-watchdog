@@ -10,7 +10,9 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.
 - `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main.
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
-- `ROUTE_CORRECTION` starts one ordinary continuation with an explicit no-XML instruction; that continuation counts normally.
+- All XML attempts share one inquiry and are folded from later model context only after the final result.
+- Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as reference-only context.
+- `ROUTE_CORRECTION` starts one ordinary continuation without reflection/XML protocol priming; that continuation counts normally.
 - Reflection may use up to 10 tool calls across at most three XML attempts.
 - XML element names and reflection `type` value are case-insensitive.
 

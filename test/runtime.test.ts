@@ -27,6 +27,7 @@ class Pi {
 	}> = [];
 	readonly messages: Array<{ message: any; options: any }> = [];
 	readonly entries: Array<{ customType: string; data: unknown }> = [];
+	readonly actions: string[] = [];
 
 	readonly events = {
 		on: (channel: string, handler: (data: unknown) => void) => {
@@ -50,10 +51,18 @@ class Pi {
 
 	sendMessage(message: unknown, options: unknown) {
 		this.messages.push({ message, options });
+		const customType = String(
+			(message as { customType?: unknown })?.customType ?? "",
+		);
+		if (customType.endsWith(":inquiry-fold")) this.actions.push("fold");
+		else if (customType.endsWith(":inquiry")) this.actions.push("inquiry");
+		else if (customType === "pi-reflect-watchdog:route-correction")
+			this.actions.push("route-correction");
 	}
 
 	appendEntry(customType: string, data: unknown) {
 		this.entries.push({ customType, data });
+		this.actions.push(`entry:${customType}`);
 	}
 
 	async emit(name: string, event: any, ctx: any) {
@@ -409,6 +418,18 @@ const validNoIssue =
 	"<reflection><type>NO_ISSUE</type><reason>sound</reason><done>checked</done><current_step>verify</current_step><next_step>continue</next_step></reflection>";
 const validCorrection =
 	"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>verify</current_step><next_step>continue differently</next_step></reflection>";
+
+async function completeReflectionAttempt(
+	pi: Pi,
+	ctx: ReturnType<typeof context>,
+	text: string,
+) {
+	const captured = await pi.emit("message_end", assistant(text), ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	return captured;
+}
 
 async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	ctx.setIdle(false);
@@ -882,18 +903,17 @@ test("confirmed neutralized assistant never synthesizes aborted stopReason", asy
 	assert.equal(replacement.message.errorMessage, undefined);
 });
 
-test("invalid XML re-ask remains internal through its successful turn", async () => {
+test("invalid XML re-ask folds every attempt out of later context", async () => {
 	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await startReflectionRun(pi, ctx);
-	await pi.emit("message_end", assistant("not XML"), ctx);
+	const firstCaptured = await pi.emit("message_end", assistant("not XML"), ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(lastInquiryFold(pi));
 	assert.equal(pi.entries.length, 0);
 	assert.equal(
 		pi.messages.filter(({ message }) =>
@@ -905,13 +925,16 @@ test("invalid XML re-ask remains internal through its successful turn", async ()
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
 	await correlateReflection(pi, ctx);
-	await pi.emit("message_end", assistant(validNoIssue), ctx);
+	const secondCaptured = await pi.emit(
+		"message_end",
+		assistant(validNoIssue),
+		ctx,
+	);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 0);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(lastInquiryFold(pi));
 	assert.equal(
 		pi.entries.filter(
 			(entry) =>
@@ -919,9 +942,100 @@ test("invalid XML re-ask remains internal through its successful turn", async ()
 		).length,
 		1,
 	);
+
+	let timestamp = 1;
+	const transcript = pi.messages
+		.filter(({ message }) => {
+			const type = String(message.customType ?? "");
+			return type.endsWith(":inquiry") || type.endsWith(":inquiry-fold");
+		})
+		.flatMap(({ message }) => {
+			const control = { role: "custom", ...message, timestamp: timestamp++ };
+			if (!String(message.customType).endsWith(":inquiry")) return [control];
+			const captured =
+				message.details.attempt === 1
+					? firstCaptured.message
+					: secondCaptured.message;
+			return [control, { ...captured, timestamp: timestamp++ }];
+		});
+	const folded = await pi.emit("context", { messages: transcript }, ctx);
+	assert.deepEqual(
+		folded.messages,
+		[],
+		"reflection retries and control messages must not reach later model context",
+	);
 });
 
-test("route correction starts one ordinary continuation that counts normally", async () => {
+test("three-attempt XML correction chain emits one final fold and leaves no context", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	const captured = [
+		await completeReflectionAttempt(pi, ctx, "invalid attempt one"),
+	];
+	await startReflectionRun(pi, ctx);
+	captured.push(
+		await completeReflectionAttempt(pi, ctx, "invalid attempt two"),
+	);
+	await startReflectionRun(pi, ctx);
+	captured.push(await completeReflectionAttempt(pi, ctx, validNoIssue));
+
+	const controls = pi.messages.filter(({ message }) => {
+		const type = String(message.customType ?? "");
+		return type.endsWith(":inquiry") || type.endsWith(":inquiry-fold");
+	});
+	assert.equal(
+		controls.filter(({ message }) =>
+			String(message.customType).endsWith(":inquiry"),
+		).length,
+		3,
+	);
+	assert.equal(
+		controls.filter(({ message }) =>
+			String(message.customType).endsWith(":inquiry-fold"),
+		).length,
+		1,
+	);
+	let timestamp = 1;
+	let assistantIndex = 0;
+	const transcript = controls.flatMap(({ message }) => {
+		const control = { role: "custom", ...message, timestamp: timestamp++ };
+		if (!String(message.customType).endsWith(":inquiry")) return [control];
+		const reply = captured[assistantIndex++];
+		assert.ok(reply);
+		return [control, { ...reply.message, timestamp: timestamp++ }];
+	});
+	const folded = await pi.emit("context", { messages: transcript }, ctx);
+	assert.deepEqual(folded.messages, []);
+});
+
+test("three invalid XML attempts emit one final fold without result evidence", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		await startReflectionRun(pi, ctx);
+		await completeReflectionAttempt(pi, ctx, `invalid attempt ${attempt}`);
+	}
+
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		3,
+	);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry-fold"),
+		).length,
+		1,
+	);
+	assert.equal(pi.entries.length, 0);
+	assert.match(ctx.notifications.join("\n"), /Reflection failed:/);
+});
+
+test("route correction starts one ordinary continuation without XML priming", async () => {
 	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
@@ -938,12 +1052,29 @@ test("route correction starts one ordinary continuation that counts normally", a
 				message.customType === "pi-reflect-watchdog:route-correction",
 		);
 	assert.ok(correction);
+	assert.equal(
+		pi.entries.filter(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		).length,
+		1,
+		"route correction persists exactly one context-excluded result",
+	);
+	assert.deepEqual(pi.actions.slice(-4), [
+		"fold",
+		"route-correction",
+		"entry:pi-reflect-watchdog:reflection",
+		"entry:pi-reflect-watchdog:reflection-completed",
+	]);
 	assert.deepEqual(correction.options, {
 		deliverAs: "steer",
 		triggerTurn: true,
 	});
-	assert.match(correction.message.content, /Continue the current task/);
-	assert.match(correction.message.content, /Do not emit reflection XML/);
+	const firstLine = correction.message.content.split("\n", 1)[0];
+	assert.equal(
+		firstLine,
+		"Continue the current task using this corrected route.",
+	);
+	assert.doesNotMatch(firstLine, /reflection|xml/i);
 	assert.doesNotMatch(
 		correction.message.customType,
 		/:inquiry(?::|$)/,
@@ -953,6 +1084,96 @@ test("route correction starts one ordinary continuation that counts normally", a
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(domain.rootWrites, 1);
+});
+
+test("completed reflection becomes the next prompt's leading branch reference", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.emit("message_end", assistant(validNoIssue), ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+
+	const result = pi.entries.find(
+		(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+	);
+	assert.ok(result, "valid reflection must persist a context-excluded result");
+	const data = result.data as {
+		readonly timestamp: string;
+		readonly decision: { readonly reason: string };
+		readonly report: string;
+	};
+	assert.equal(data.decision.reason, "sound");
+	assert.match(data.report, /Reason: sound/);
+	ctx.setBranch([
+		{
+			type: "custom",
+			id: "malformed-reflection",
+			parentId: null,
+			timestamp: data.timestamp,
+			customType: result.customType,
+			data: { report: "poison" },
+		},
+		{
+			type: "custom",
+			id: "previous-reflection",
+			parentId: null,
+			timestamp: data.timestamp,
+			customType: result.customType,
+			data: result.data,
+		},
+		{
+			type: "custom",
+			id: "newer-malformed-reflection",
+			parentId: null,
+			timestamp: data.timestamp,
+			customType: result.customType,
+			data: { version: 1, report: "newer poison" },
+		},
+	]);
+
+	await pi.commands[0]?.handler("", ctx);
+	const prompt = lastInquiry(pi)?.content ?? "";
+	const previous = prompt.indexOf(data.report);
+	const current = prompt.indexOf("[Plugin-generated reflection context]");
+	assert.ok(previous >= 0, "latest valid branch reflection must be included");
+	assert.ok(
+		previous < current,
+		"previous reflection must precede current context",
+	);
+	assert.doesNotMatch(prompt, /poison/);
+});
+
+test("queued second reflection dispatches after completed evidence is visible", async () => {
+	const ctx = context();
+	const { pi } = install({ ctx });
+	const branch: any[] = [];
+	const originalAppendEntry = pi.appendEntry.bind(pi);
+	pi.appendEntry = (customType: string, data: unknown) => {
+		originalAppendEntry(customType, data);
+		branch.push({ type: "custom", customType, data });
+		ctx.setBranch(branch);
+	};
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("first supplement", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.commands[0]?.handler("second supplement", ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+
+	const inquiries = pi.messages.filter(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry"),
+	);
+	assert.equal(inquiries.length, 2);
+	assert.match(inquiries[1]?.message.content ?? "", /Reason: sound/);
+	assert.match(inquiries[1]?.message.content ?? "", /second supplement/);
+	assert.deepEqual(pi.actions.slice(-4), [
+		"fold",
+		"entry:pi-reflect-watchdog:reflection",
+		"entry:pi-reflect-watchdog:reflection-completed",
+		"inquiry",
+	]);
 });
 
 test("domain snapshots, not local wall-clock state, drive status text", async () => {
