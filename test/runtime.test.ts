@@ -1014,6 +1014,7 @@ test("three invalid XML attempts emit one final fold without result evidence", a
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
+	const notificationsBeforeAttempts = ctx.notifications.length;
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
 		await startReflectionRun(pi, ctx);
 		await completeReflectionAttempt(pi, ctx, `invalid attempt ${attempt}`);
@@ -1032,7 +1033,11 @@ test("three invalid XML attempts emit one final fold without result evidence", a
 		1,
 	);
 	assert.equal(pi.entries.length, 0);
-	assert.match(ctx.notifications.join("\n"), /Reflection failed:/);
+	assert.deepEqual(ctx.notifications.slice(notificationsBeforeAttempts), [
+		"Reflection attempt 1/3 invalid: response must end with one valid XML block; retrying.",
+		"Reflection attempt 2/3 invalid: response must end with one valid XML block; retrying.",
+		"Reflection failed: response must end with one valid XML block",
+	]);
 });
 
 test("route correction starts one ordinary continuation without XML priming", async () => {

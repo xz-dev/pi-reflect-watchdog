@@ -300,6 +300,94 @@ export default function producer(pi) {
 	);
 });
 
+test("packed stock Pi shows each invalid reflection retry before terminal failure", {
+	timeout: 45_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-invalid-retries-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		rootLoopLimit: 100,
+		allLoopLimit: 500,
+		taskMinutes: 30,
+	});
+	const provider = await startFakeProvider({
+		responsePlan: ({ requestIndex }) => ({
+			delay: 20,
+			chunks: [
+				{
+					content:
+						requestIndex < 3
+							? `private invalid reflection ${requestIndex + 1}`
+							: "<reflection><type>NO_ISSUE</type><reason>unexpected retry</reason><done>none</done><current_step>stop</current_step><next_step>stop</next_step></reflection>",
+				},
+			],
+		}),
+	});
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		launcherArgs: [
+			"--mode",
+			"rpc",
+			"--no-session",
+			"--no-tools",
+			"--provider",
+			"watchdog-fixture",
+			"--model",
+			"watchdog-fixture",
+		],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+
+	const accepted = await rpc.request({
+		type: "prompt",
+		message: "/reflect exercise invalid XML correction",
+	});
+	assert.equal(accepted.success, true);
+	await waitForProviderRequests(provider, 3);
+	await waitForProviderResponse(provider.requests[2]);
+	const warningDeadline = performance.now() + 10_000;
+	let warnings = [];
+	while (performance.now() < warningDeadline) {
+		warnings = rpc.events
+			.map(({ message }) => message)
+			.filter(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.method === "notify" &&
+					message.notifyType === "warning" &&
+					message.message.startsWith("Reflection"),
+			)
+			.map((message) => message.message);
+		if (warnings.length >= 3) break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.deepEqual(warnings, [
+		"Reflection attempt 1/3 invalid: response must end with one valid XML block; retrying.",
+		"Reflection attempt 2/3 invalid: response must end with one valid XML block; retrying.",
+		"Reflection failed: response must end with one valid XML block",
+	]);
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(provider.requests.length, 3, "terminal failure does not retry");
+});
+
 test("packed stock Pi completes one root-loop reflection without redispatching during cooldown", {
 	timeout: 45_000,
 }, async (t) => {

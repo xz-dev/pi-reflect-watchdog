@@ -1022,6 +1022,10 @@ export function createWatchdogExtension(
 				runtime.internalRun = { kind: "none" };
 				if (planned !== undefined && "error" in planned) {
 					if (active.attempt < MAX_REFLECTION_REASKS) {
+						runtime.ctx?.ui.notify(
+							`Reflection attempt ${active.attempt}/${MAX_REFLECTION_REASKS} invalid: ${planned.error}; retrying.`,
+							"warning",
+						);
 						active.attempt += 1;
 						active.planned = undefined;
 						sendActiveReflection(
