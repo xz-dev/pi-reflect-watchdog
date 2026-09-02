@@ -14,6 +14,7 @@ import {
 	type InquiryRuntime,
 } from "pi-extension-utils/pi-inquiry";
 import {
+	publishSemanticHook,
 	type SemanticHookV1,
 	subscribeSemanticHooks,
 } from "pi-extension-utils/semantic-hook";
@@ -60,6 +61,8 @@ const REFLECT_COMMAND = "reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
 const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
+const REFLECTION_COMPLETED_HOOK = "reflection-completed";
+const SEMANTIC_HOOK_TEXT_LIMIT = 4096;
 const REFLECT_COOLDOWN_LOOPS = 10;
 const ACTIVE_TICK_MS = 1_000;
 const RPC_STATUS_TICK_MS = 30_000;
@@ -406,6 +409,32 @@ function reflectionResult(
 		decision,
 		report: formatReflectionReport(active, decision),
 	};
+}
+
+function clipSemanticHookText(value: string): string {
+	if (value.length <= SEMANTIC_HOOK_TEXT_LIMIT) return value;
+	let prefix = "";
+	for (const codePoint of value) {
+		if (prefix.length + codePoint.length >= SEMANTIC_HOOK_TEXT_LIMIT) break;
+		prefix += codePoint;
+	}
+	return `${prefix}…`;
+}
+
+function publishReflectionCompleted(
+	runtime: Runtime,
+	decision: ReflectionDecision,
+): void {
+	try {
+		publishSemanticHook(runtime.pi.events, {
+			name: REFLECTION_COMPLETED_HOOK,
+			values: {
+				REFLECTION_TYPE: decision.type,
+				REASON: clipSemanticHookText(decision.reason),
+				NEXT_STEP: clipSemanticHookText(decision.nextStep),
+			},
+		});
+	} catch {}
 }
 
 function completedWatchdogReflection(entry: SessionEntry): string | undefined {
@@ -1058,6 +1087,7 @@ export function createWatchdogExtension(
 					finishReflection(runtime, planned);
 					pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
 					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
+					publishReflectionCompleted(runtime, planned);
 					maybeDispatch(runtime);
 					return;
 				}

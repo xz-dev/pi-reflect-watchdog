@@ -327,6 +327,30 @@ function publishHook(pi: Pi, name: string) {
 	publishSemanticHook(pi.events, { name });
 }
 
+function captureReflectionHooks(pi: Pi, throws = false) {
+	const hooks: unknown[] = [];
+	pi.events.on("pi:semantic-hook:v1", (envelope) => {
+		if ((envelope as { name?: unknown }).name !== "reflection-completed")
+			return;
+		hooks.push(envelope);
+		pi.actions.push("hook:reflection-completed");
+		if (throws) throw new Error("fixture listener failed");
+	});
+	return hooks;
+}
+
+function reflectionXml({
+	type = "NO_ISSUE",
+	reason = "sound",
+	nextStep = "continue",
+}: {
+	type?: "NO_ISSUE" | "ROUTE_CORRECTION";
+	reason?: string;
+	nextStep?: string;
+} = {}) {
+	return `<reflection><type>${type}</type><reason>${reason}</reason><done>checked</done><current_step>verify</current_step><next_step>${nextStep}</next_step></reflection>`;
+}
+
 async function flushAsync() {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	await new Promise<void>((resolve) => setImmediate(resolve));
@@ -413,10 +437,12 @@ function ordinaryLoop(id: string, stopReason = "stop") {
 	);
 }
 
-const validNoIssue =
-	"<reflection><type>NO_ISSUE</type><reason>sound</reason><done>checked</done><current_step>verify</current_step><next_step>continue</next_step></reflection>";
-const validCorrection =
-	"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>verify</current_step><next_step>continue differently</next_step></reflection>";
+const validNoIssue = reflectionXml();
+const validCorrection = reflectionXml({
+	type: "ROUTE_CORRECTION",
+	reason: "change route",
+	nextStep: "continue differently",
+});
 
 async function completeReflectionAttempt(
 	pi: Pi,
@@ -813,6 +839,222 @@ test("native Pi steering queue accepts reflection despite an existing pending me
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+});
+
+test("valid final reflections publish exact payloads once after durable entries", async () => {
+	for (const [text, expected] of [
+		[
+			validNoIssue,
+			{
+				REFLECTION_TYPE: "NO_ISSUE",
+				REASON: "sound",
+				NEXT_STEP: "continue",
+			},
+		],
+		[
+			validCorrection,
+			{
+				REFLECTION_TYPE: "ROUTE_CORRECTION",
+				REASON: "change route",
+				NEXT_STEP: "continue differently",
+			},
+		],
+	] as const) {
+		const ctx = context("root", { mode: "tui" });
+		const { pi, domain } = install({ ctx });
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await completeReflectionAttempt(pi, ctx, text);
+		assert.deepEqual(hooks, [
+			{ version: 1, name: "reflection-completed", values: expected },
+		]);
+		assert.deepEqual(pi.actions.slice(-3), [
+			"entry:pi-reflect-watchdog:reflection",
+			"entry:pi-reflect-watchdog:reflection-completed",
+			"hook:reflection-completed",
+		]);
+		assert.equal(domain.counters().activeMs.value, 0n);
+		assert.equal(domain.counters().taskMs.value, 0n);
+		if (expected.REFLECTION_TYPE === "NO_ISSUE")
+			assert.ok(ctx.notifications.includes("Reflect watchdog: sound"));
+		else
+			assert.ok(
+				pi.messages.some(
+					({ message }) =>
+						message.customType === "pi-reflect-watchdog:route-correction",
+				),
+			);
+		await pi.emit("agent_settled", {}, ctx);
+		assert.equal(hooks.length, 1, "duplicate finalization stays silent");
+	}
+});
+
+test("completion hook clips transport text without changing durable result", async () => {
+	const cases = [
+		{
+			reason: "a".repeat(4096),
+			nextStep: "b".repeat(4097),
+			expectedReason: "a".repeat(4096),
+			expectedNextStep: `${"b".repeat(4095)}…`,
+		},
+		{
+			reason: `${"a".repeat(4094)}😀b`,
+			nextStep: "continue",
+			expectedReason: `${"a".repeat(4094)}…`,
+			expectedNextStep: "continue",
+		},
+	];
+	for (const item of cases) {
+		const { pi, ctx } = install();
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await completeReflectionAttempt(
+			pi,
+			ctx,
+			reflectionXml({ reason: item.reason, nextStep: item.nextStep }),
+		);
+		const result = pi.entries.find(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		)?.data as { decision: { reason: string; nextStep: string } };
+		assert.equal(result.decision.reason, item.reason);
+		assert.equal(result.decision.nextStep, item.nextStep);
+		assert.deepEqual(hooks, [
+			{
+				version: 1,
+				name: "reflection-completed",
+				values: {
+					REFLECTION_TYPE: "NO_ISSUE",
+					REASON: item.expectedReason,
+					NEXT_STEP: item.expectedNextStep,
+				},
+			},
+		]);
+	}
+});
+
+test("incomplete persistence never publishes completion", async () => {
+	for (const failingType of [
+		"pi-reflect-watchdog:reflection",
+		"pi-reflect-watchdog:reflection-completed",
+	]) {
+		const { pi, ctx } = install();
+		const hooks = captureReflectionHooks(pi);
+		const appendEntry = pi.appendEntry.bind(pi);
+		pi.appendEntry = (customType: string, data: unknown) => {
+			if (customType === failingType) throw new Error("fixture append failed");
+			appendEntry(customType, data);
+		};
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await pi.emit("message_end", assistant(validNoIssue), ctx);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		ctx.setIdle(true);
+		await assert.rejects(
+			() => pi.emit("agent_settled", {}, ctx),
+			/fixture append failed/,
+		);
+		assert.deepEqual(hooks, []);
+	}
+});
+
+test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent", async () => {
+	{
+		const { pi, ctx } = install();
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await completeReflectionAttempt(pi, ctx, "invalid");
+		assert.deepEqual(hooks, [], "retry attempt is silent");
+		for (const text of ["invalid again", "invalid exhausted"]) {
+			await startReflectionRun(pi, ctx);
+			await completeReflectionAttempt(pi, ctx, text);
+		}
+		assert.deepEqual(hooks, [], "exhausted validation is silent");
+	}
+	{
+		const { pi, ctx } = install();
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		ctx.setIdle(true);
+		await pi.emit("agent_settled", {}, ctx);
+		assert.deepEqual(hooks, [], "settled run without decision is silent");
+	}
+	{
+		const hub = createObservableAgentHub();
+		const domain = new FakeDomain();
+		const root = install({
+			hub,
+			domain,
+			ctx: context("root", { hasUI: false }),
+		});
+		const hooks = captureReflectionHooks(root.pi);
+		await root.pi.emit("session_start", {}, root.ctx);
+		await root.pi.commands[0]?.handler("", root.ctx);
+		await startReflectionRun(root.pi, root.ctx);
+		const owner = install({
+			hub,
+			domain,
+			ctx: context("owner", { hasUI: true }),
+		});
+		await owner.pi.emit("session_start", {}, owner.ctx);
+		root.ctx.setIdle(true);
+		await root.pi.emit("agent_settled", {}, root.ctx);
+		assert.deepEqual(hooks, [], "ownership loss is silent");
+	}
+	{
+		const { pi, ctx } = install();
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		await pi.emit("message_end", assistant(validNoIssue), ctx);
+		await pi.emit("session_shutdown", {}, ctx);
+		ctx.setIdle(true);
+		await pi.emit("agent_settled", {}, ctx);
+		assert.deepEqual(hooks, [], "shutdown is silent");
+	}
+});
+
+test("throwing completion listener cannot change result, UI, counters, or later dispatch", async () => {
+	const ctx = context("root", { mode: "tui" });
+	const { pi, domain } = install({ ctx });
+	const hooks = captureReflectionHooks(pi, true);
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("first", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.commands[0]?.handler("second", ctx);
+	await completeReflectionAttempt(pi, ctx, validCorrection);
+	assert.equal(hooks.length, 1);
+	assert.equal(
+		pi.entries.filter(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		).length,
+		1,
+	);
+	assert.ok(
+		pi.messages.some(
+			({ message }) =>
+				message.customType === "pi-reflect-watchdog:route-correction",
+		),
+	);
+	assert.equal(domain.counters().activeMs.value, 0n);
+	assert.equal(domain.counters().taskMs.value, 0n);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		2,
+		"later dispatch survives listener failure",
+	);
 });
 
 test("provisional reflection, valid response, and its turn_end add no activity or loops", async () => {

@@ -71,6 +71,43 @@ async function waitForProviderResponse(record, timeoutMs = 10_000) {
 	throw new Error(`Provider response did not finish within ${timeoutMs}ms`);
 }
 
+async function installHookTracer({ base, agentDir, tracePath }) {
+	const tracerDir = path.join(base, "hook-tracer");
+	await mkdir(tracerDir, { recursive: true });
+	await writeFile(
+		path.join(tracerDir, "package.json"),
+		JSON.stringify({
+			name: "watchdog-hook-tracer",
+			version: "1.0.0",
+			type: "module",
+			pi: { extensions: ["./index.js"] },
+		}),
+	);
+	await writeFile(
+		path.join(tracerDir, "index.js"),
+		`import { appendFileSync } from "node:fs";
+export default function tracer(pi) {
+  pi.events.on("pi:semantic-hook:v1", (envelope) => {
+    appendFileSync(process.env.PI_WATCHDOG_HOOK_TRACE, JSON.stringify(envelope) + "\\n");
+  });
+}
+`,
+	);
+	const settingsPath = path.join(agentDir, "settings.json");
+	const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+	settings.packages.push(tracerDir);
+	await writeJson(settingsPath, settings);
+	return tracePath;
+}
+
+async function tracedHooks(tracePath) {
+	return (await readFile(tracePath, "utf8").catch(() => ""))
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+}
+
 function warningPlan({ requestIndex }) {
 	if (requestIndex === 0) {
 		return {
@@ -157,6 +194,87 @@ test("the installed packed tarball loads dist with only the reflect command", as
 			.map((command) => command.name),
 		["reflect"],
 	);
+});
+
+test("packed stock Pi publishes one final reflection-completed hook to a raw EventBus consumer", {
+	timeout: 45_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-hook-completed-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		rootLoopLimit: 100,
+		allLoopLimit: 500,
+		taskMinutes: 30,
+	});
+	const tracePath = await installHookTracer({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+		tracePath: path.join(resources.base, "semantic-hooks.jsonl"),
+	});
+	const provider = await startFakeProvider({
+		responsePlan: () => ({
+			delay: 20,
+			chunks: [
+				{
+					content:
+						"<reflection><type>NO_ISSUE</type><reason>route is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
+				},
+			],
+		}),
+	});
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: { ...isolated.env, PI_WATCHDOG_HOOK_TRACE: tracePath },
+		launcherArgs: [
+			"--mode",
+			"rpc",
+			"--no-session",
+			"--no-tools",
+			"--provider",
+			"watchdog-fixture",
+			"--model",
+			"watchdog-fixture",
+		],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+
+	const accepted = await rpc.request({
+		type: "prompt",
+		message: "/reflect verify final hook",
+	});
+	assert.equal(accepted.success, true);
+	await waitForProviderRequests(provider, 1);
+	await waitForProviderResponse(provider.requests[0]);
+	await rpc.waitFor((message) => message.type === "agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.deepEqual(await tracedHooks(tracePath), [
+		{
+			version: 1,
+			name: "reflection-completed",
+			values: {
+				REFLECTION_TYPE: "NO_ISSUE",
+				REASON: "route is sound",
+				NEXT_STEP: "stop",
+			},
+		},
+	]);
 });
 
 test("packed stock Pi semantic hook pause suppresses then resumes automatic reflection", {
