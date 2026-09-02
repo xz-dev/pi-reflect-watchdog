@@ -12,6 +12,7 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
 - All XML attempts share one inquiry and are folded from later model context only after the final result.
 - Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as reference-only context.
+- After the result and completion marker are stored, one best-effort `reflection-completed` semantic hook publishes `REFLECTION_TYPE`, `REASON`, and `NEXT_STEP` to current listeners.
 - `ROUTE_CORRECTION` starts one ordinary continuation without reflection/XML protocol priming; that continuation counts normally.
 - Reflection may use up to 10 tool calls across at most three XML attempts.
 - XML element names and reflection `type` value are case-insensitive.
@@ -36,6 +37,8 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
 `hookPauses` is watchdog-private configuration. Each distinct pair has an independent nesting depth; duplicate identical pairs collapse to one pair, unmatched resume events are harmless, and counting resumes only after every pair reaches zero. Hook names follow the neutral `pi:semantic-hook:v1` lowercase kebab-case protocol from `pi-extension-utils/semantic-hook`.
 
 Delivery is best-effort to current listeners only: no buffer, replay, acknowledgement, retry, or cross-process forwarding. Producers must publish pause before excluded work and a matching resume on every terminal path. While paused, active/task time and loop counters freeze across the watchdog process domain; explicit `/reflect` remains available.
+
+Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid XML attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, route correction, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
 
 Runtime reset, dynamic limit controls, history/timeline tools, public pause APIs, and pause/resume commands are intentionally removed. Config-driven semantic-hook pauses are the only external counting control.
 
