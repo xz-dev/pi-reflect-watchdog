@@ -2,6 +2,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+	createAssistantMessageEventStream,
+	type StreamFunction,
+	Type,
+} from "@earendil-works/pi-ai";
+import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { stream as streamGoogle } from "@earendil-works/pi-ai/api/google-generative-ai";
+import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
+import { stream as streamResponses } from "@earendil-works/pi-ai/api/openai-responses";
+import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
+import { googleProvider } from "@earendil-works/pi-ai/providers/google";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import {
+	buildSessionContext,
+	convertToLlm,
+	generateBranchSummary,
+	generateSummaryWithUsage,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import type { WatchdogConfig } from "../src/config.js";
 import {
@@ -49,6 +68,8 @@ class Pi {
 		this.commands.push({ name, handler: command.handler });
 	}
 
+	registerMessageRenderer() {}
+
 	sendMessage(message: unknown, options: unknown) {
 		this.messages.push({ message, options });
 		const customType = String(
@@ -56,8 +77,8 @@ class Pi {
 		);
 		if (customType.endsWith(":inquiry-fold")) this.actions.push("fold");
 		else if (customType.endsWith(":inquiry")) this.actions.push("inquiry");
-		else if (customType === "pi-reflect-watchdog:route-correction")
-			this.actions.push("route-correction");
+		else if (customType === "pi-reflect-watchdog:continuation")
+			this.actions.push("continuation");
 	}
 
 	appendEntry(customType: string, data: unknown) {
@@ -379,6 +400,12 @@ function lastInquiryFold(pi: Pi) {
 	)?.message;
 }
 
+function continuationMessages(pi: Pi) {
+	return pi.messages.filter(
+		({ message }) => message.customType === "pi-reflect-watchdog:continuation",
+	);
+}
+
 async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
 	const prompt = lastInquiry(pi);
 	assert.ok(prompt);
@@ -396,7 +423,97 @@ async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
 }
 
 function assistant(text: string) {
-	return { message: { role: "assistant", content: [{ type: "text", text }] } };
+	return {
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: "openai-completions",
+			provider: "fixture",
+			model: "fixture-model",
+			responseId: "fixture-response",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+		},
+	};
+}
+
+function providerMessageTextForRuntime(message: any) {
+	return typeof message.content === "string"
+		? message.content
+		: (message.content ?? [])
+				.filter((block: any) => block.type === "text")
+				.map((block: any) => block.text)
+				.join("\n");
+}
+
+async function reflectionHandoff(
+	origin: "automatic" | "manual",
+	reply: any = assistant(validNoIssue).message,
+) {
+	const { pi, ctx } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	if (origin === "manual") await pi.commands[0]?.handler("", ctx);
+	else {
+		ctx.setIdle(false);
+		await pi.emit("agent_start", {}, ctx);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+	}
+	await startReflectionRun(pi, ctx);
+	const captured = await pi.emit(
+		"message_end",
+		{ message: { ...reply, timestamp: 2 } },
+		ctx,
+	);
+	assert.ok(captured);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(continuationMessages(pi).length, 1);
+	const result = pi.entries.find(
+		(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+	)?.data as any;
+	assert.ok(result);
+	return {
+		pi,
+		ctx,
+		result,
+		messages: [
+			{ role: "custom", ...lastInquiry(pi), timestamp: 1 },
+			captured.message,
+			{ role: "custom", ...lastInquiryFold(pi), timestamp: 3 },
+			{ role: "custom", ...continuationMessages(pi)[0]?.message, timestamp: 4 },
+		],
+	};
+}
+
+function appendHandoff(
+	session: SessionManager,
+	handoff: Awaited<ReturnType<typeof reflectionHandoff>>,
+) {
+	for (const message of handoff.messages) {
+		if (message.role !== "custom") session.appendMessage(message);
+		else {
+			if (message.customType === "pi-reflect-watchdog:continuation")
+				for (const entry of handoff.pi.entries)
+					session.appendCustomEntry(entry.customType, entry.data);
+			session.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		}
+	}
 }
 
 function branchMessage(message: any, id: string) {
@@ -895,7 +1012,7 @@ test("valid final reflections publish exact payloads once after durable entries"
 			assert.ok(
 				pi.messages.some(
 					({ message }) =>
-						message.customType === "pi-reflect-watchdog:route-correction",
+						message.customType === "pi-reflect-watchdog:continuation",
 				),
 			);
 		await pi.emit("agent_settled", {}, ctx);
@@ -949,29 +1066,43 @@ test("completion hook clips transport text without changing durable result", asy
 });
 
 test("incomplete persistence never publishes completion", async () => {
-	for (const failingType of [
-		"pi-reflect-watchdog:reflection",
-		"pi-reflect-watchdog:reflection-completed",
-	]) {
-		const { pi, ctx } = install();
-		const hooks = captureReflectionHooks(pi);
-		const appendEntry = pi.appendEntry.bind(pi);
-		pi.appendEntry = (customType: string, data: unknown) => {
-			if (customType === failingType) throw new Error("fixture append failed");
-			appendEntry(customType, data);
-		};
-		await pi.emit("session_start", {}, ctx);
-		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
-		await pi.emit("message_end", assistant(validNoIssue), ctx);
-		await pi.emit("turn_end", turnEnd("stop"), ctx);
-		ctx.setIdle(true);
-		await assert.rejects(
-			() => pi.emit("agent_settled", {}, ctx),
-			/fixture append failed/,
-		);
-		assert.deepEqual(hooks, []);
-	}
+	for (const xml of [validNoIssue, validCorrection])
+		for (const failingType of [
+			"pi-reflect-watchdog:reflection",
+			"pi-reflect-watchdog:reflection-completed",
+		]) {
+			const { pi, ctx } = install();
+			const hooks = captureReflectionHooks(pi);
+			const appendEntry = pi.appendEntry.bind(pi);
+			pi.appendEntry = (customType: string, data: unknown) => {
+				if (customType === failingType)
+					throw new Error("fixture append failed");
+				appendEntry(customType, data);
+			};
+			await pi.emit("session_start", {}, ctx);
+			await pi.commands[0]?.handler("", ctx);
+			await startReflectionRun(pi, ctx);
+			await pi.emit("message_end", assistant(xml), ctx);
+			await pi.emit("turn_end", turnEnd("stop"), ctx);
+			ctx.setIdle(true);
+			await assert.rejects(
+				() => pi.emit("agent_settled", {}, ctx),
+				/fixture append failed/,
+			);
+			const persisted = pi.entries.length;
+			await pi.emit("agent_settled", {}, ctx);
+			assert.equal(
+				pi.entries.length,
+				persisted,
+				"persistence errors do not acquire replay",
+			);
+			assert.equal(
+				continuationMessages(pi).length,
+				1,
+				"scheduling still precedes persistence without an extra wake",
+			);
+			assert.deepEqual(hooks, []);
+		}
 });
 
 test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent", async () => {
@@ -988,6 +1119,7 @@ test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent",
 			await completeReflectionAttempt(pi, ctx, text);
 		}
 		assert.deepEqual(hooks, [], "exhausted validation is silent");
+		assert.equal(continuationMessages(pi).length, 0);
 	}
 	{
 		const { pi, ctx } = install();
@@ -999,6 +1131,7 @@ test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent",
 		ctx.setIdle(true);
 		await pi.emit("agent_settled", {}, ctx);
 		assert.deepEqual(hooks, [], "settled run without decision is silent");
+		assert.equal(continuationMessages(pi).length, 0);
 	}
 	{
 		const hub = createObservableAgentHub();
@@ -1021,6 +1154,7 @@ test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent",
 		root.ctx.setIdle(true);
 		await root.pi.emit("agent_settled", {}, root.ctx);
 		assert.deepEqual(hooks, [], "ownership loss is silent");
+		assert.equal(continuationMessages(root.pi).length, 0);
 	}
 	{
 		const { pi, ctx } = install();
@@ -1033,6 +1167,7 @@ test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent",
 		ctx.setIdle(true);
 		await pi.emit("agent_settled", {}, ctx);
 		assert.deepEqual(hooks, [], "shutdown is silent");
+		assert.equal(continuationMessages(pi).length, 0);
 	}
 });
 
@@ -1055,7 +1190,7 @@ test("throwing completion listener cannot change result, UI, counters, or later 
 	assert.ok(
 		pi.messages.some(
 			({ message }) =>
-				message.customType === "pi-reflect-watchdog:route-correction",
+				message.customType === "pi-reflect-watchdog:continuation",
 		),
 	);
 	assert.equal(domain.counters().activeMs.value, 0n);
@@ -1293,61 +1428,835 @@ test("three invalid XML attempts emit one final fold without result evidence", a
 	]);
 });
 
-test("route correction starts one ordinary continuation without XML priming", async () => {
-	const { pi, ctx, domain } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	await pi.emit("message_end", assistant(validCorrection), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 0);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	const correction = [...pi.messages]
-		.reverse()
-		.find(
-			({ message }) =>
-				message.customType === "pi-reflect-watchdog:route-correction",
-		);
-	assert.ok(correction);
-	assert.equal(
-		pi.entries.filter(
-			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
-		).length,
-		1,
-		"route correction persists exactly one context-excluded result",
-	);
-	assert.deepEqual(pi.actions.slice(-4), [
-		"fold",
-		"route-correction",
-		"entry:pi-reflect-watchdog:reflection",
-		"entry:pi-reflect-watchdog:reflection-completed",
-	]);
-	assert.deepEqual(correction.options, {
-		deliverAs: "steer",
-		triggerTurn: true,
-	});
-	const firstLine = correction.message.content.split("\n", 1)[0];
-	assert.equal(
-		firstLine,
-		"Reconsider the current conversation using this perspective and choose the appropriate next response.",
-	);
-	assert.match(correction.message.content, /Observation: change route/);
-	assert.match(
-		correction.message.content,
-		/Suggested next step: continue differently/,
-	);
-	assert.doesNotMatch(firstLine, /reflection|xml/i);
-	assert.doesNotMatch(
-		correction.message.customType,
-		/:inquiry(?::|$)/,
-		"ordinary continuation is outside the internal inquiry namespace",
-	);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 1);
+for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
+	for (const trigger of ["automatic", "busy-manual", "idle-manual"] as const)
+		test(`${trigger} ${type} resumes once with a trigger-specific report`, async () => {
+			const origin = trigger === "automatic" ? "automatic" : "manual";
+			const xml = reflectionXml({
+				type,
+				nextStep: "wait for the existing callback",
+			});
+			const { pi, ctx, domain } = install({
+				limits:
+					origin === "automatic"
+						? { rootLoopLimit: 1, allLoopLimit: 100 }
+						: undefined,
+			});
+			const hooks = captureReflectionHooks(pi);
+			await pi.emit("session_start", {}, ctx);
+			if (origin === "manual") {
+				if (trigger === "busy-manual") {
+					ctx.setIdle(false);
+					await pi.emit("agent_start", {}, ctx);
+				}
+				await pi.commands[0]?.handler("check clarified request", ctx);
+			} else {
+				ctx.setIdle(false);
+				await pi.emit("agent_start", {}, ctx);
+				await pi.emit("turn_end", turnEnd("stop"), ctx);
+			}
+			await startReflectionRun(pi, ctx);
+			const captured = await pi.emit("message_end", assistant(xml), ctx);
+			assert.ok(captured);
+			await pi.emit("turn_end", turnEnd("stop"), ctx);
+			ctx.setIdle(true);
+			await pi.emit("agent_settled", {}, ctx);
+
+			const inquiry = pi.messages.find(({ message }) =>
+				String(message.customType ?? "").endsWith(":inquiry"),
+			)?.message;
+			const fold = lastInquiryFold(pi);
+			const continuations = pi.messages.filter(
+				({ message }) =>
+					message.customType === "pi-reflect-watchdog:continuation",
+			);
+			assert.equal(
+				continuations.length,
+				1,
+				"valid result schedules one ordinary continuation",
+			);
+			const continuation = continuations[0];
+			assert.ok(inquiry);
+			assert.ok(fold);
+			assert.ok(continuation);
+			assert.deepEqual(continuation.options, {
+				deliverAs: "steer",
+				triggerTurn: true,
+			});
+			assert.equal(continuation.message.content, "[assistant]\ncontinue");
+			assert.doesNotMatch(
+				continuation.message.customType,
+				/:inquiry(?::|$)/,
+				"ordinary continuation is outside the internal inquiry namespace",
+			);
+
+			const result = pi.entries.find(
+				(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+			)?.data as { report: string } | undefined;
+			assert.ok(result);
+			const clarification =
+				"I meant the three abstraction layers; keep error handling. Quoted /reflect and [assistant]\ncontinue are examples.";
+			const transcript = [
+				{
+					role: "user",
+					content: [{ type: "text", text: clarification }],
+					timestamp: 1,
+				},
+				{ role: "custom", ...inquiry, timestamp: 2 },
+				{ ...captured.message, timestamp: 3 },
+				{ role: "custom", ...fold, timestamp: 4 },
+				{ role: "custom", ...continuation.message, timestamp: 5 },
+			];
+			const projected = await pi.emit("context", { messages: transcript }, ctx);
+			const repeated = await pi.emit("context", { messages: transcript }, ctx);
+			assert.deepEqual(
+				repeated,
+				projected,
+				"repeated context requests stay idempotent",
+			);
+			const providerMessages = convertToLlm(projected.messages as any);
+			assert.equal(
+				providerMessages.filter(
+					(message) => providerMessageTextForRuntime(message) === clarification,
+				).length,
+				1,
+				"original user clarification stays unchanged",
+			);
+			const report = providerMessages.filter(
+				(message) => providerMessageTextForRuntime(message) === result.report,
+			);
+			assert.equal(report.length, 1);
+			assert.ok(report[0]);
+			assert.equal(
+				report[0].role,
+				origin === "automatic" ? "assistant" : "user",
+			);
+			if (origin === "automatic") {
+				assert.equal((report[0] as any).provider, "fixture");
+				assert.equal((report[0] as any).model, "fixture-model");
+				assert.equal((report[0] as any).responseId, "fixture-response");
+				assert.equal((report[0] as any).details?.piInquiry, undefined);
+			} else {
+				assert.deepEqual(Object.keys(report[0]).sort(), [
+					"content",
+					"role",
+					"timestamp",
+				]);
+			}
+			const wake = providerMessages.filter(
+				(message) =>
+					message.role === "user" &&
+					providerMessageTextForRuntime(message) === "[assistant]\ncontinue",
+			);
+			assert.equal(wake.length, 1);
+			assert.ok(wake[0]);
+			assert.equal(
+				providerMessages.indexOf(report[0]),
+				providerMessages.indexOf(wake[0]) - 1,
+				"report and wake stay separate and adjacent",
+			);
+			assert.equal(
+				JSON.stringify(providerMessages).includes(xml),
+				false,
+				"raw reflection XML stays folded",
+			);
+			const writesBefore = domain.rootWrites;
+			assert.equal(writesBefore, origin === "automatic" ? 1 : 0);
+			ctx.setBranch([
+				branchMessage(captured.message, "source"),
+				...pi.entries.map((entry, index) => ({
+					type: "custom",
+					id: `stored-${index}`,
+					parentId: "source",
+					timestamp: "2026-09-08T00:00:00.000Z",
+					...entry,
+				})),
+			]);
+			ctx.setIdle(false);
+			await pi.emit("agent_start", {}, ctx);
+			await pi.emit(
+				"message_start",
+				{ message: { role: "custom", ...continuation.message } },
+				ctx,
+			);
+			assert.equal(
+				await pi.emit(
+					"message_end",
+					assistant("Waiting for the callback."),
+					ctx,
+				),
+				undefined,
+			);
+			await pi.emit("turn_end", turnEnd("stop"), ctx);
+			ctx.setIdle(true);
+			await pi.emit("agent_settled", {}, ctx);
+			await pi.emit("agent_settled", {}, ctx);
+			assert.equal(
+				domain.rootWrites,
+				writesBefore + 1,
+				"the resumed successful turn counts as ordinary work",
+			);
+			assert.equal(
+				pi.messages.filter(
+					({ message }) =>
+						message.customType === "pi-reflect-watchdog:continuation",
+				).length,
+				1,
+			);
+			assert.equal(
+				pi.messages.filter(({ message }) =>
+					String(message.customType).endsWith(":inquiry"),
+				).length,
+				1,
+			);
+			assert.equal(pi.entries.length, 2);
+			assert.equal(hooks.length, 1);
+		});
+
+test("native wake can reenter context before result persistence with internal state released", async () => {
+	for (const origin of ["automatic", "manual"] as const) {
+		const { pi, ctx } = install({
+			limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+		});
+		await pi.emit("session_start", {}, ctx);
+		if (origin === "manual") await pi.commands[0]?.handler("", ctx);
+		else {
+			ctx.setIdle(false);
+			await pi.emit("agent_start", {}, ctx);
+			await pi.emit("turn_end", turnEnd("stop"), ctx);
+		}
+		await startReflectionRun(pi, ctx);
+		const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		const sendMessage = pi.sendMessage.bind(pi);
+		let reentered = false;
+		pi.sendMessage = (message: any, options) => {
+			sendMessage(message, options);
+			if (message.customType !== "pi-reflect-watchdog:continuation") return;
+			assert.equal(
+				pi.entries.length,
+				0,
+				"the context hook cannot depend on a later result entry",
+			);
+			const projected = pi.handlers.get("context")?.(
+				{
+					messages: [
+						{ role: "custom", ...lastInquiry(pi), timestamp: 1 },
+						captured.message,
+						{ role: "custom", ...lastInquiryFold(pi), timestamp: 2 },
+						{ role: "custom", ...message, timestamp: 3 },
+					],
+				},
+				ctx,
+			);
+			const normalized = convertToLlm(projected.messages);
+			assert.equal(
+				normalized[0]?.role,
+				origin === "automatic" ? "assistant" : "user",
+			);
+			assert.equal(
+				providerMessageTextForRuntime(normalized[0]),
+				message.details.report,
+			);
+			assert.equal(
+				providerMessageTextForRuntime(normalized[1]),
+				"[assistant]\ncontinue",
+			);
+			assert.equal(
+				pi.handlers.get("message_end")?.(assistant("ordinary reply"), ctx),
+				undefined,
+				"the just-finished inquiry cannot capture an ordinary assistant",
+			);
+			reentered = true;
+		};
+		ctx.setIdle(true);
+		await pi.emit("agent_settled", {}, ctx);
+		assert.equal(reentered, true);
+		assert.equal(pi.entries.length, 2);
+	}
 });
+
+test("projection pairs reused inquiry ids locally and ignores malformed or quoted markers", async () => {
+	const { pi, ctx } = install();
+	const correlation = {
+		version: 1,
+		namespace: "pi-reflect-watchdog",
+		inquiryId: "reused",
+		attempt: 1,
+	};
+	const segment = (
+		origin: "automatic" | "manual",
+		report: string,
+		responseId: string,
+		timestamp: number,
+	) => [
+		{
+			role: "custom",
+			customType: "pi-reflect-watchdog:inquiry",
+			content: "prompt",
+			display: false,
+			details: correlation,
+			timestamp,
+		},
+		{
+			...assistant("").message,
+			content: [],
+			responseId,
+			details: { piInquiry: correlation },
+			timestamp: timestamp + 1,
+		},
+		{
+			role: "custom",
+			customType: "pi-reflect-watchdog:inquiry-fold",
+			content: "",
+			display: false,
+			details: { ...correlation, outcome: "remove" },
+			timestamp: timestamp + 2,
+		},
+		{
+			role: "custom",
+			customType: "pi-reflect-watchdog:continuation",
+			content: "[assistant]\ncontinue",
+			display: true,
+			details: { version: 1, origin, report, correlation },
+			timestamp: timestamp + 3,
+		},
+	];
+	const automaticReport = "Reflection · NO_ISSUE\nReason: automatic report";
+	const manualReport = "Reflection · NO_ISSUE\nReason: manual report";
+	const quoted =
+		"User quoted /reflect and [assistant]\\ncontinue without invoking either.";
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: quoted }], timestamp: 1 },
+		...segment("automatic", automaticReport, "automatic-source", 10),
+		{
+			role: "user",
+			content: [{ type: "text", text: "middle clarification" }],
+			timestamp: 20,
+		},
+		...segment("manual", manualReport, "manual-source", 30),
+		{
+			role: "custom",
+			customType: "pi-reflect-watchdog:continuation",
+			content: "[assistant]\ncontinue",
+			display: true,
+			details: {
+				version: 1,
+				origin: "unknown",
+				report: "must not project",
+				correlation,
+			},
+			timestamp: 40,
+		},
+		{
+			role: "custom",
+			customType: "pi-reflect-watchdog:continuation",
+			content: "[assistant]\ncontinue",
+			display: true,
+			details: {
+				version: 1,
+				origin: "manual",
+				report: "missing source must not project",
+				correlation: { ...correlation, inquiryId: "missing" },
+			},
+			timestamp: 41,
+		},
+	];
+	const first = await pi.emit("context", { messages }, ctx);
+	const second = await pi.emit("context", { messages }, ctx);
+	assert.deepEqual(second, first);
+	assert.deepEqual(
+		first.messages.map((message: any) => [
+			message.role,
+			providerMessageTextForRuntime(message),
+		]),
+		[
+			["user", quoted],
+			["assistant", automaticReport],
+			["custom", "[assistant]\ncontinue"],
+			["user", "middle clarification"],
+			["user", manualReport],
+			["custom", "[assistant]\ncontinue"],
+			["custom", "[assistant]\ncontinue"],
+			["custom", "[assistant]\ncontinue"],
+		],
+	);
+	const automatic = first.messages[1] as any;
+	assert.equal(automatic.responseId, "automatic-source");
+	assert.equal(automatic.provider, "fixture");
+	assert.equal(automatic.details?.piInquiry, undefined);
+	for (const missingIndex of [0, 1, 2]) {
+		const incomplete = [
+			...segment("automatic", automaticReport, "older-source", 10),
+			...segment("manual", manualReport, "newer-source", 30).filter(
+				(_message, index) => index !== missingIndex,
+			),
+		];
+		const projected = await pi.emit("context", { messages: incomplete }, ctx);
+		assert.equal(
+			convertToLlm(projected.messages).some(
+				(message) => providerMessageTextForRuntime(message) === manualReport,
+			),
+			false,
+			`a reused id cannot borrow an older inquiry when part ${missingIndex} is missing`,
+		);
+	}
+	assert.deepEqual(Object.keys(first.messages[4] as any).sort(), [
+		"content",
+		"role",
+		"timestamp",
+	]);
+	assert.equal(
+		JSON.stringify(first.messages).includes("must not project"),
+		true,
+	);
+	assert.equal(
+		first.messages.filter(
+			(message: any) =>
+				message.role !== "custom" &&
+				providerMessageTextForRuntime(message).includes("must not project"),
+		).length,
+		0,
+	);
+});
+
+test("serialized mixed-trigger handoffs restore once without replay or rewriting legacy data", async () => {
+	const automatic = await reflectionHandoff("automatic");
+	const manual = await reflectionHandoff("manual");
+	const session = SessionManager.inMemory("/work/restored");
+	session.appendCustomEntry("pi-reflect-watchdog:reflection", {
+		...automatic.result,
+		report: "legacy version-1 report",
+	});
+	session.appendCustomMessageEntry(
+		"pi-reflect-watchdog:route-correction",
+		"legacy correction content",
+		true,
+	);
+	session.appendMessage({
+		role: "user",
+		content: "Keep the clarification, including quoted /reflect.",
+		timestamp: 0,
+	});
+	appendHandoff(session, automatic);
+	session.appendCustomMessageEntry(
+		"unrelated-extension:note",
+		"foreign context",
+		true,
+		{ origin: "manual" },
+	);
+	appendHandoff(session, manual);
+	const entries = JSON.parse(JSON.stringify(session.getEntries()));
+	const before = JSON.stringify(entries);
+	const messages = buildSessionContext(entries).messages;
+	const restored = install();
+	restored.ctx.setBranch(entries);
+	await restored.pi.emit("session_start", {}, restored.ctx);
+	for (let request = 0; request < 2; request += 1) {
+		const projected = await restored.pi.emit(
+			"context",
+			{ messages },
+			restored.ctx,
+		);
+		const normalized = convertToLlm(projected.messages);
+		for (const [report, role] of [
+			[automatic.result.report, "assistant"],
+			[manual.result.report, "user"],
+		]) {
+			const found = normalized.filter(
+				(message) => providerMessageTextForRuntime(message) === report,
+			);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.role, role);
+		}
+		assert.deepEqual(
+			projected.messages.filter(
+				(message: any) => message.customType === "unrelated-extension:note",
+			),
+			messages.filter(
+				(message: any) => message.customType === "unrelated-extension:note",
+			),
+		);
+		assert.equal(
+			normalized.filter(
+				(message) =>
+					providerMessageTextForRuntime(message) ===
+					"legacy correction content",
+			).length,
+			1,
+		);
+		assert.equal(
+			normalized.filter(
+				(message) =>
+					providerMessageTextForRuntime(message) ===
+					"Keep the clarification, including quoted /reflect.",
+			).length,
+			1,
+		);
+	}
+	assert.deepEqual(
+		restored.pi.messages,
+		[],
+		"reading restored context must not schedule a native wake",
+	);
+	assert.deepEqual(
+		restored.pi.entries,
+		[],
+		"projection appends no result or completion",
+	);
+	assert.equal(JSON.stringify(entries), before);
+	// Existing version-1 storage remains usable independently of new markers.
+	restored.ctx.setBranch([entries[0]]);
+	await restored.pi.commands[0]?.handler("", restored.ctx);
+	assert.match(lastInquiry(restored.pi).content, /legacy version-1 report/);
+});
+
+test("incomplete persisted handoffs omit reports rather than guessing an origin or source", async () => {
+	for (const origin of ["automatic", "manual"] as const) {
+		const { pi, ctx, messages, result } = await reflectionHandoff(origin);
+		const marker = messages[3];
+		const details = marker.details;
+		const malformed = [
+			{ details: undefined },
+			{ details: { ...details, version: 2 } },
+			{ details: { ...details, origin: undefined } },
+			{ details: { ...details, origin: "guessed" } },
+			{ details: { ...details, correlation: undefined } },
+			...[
+				{ version: 2 },
+				{ namespace: "other" },
+				{ inquiryId: "missing" },
+				{ inquiryId: "bad id" },
+				{ attempt: 0 },
+				{ attempt: 2 },
+			].map((patch) => ({
+				details: {
+					...details,
+					correlation: { ...details.correlation, ...patch },
+				},
+			})),
+			{ customType: "other:continuation" },
+			{ content: "[assistant]\ncontinue\n" },
+		];
+		const contexts = malformed.map((patch) => [
+			...messages.slice(0, 3),
+			{ ...marker, ...patch },
+		]);
+		contexts.push(messages.filter((message) => message.role !== "assistant"));
+		for (const input of contexts) {
+			const retained = JSON.parse(JSON.stringify(input));
+			const projected = await pi.emit("context", { messages: retained }, ctx);
+			assert.equal(
+				convertToLlm(projected.messages).some(
+					(message) => providerMessageTextForRuntime(message) === result.report,
+				),
+				false,
+			);
+			assert.deepEqual(
+				projected.messages.at(-1),
+				retained.at(-1),
+				"no report is copied into the wake",
+			);
+		}
+		assert.equal(
+			continuationMessages(pi).length,
+			1,
+			"restoration tests did not replay the original wake",
+		);
+	}
+});
+
+test("built-in compaction and branch summaries see only the wake for either trigger", async () => {
+	const model = openaiProvider()
+		.getModels()
+		.find((model) => model.id === "gpt-4.1");
+	assert.ok(model);
+	for (const origin of ["automatic", "manual"] as const) {
+		const handoff = await reflectionHandoff(origin);
+		const session = SessionManager.inMemory("/work/compaction");
+		appendHandoff(session, handoff);
+		const messages = session.buildSessionContext().messages;
+		const captured: string[] = [];
+		const streamFn = (_model: any, request: any) => {
+			captured.push(providerMessageTextForRuntime(request.messages[0]));
+			const stream = createAssistantMessageEventStream();
+			stream.push({
+				type: "done",
+				reason: "stop",
+				message: assistant("summary fixture").message as any,
+			});
+			stream.end();
+			return stream;
+		};
+		const signal = new AbortController().signal;
+		await generateSummaryWithUsage(
+			messages,
+			model,
+			1024,
+			"offline-fixture",
+			undefined,
+			signal,
+			undefined,
+			undefined,
+			undefined,
+			streamFn,
+		);
+		await generateBranchSummary(session.getEntries(), {
+			model,
+			apiKey: "offline-fixture",
+			signal,
+			streamFn,
+			reserveTokens: 1024,
+		});
+		assert.equal(
+			captured.length,
+			2,
+			"both native summary paths reached the injected offline stream",
+		);
+		for (const prompt of captured) {
+			assert.equal(prompt.split("[assistant]\ncontinue").length - 1, 1);
+			assert.equal(prompt.includes(handoff.result.report), false);
+			assert.equal(prompt.includes("Reflection · NO_ISSUE"), false);
+			assert.equal(prompt.includes(validNoIssue), false);
+			assert.equal(prompt.includes('"origin"'), false);
+		}
+		const marker = session
+			.getEntries()
+			.find(
+				(entry: any) => entry.customType === "pi-reflect-watchdog:continuation",
+			);
+		assert.ok(marker);
+		session.appendCompaction("summary fixture", marker.id, 100);
+		handoff.ctx.setBranch(session.getBranch());
+		const retained = session.buildSessionContext().messages;
+		const projected = await handoff.pi.emit(
+			"context",
+			{ messages: retained },
+			handoff.ctx,
+		);
+		assert.equal(
+			convertToLlm(projected.messages).some(
+				(message) =>
+					providerMessageTextForRuntime(message) === handoff.result.report,
+			),
+			false,
+			"a report still in private storage is not reconstructed after its source was compacted",
+		);
+		assert.equal(continuationMessages(handoff.pi).length, 1);
+	}
+});
+
+for (const [label, provider, modelId, api, adapter] of [
+	[
+		"OpenAI Chat",
+		openaiProvider,
+		"gpt-4.1",
+		"openai-completions",
+		streamCompletions,
+	],
+	[
+		"OpenAI Responses",
+		openaiProvider,
+		"gpt-4.1",
+		"openai-responses",
+		streamResponses,
+	],
+	[
+		"Anthropic",
+		anthropicProvider,
+		"claude-sonnet-4-5",
+		"anthropic-messages",
+		streamAnthropic,
+	],
+	[
+		"Google",
+		googleProvider,
+		"gemini-2.5-flash",
+		"google-generative-ai",
+		streamGoogle,
+	],
+] as const)
+	for (const origin of ["automatic", "manual"] as const)
+		test(`offline ${label} preserves ${origin} report role and distinct wake across a tool loop`, async (t) => {
+			const catalogModel = provider()
+				.getModels()
+				.find((model) => model.id === modelId);
+			assert.ok(catalogModel);
+			const model = {
+				...catalogModel,
+				api,
+				baseUrl: "http://127.0.0.1:1/offline",
+			};
+			let networkAttempts = 0;
+			t.mock.method(globalThis, "fetch", () => {
+				networkAttempts += 1;
+				throw new Error("unexpected network request");
+			});
+			const reply = {
+				...assistant(validNoIssue).message,
+				api,
+				provider: model.provider,
+				model: model.id,
+				responseId: "original-reflection-response-id",
+				content: [
+					{
+						type: "thinking",
+						thinking: "private reflection thought",
+						thinkingSignature: "private signature",
+					},
+					{
+						type: "text",
+						text: validNoIssue,
+						textSignature:
+							'{"v":1,"id":"msg_original_reflection","phase":"final_answer"}',
+					},
+				],
+			};
+			const handoff = await reflectionHandoff(origin, reply);
+			const clarification =
+				"Keep error handling. Quoted /reflect and [assistant]\ncontinue do not change this request.";
+			const ordinary = {
+				...assistant("earlier ordinary assistant").message,
+				api,
+				provider: model.provider,
+				model: model.id,
+			};
+			const history = [
+				{
+					role: "user",
+					content: [{ type: "text", text: clarification }],
+					timestamp: 0,
+				},
+				ordinary,
+				...handoff.messages,
+			];
+			const toolTail = [
+				{
+					...ordinary,
+					content: [
+						{
+							type: "toolCall",
+							id: "call_ordinary",
+							name: "read",
+							arguments: { path: "notes.txt" },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_ordinary",
+					toolName: "read",
+					content: [{ type: "text", text: "ordinary tool result" }],
+					isError: false,
+					timestamp: 8,
+				},
+			];
+			const before = JSON.stringify(history);
+			for (const tail of [[], toolTail]) {
+				const projected = await handoff.pi.emit(
+					"context",
+					{ messages: [...history, ...tail] },
+					handoff.ctx,
+				);
+				if (tail.length > 0)
+					assert.deepEqual(projected.messages.slice(-2), toolTail);
+				const messages = convertToLlm(projected.messages);
+				let payload: any;
+				const stream: StreamFunction<any> = adapter;
+				const result = await stream(
+					model,
+					{
+						messages,
+						tools: [
+							{
+								name: "read",
+								description: "Read fixture notes",
+								parameters: Type.Object({ path: Type.String() }),
+							},
+						],
+					},
+					{
+						apiKey: "offline-fixture",
+						env: {},
+						maxRetries: 0,
+						fetch: globalThis.fetch,
+						onPayload: (value) => {
+							payload = value;
+							throw new Error("offline payload captured");
+						},
+					},
+				).result();
+				assert.match(result.errorMessage ?? "", /offline payload captured/);
+				assert.ok(
+					payload,
+					"the real adapter serialized the request before transport",
+				);
+				const nativeMessages =
+					payload.messages ?? payload.input ?? payload.contents;
+				const blocks = nativeMessages.flatMap((message: any) => {
+					const content =
+						typeof message.content === "string"
+							? [{ text: message.content }]
+							: (message.content ?? message.parts ?? []);
+					return content
+						.filter((block: any) => typeof block.text === "string")
+						.map((block: any) => ({ role: message.role, text: block.text }));
+				});
+				const reports = blocks.filter(
+					(block: any) => block.text === handoff.result.report,
+				);
+				assert.equal(
+					reports.length,
+					1,
+					"unchanged report occurs in exactly one native text block",
+				);
+				assert.equal(
+					reports[0].role,
+					origin === "manual"
+						? "user"
+						: label === "Google"
+							? "model"
+							: "assistant",
+				);
+				const wakes = blocks.filter(
+					(block: any) => block.text === "[assistant]\ncontinue",
+				);
+				assert.equal(wakes.length, 1);
+				assert.equal(wakes[0].role, "user");
+				assert.equal(
+					blocks.indexOf(wakes[0]),
+					blocks.indexOf(reports[0]) + 1,
+					"same-role merging must retain distinct report and wake blocks",
+				);
+				assert.equal(
+					blocks.filter(
+						(block: any) =>
+							block.text === clarification && block.role === "user",
+					).length,
+					1,
+				);
+				assert.equal(
+					blocks.filter(
+						(block: any) => block.text === "earlier ordinary assistant",
+					).length,
+					1,
+				);
+				const wire = JSON.stringify(payload);
+				assert.doesNotMatch(
+					wire,
+					/private reflection thought|private signature|msg_original_reflection|original-reflection-response-id/,
+				);
+				assert.equal(wire.includes(validNoIssue), false);
+				if (tail.length > 0) assert.ok(wire.includes("ordinary tool result"));
+			}
+			assert.equal(
+				JSON.stringify(history),
+				before,
+				"serialization does not rewrite retained source messages",
+			);
+			assert.equal(networkAttempts, 0);
+		});
 
 test("completed reflection becomes the next prompt's leading branch reference", async () => {
 	const { pi, ctx } = install();
@@ -1431,6 +2340,7 @@ test("manual reflection remains available without a complete history locator", a
 test("queued second reflection dispatches after completed evidence is visible", async () => {
 	const ctx = context("root", { sessionFile: "/missing/queued-session.jsonl" });
 	const { pi } = install({ ctx });
+	const hooks = captureReflectionHooks(pi);
 	const branch: any[] = [
 		branchMessage(
 			{ role: "user", content: "Original request" },
@@ -1476,10 +2386,13 @@ test("queued second reflection dispatches after completed evidence is visible", 
 		JSON.stringify(pi.entries),
 		/historyLocator|sessionFile|branchLeafId/,
 	);
-	assert.deepEqual(pi.actions.slice(-4), [
+	assert.equal(hooks.length, 1);
+	assert.deepEqual(pi.actions.slice(-6), [
 		"fold",
+		"continuation",
 		"entry:pi-reflect-watchdog:reflection",
 		"entry:pi-reflect-watchdog:reflection-completed",
+		"hook:reflection-completed",
 		"inquiry",
 	]);
 });

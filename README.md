@@ -2,7 +2,7 @@
 
 Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules.
 
-## Kept behavior
+## Behavior
 
 - Pi lifecycle state comes from `agent_start`, live `probePiAgentState`, and authoritative `agent_settled`.
 - Only successful assistant `turn_end` outcomes count: `stop` and `toolUse`.
@@ -13,9 +13,26 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - All XML attempts share one inquiry and are folded from later model context only after the final result.
 - Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as fallible historical assistant analysis, not the user's words.
 - After the result and completion marker are stored, one best-effort `reflection-completed` semantic hook publishes `REFLECTION_TYPE`, `REASON`, and `NEXT_STEP` to current listeners.
-- `ROUTE_CORRECTION` starts one ordinary continuation without reflection/XML protocol priming; that continuation counts normally.
+- Both `NO_ISSUE` and `ROUTE_CORRECTION` start exactly one ordinary continuation without reflection/XML protocol priming, including busy and idle manual `/reflect`; that continuation counts normally.
 - Reflection may use up to 10 tool calls across at most three XML attempts.
 - XML element names and reflection `type` value are case-insensitive.
+
+## Returning to ordinary work
+
+Reports keep their existing text and formatting. Automatically triggered reports reach ordinary model requests as `assistant`; results requested through `/reflect` reach them as `user`. The actual trigger selects the role, not the verdict or a quoted command. Manual reports are still generated feedback, not verbatim human input.
+
+Each report is followed by a separate native wake with exactly this body:
+
+```text
+[assistant]
+continue
+```
+
+The wake has the synthetic **user transport role**; its text label does not turn it into an assistant message. Neither verdict means the task is complete or requires executing `next_step`. The ordinary agent decides whether to work, wait for an existing callback, clarify, or finish. The no-issue informational notice remains available in the TUI.
+
+The report, trigger origin, and inquiry correlation live in private marker metadata. Ordinary context projection restores the report once, including after reload, only while its correlated source assistant remains available. Missing source or malformed origin/correlation means no reconstructed report, not a guessed role or a report copied into the wake.
+
+Built-in compaction and branch summarization bypass this projection. For either trigger, a new handoff contributes only the fixed wake to their conversational input; report retention in a generated summary is not guaranteed. The existing stored report remains available to later reflections. Old sessions and unrelated extensions' messages are not rewritten.
 
 ## Reflection perspective
 
@@ -48,7 +65,7 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
 
 Delivery is best-effort to current listeners only: no buffer, replay, acknowledgement, retry, or cross-process forwarding. Producers must publish pause before excluded work and a matching resume on every terminal path. While paused, active/task time and loop counters freeze across the watchdog process domain; explicit `/reflect` remains available.
 
-Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid XML attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, route correction, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
+Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid XML attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, ordinary continuation, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
 
 Runtime reset, dynamic limit controls, history/timeline tools, public pause APIs, and pause/resume commands are intentionally removed. Config-driven semantic-hook pauses are the only external counting control.
 

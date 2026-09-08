@@ -6,6 +6,7 @@ import type {
 	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
@@ -62,6 +63,8 @@ const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
 const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
 const REFLECTION_COMPLETED_HOOK = "reflection-completed";
+const REFLECTION_CONTINUATION = "pi-reflect-watchdog:continuation";
+const REFLECTION_CONTINUATION_CONTENT = "[assistant]\ncontinue";
 const SEMANTIC_HOOK_TEXT_LIMIT = 4096;
 const REFLECT_COOLDOWN_LOOPS = 10;
 const ACTIVE_TICK_MS = 1_000;
@@ -129,6 +132,13 @@ interface ReflectionResult {
 	readonly report: string;
 }
 
+interface ReflectionContinuationDetails {
+	readonly version: 1;
+	readonly origin: "automatic" | "manual";
+	readonly report: string;
+	readonly correlation: InquiryAttemptHandle["correlation"];
+}
+
 interface Runtime {
 	readonly pi: ExtensionAPI;
 	readonly hub: ObservableAgentHub;
@@ -159,6 +169,184 @@ interface Runtime {
 	hookPauseDepths: number[];
 	externallyPaused: boolean;
 	pauseTail: Promise<void>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sameCorrelation(
+	left: InquiryAttemptHandle["correlation"],
+	right: InquiryAttemptHandle["correlation"],
+): boolean {
+	return (
+		left.version === right.version &&
+		left.namespace === right.namespace &&
+		left.inquiryId === right.inquiryId &&
+		left.attempt === right.attempt
+	);
+}
+
+function inquiryCorrelation(
+	value: unknown,
+): InquiryAttemptHandle["correlation"] | null {
+	if (!isRecord(value)) return null;
+	return value.version === 1 &&
+		value.namespace === REFLECTION_INQUIRY_NAMESPACE &&
+		typeof value.inquiryId === "string" &&
+		/^[A-Za-z0-9_-]{1,128}$/.test(value.inquiryId) &&
+		typeof value.attempt === "number" &&
+		Number.isSafeInteger(value.attempt) &&
+		value.attempt > 0
+		? {
+				version: 1,
+				namespace: REFLECTION_INQUIRY_NAMESPACE,
+				inquiryId: value.inquiryId,
+				attempt: value.attempt,
+			}
+		: null;
+}
+
+function continuationDetails(
+	value: unknown,
+): ReflectionContinuationDetails | null {
+	if (!isRecord(value)) return null;
+	const correlation = inquiryCorrelation(value.correlation);
+	return value.version === 1 &&
+		(value.origin === "automatic" || value.origin === "manual") &&
+		typeof value.report === "string" &&
+		value.report.trim().length > 0 &&
+		correlation !== null
+		? {
+				version: 1,
+				origin: value.origin,
+				report: value.report,
+				correlation,
+			}
+		: null;
+}
+
+function messageText(message: Record<string, unknown>): string | null {
+	if (typeof message.content === "string") return message.content;
+	if (
+		Array.isArray(message.content) &&
+		message.content.length === 1 &&
+		isRecord(message.content[0]) &&
+		message.content[0].type === "text" &&
+		typeof message.content[0].text === "string"
+	)
+		return message.content[0].text;
+	return null;
+}
+
+function continuationProjection<T extends object>(messages: T[]): T[] {
+	const projections = new Map<number, T>();
+	for (let markerIndex = 0; markerIndex < messages.length; markerIndex += 1) {
+		const marker = messages[markerIndex];
+		if (!isRecord(marker)) continue;
+		const details =
+			marker.role === "custom" &&
+			marker.customType === REFLECTION_CONTINUATION &&
+			messageText(marker) === REFLECTION_CONTINUATION_CONTENT
+				? continuationDetails(marker.details)
+				: null;
+		if (details === null) continue;
+
+		let source: Record<string, unknown> | undefined;
+		let completed = false;
+		let started = false;
+		for (let index = markerIndex - 1; index >= 0; index -= 1) {
+			const candidate = messages[index];
+			if (!isRecord(candidate)) continue;
+			// A previous handoff bounds this segment even when ids are reused.
+			if (
+				candidate.role === "custom" &&
+				candidate.customType === REFLECTION_CONTINUATION
+			)
+				break;
+			if (
+				candidate.role === "custom" &&
+				candidate.customType ===
+					`${REFLECTION_INQUIRY_NAMESPACE}:inquiry-fold` &&
+				messageText(candidate) === "" &&
+				isRecord(candidate.details) &&
+				candidate.details.outcome === "remove"
+			) {
+				const correlation = inquiryCorrelation(candidate.details);
+				if (
+					correlation !== null &&
+					sameCorrelation(correlation, details.correlation)
+				) {
+					if (completed) break;
+					completed = true;
+				}
+			}
+			if (
+				candidate.role === "custom" &&
+				candidate.customType === `${REFLECTION_INQUIRY_NAMESPACE}:inquiry`
+			) {
+				const correlation = inquiryCorrelation(candidate.details);
+				if (
+					correlation !== null &&
+					sameCorrelation(correlation, details.correlation)
+				) {
+					started =
+						source !== undefined &&
+						(messageText(candidate)?.trim().length ?? 0) > 0;
+					break;
+				}
+			}
+			if (
+				candidate.role !== "assistant" ||
+				!Array.isArray(candidate.content) ||
+				candidate.content.length !== 0 ||
+				!isRecord(candidate.details)
+			)
+				continue;
+			const correlation = inquiryCorrelation(candidate.details.piInquiry);
+			if (
+				completed &&
+				source === undefined &&
+				correlation !== null &&
+				sameCorrelation(correlation, details.correlation)
+			) {
+				source = candidate;
+			}
+		}
+		if (source === undefined || !started) continue;
+
+		const timestamp = source.timestamp;
+		const report =
+			details.origin === "automatic"
+				? {
+						...source,
+						content: [{ type: "text", text: details.report }],
+						details: Object.fromEntries(
+							Object.entries(source.details as Record<string, unknown>).filter(
+								([key]) => key !== "piInquiry",
+							),
+						),
+					}
+				: {
+						role: "user",
+						content: [{ type: "text", text: details.report }],
+						timestamp,
+					};
+		projections.set(markerIndex, report as T);
+	}
+	return projections.size === 0
+		? messages
+		: messages.flatMap((message, index) => {
+				const report = projections.get(index);
+				return report === undefined ? [message] : [report, message];
+			});
+}
+
+function reflectionContext<T extends object>(messages: T[]): T[] {
+	return foldInquiryContext(
+		continuationProjection(messages),
+		REFLECTION_INQUIRY_NAMESPACE,
+	);
 }
 
 function externalPauseActive(runtime: Runtime): boolean {
@@ -710,29 +898,32 @@ function queueManualReflection(runtime: Runtime, supplement?: string): void {
 function finishReflection(
 	runtime: Runtime,
 	decision?: ReflectionDecision,
+	report?: string,
 ): void {
 	const active = runtime.activeReflection;
 	if (active === undefined) return;
 	runtime.activeReflection = undefined;
 	runtime.internalRun = { kind: "none" };
 	if (runtime.ctx !== null) observe(runtime, runtime.ctx);
-	if (decision?.type === "ROUTE_CORRECTION") {
+	if (decision !== undefined && report !== undefined) {
 		runtime.pi.sendMessage(
 			{
-				customType: `${REFLECTION_INQUIRY_NAMESPACE}:route-correction`,
-				content: [
-					"Reconsider the current conversation using this perspective and choose the appropriate next response.",
-					`Observation: ${decision.reason}`,
-					`Reported progress: ${decision.done}`,
-					`Current focus: ${decision.currentStep}`,
-					`Suggested next step: ${decision.nextStep}`,
-				].join("\n"),
+				customType: REFLECTION_CONTINUATION,
+				content: REFLECTION_CONTINUATION_CONTENT,
 				display: true,
-				details: { timestamp: active.timestamp, decision },
+				details: {
+					version: 1,
+					origin: active.reasons.includes("USER_REQUEST")
+						? "manual"
+						: "automatic",
+					report,
+					correlation: active.handle.correlation,
+				} satisfies ReflectionContinuationDetails,
 			},
 			{ deliverAs: "steer", triggerTurn: true },
 		);
-	} else if (decision !== undefined && runtime.ctx?.mode === "tui") {
+	}
+	if (decision?.type === "NO_ISSUE" && runtime.ctx?.mode === "tui") {
 		runtime.ctx.ui.notify(`Reflect watchdog: ${decision.reason}`, "info");
 	}
 }
@@ -879,11 +1070,21 @@ export function createWatchdogExtension(
 		};
 
 		pi.on("context", (event) => ({
-			messages: foldInquiryContext(
-				event.messages,
-				REFLECTION_INQUIRY_NAMESPACE,
-			),
+			messages: reflectionContext(event.messages),
 		}));
+
+		pi.registerMessageRenderer<ReflectionContinuationDetails>(
+			REFLECTION_CONTINUATION,
+			(message, { outputPad }, theme) => {
+				const details = continuationDetails(message.details);
+				if (details === null) return undefined;
+				const box = new Box(outputPad, 1, (text) =>
+					theme.bg("customMessageBg", text),
+				);
+				box.addChild(new Text(details.report, 0, 0));
+				return box;
+			},
+		);
 
 		pi.registerCommand(REFLECT_COMMAND, {
 			description:
@@ -1088,7 +1289,7 @@ export function createWatchdogExtension(
 							deliverAs: "steer",
 							triggerTurn: false,
 						});
-					finishReflection(runtime, planned);
+					finishReflection(runtime, planned, result.report);
 					pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
 					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
 					publishReflectionCompleted(runtime, planned);

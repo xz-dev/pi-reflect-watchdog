@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import {
 	access,
 	lstat,
@@ -71,6 +72,15 @@ async function waitForProviderResponse(record, timeoutMs = 10_000) {
 	throw new Error(`Provider response did not finish within ${timeoutMs}ms`);
 }
 
+function providerMessageText(message) {
+	return typeof message.content === "string"
+		? message.content
+		: (message.content ?? [])
+				.filter((block) => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+}
+
 async function installHookTracer({ base, agentDir, tracePath }) {
 	const tracerDir = path.join(base, "hook-tracer");
 	await mkdir(tracerDir, { recursive: true });
@@ -108,7 +118,7 @@ async function tracedHooks(tracePath) {
 		.map((line) => JSON.parse(line));
 }
 
-function warningPlan({ requestIndex }) {
+function warningPlan({ requestIndex, request: { body } }) {
 	if (requestIndex === 0) {
 		return {
 			delay: 20,
@@ -151,6 +161,14 @@ function warningPlan({ requestIndex }) {
 			finishReason: "tool_calls",
 		};
 	}
+	if (
+		!body.messages.some((message) =>
+			providerMessageText(message).includes(
+				"Trigger source(s): ROOT_LOOP_LIMIT",
+			),
+		)
+	)
+		return { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] };
 	return {
 		delay: 20,
 		chunks: [
@@ -576,20 +594,200 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 		"the reflection provider request starts after the ordinary tool round",
 	);
 	await waitForProviderResponse(continuation);
-	await rpc.waitFor((message) => message.type === "agent_settled");
+	await waitForProviderRequests(provider, 4);
+	const resumed = provider.requests[3];
+	await waitForProviderResponse(resumed);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= resumed.finishedAt,
+	);
+	const resumedMessages = resumed.body.messages;
+	const reportIndex = resumedMessages.findIndex(
+		(message) =>
+			message.role === "assistant" &&
+			providerMessageText(message).includes("Reflection · NO_ISSUE"),
+	);
+	assert.ok(reportIndex >= 0);
+	assert.equal(
+		providerMessageText(resumedMessages[reportIndex + 1]),
+		"[assistant]\ncontinue",
+	);
+	assert.equal(resumedMessages[reportIndex + 1].role, "user");
+	assert.equal(JSON.stringify(resumedMessages).includes("<reflection>"), false);
 	await new Promise((resolve) => setTimeout(resolve, 250));
 	assert.equal(
 		provider.requests.length,
-		3,
+		4,
 		"completed evidence prevents the latched automatic reflection from redispatching during cooldown",
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(
 		last.data.text ?? "",
-		"",
-		"the internal NO_ISSUE reflection response is not visible as assistant output",
+		"ordinary fixture resumed",
+		"the continuation is ordinary output, not the internal NO_ISSUE XML",
+	);
+	// The first continuation counts as one ordinary loop. Eleven more cross
+	// the inclusive ten-loop cooldown and the unchanged two-loop threshold.
+	for (let index = 0; index < 11; index += 1) {
+		const next = provider.requests.length;
+		const accepted = await rpc.request({
+			type: "prompt",
+			message: `ordinary follow-up ${index}`,
+		});
+		assert.equal(accepted.success, true);
+		await waitForProviderRequests(provider, next + 1);
+		await waitForProviderResponse(provider.requests[next]);
+		await rpc.waitFor(
+			(message, at) =>
+				message.type === "agent_settled" &&
+				at >= provider.requests[next].finishedAt,
+		);
+	}
+	await waitForProviderRequests(provider, 17);
+	await waitForProviderResponse(provider.requests[16]);
+	const reflections = provider.requests.filter((request) =>
+		request.body.messages.some((message) =>
+			providerMessageText(message).includes(warningMarker),
+		),
+	);
+	assert.equal(
+		reflections.length,
+		2,
+		"a later threshold still reflects after cooldown",
+	);
+	assert.match(
+		JSON.stringify(reflections[1].body.messages),
+		/active=\d+ms\/14 loops/,
 	);
 });
+
+for (const [origin, type] of [
+	["automatic", "ROUTE_CORRECTION"],
+	["busy-manual", "ROUTE_CORRECTION"],
+	["busy-manual", "NO_ISSUE"],
+])
+	test(`packed stock Pi ${origin} ${type} projects the report before exact wake`, {
+		timeout: 45_000,
+	}, async (t) => {
+		assertStockPi();
+		const resources = await createTestResources(
+			t,
+			"pi-reflect-watchdog-automatic-correction-",
+		);
+		const isolated = await createIsolatedEnvironment(resources.base);
+		const artifact = await installPackedArtifact({
+			base: resources.base,
+			agentDir: isolated.agentDir,
+		});
+		await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+			rootLoopLimit: origin === "automatic" ? 1 : 100,
+			allLoopLimit: 500,
+			taskMinutes: 30,
+		});
+		const reflectionXml = `<reflection><type>${type}</type><reason>preserve the clarification</reason><done>checked current direction</done><current_step>reassess the abstraction layers</current_step><next_step>wait for the existing callback</next_step></reflection>`;
+		const provider = await startFakeProvider({
+			responsePlan: ({ requestIndex }) => ({
+				delay: origin === "busy-manual" && requestIndex === 0 ? 1000 : 20,
+				chunks: [
+					{
+						content:
+							requestIndex === 0
+								? "I will remove error handling."
+								: requestIndex === 1
+									? reflectionXml
+									: "clarification preserved",
+					},
+				],
+			}),
+		});
+		resources.add(() => provider.close());
+		await writeJson(
+			path.join(isolated.agentDir, "models.json"),
+			modelConfig(provider.baseUrl),
+		);
+		const rpc = new RpcPi({
+			cwd: isolated.workspace,
+			env: isolated.env,
+			launcherArgs: [
+				"--mode",
+				"rpc",
+				"--no-tools",
+				"--provider",
+				"watchdog-fixture",
+				"--model",
+				"watchdog-fixture",
+			],
+		});
+		resources.add(() => rpc.close());
+		await assertSingleWatchdogCommand(
+			rpc,
+			path.join(artifact.packagePath, "dist", "extension.js"),
+		);
+		const clarification =
+			"Too complicated. I meant the three abstraction layers; keep error handling.";
+		const accepted = await rpc.request({
+			type: "prompt",
+			message: clarification,
+		});
+		assert.equal(accepted.success, true);
+		if (origin === "busy-manual") {
+			await waitForProviderRequests(provider, 1);
+			assert.equal(
+				(await rpc.request({ type: "get_state" })).data.isStreaming,
+				true,
+			);
+			const manual = await rpc.request({
+				type: "prompt",
+				message: "/reflect check the clarification",
+			});
+			assert.equal(manual.success, true);
+			assert.equal(
+				provider.requests[0].finishedAt,
+				undefined,
+				"manual command was invoked during ordinary work",
+			);
+		}
+		await waitForProviderRequests(provider, 3);
+		const messages = provider.requests[2].body.messages;
+		const reportIndex = messages.findIndex(
+			(message) =>
+				message.role === (origin === "automatic" ? "assistant" : "user") &&
+				providerMessageText(message).includes(`Reflection · ${type}`),
+		);
+		const wakeIndex = messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				providerMessageText(message) === "[assistant]\ncontinue",
+		);
+		assert.ok(
+			reportIndex >= 0,
+			"report reaches provider with its actual trigger role",
+		);
+		assert.equal(wakeIndex, reportIndex + 1);
+		assert.match(
+			providerMessageText(messages[reportIndex]),
+			/Reason: preserve the clarification/,
+		);
+		assert.equal(
+			messages.filter(
+				(message) => providerMessageText(message) === clarification,
+			).length,
+			1,
+			"original user clarification stays unchanged",
+		);
+		assert.equal(JSON.stringify(messages).includes(reflectionXml), false);
+		await waitForProviderResponse(provider.requests[2]);
+		await rpc.waitFor(
+			(message, at) =>
+				message.type === "agent_settled" &&
+				at >= provider.requests[2].finishedAt,
+		);
+		assert.equal(
+			provider.requests.length,
+			3,
+			"one ordinary request follows the reflection",
+		);
+	});
 
 test("packed stock Pi hides reflection XML and continues normally after a correction", {
 	timeout: 45_000,
@@ -609,24 +807,43 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		allLoopLimit: 500,
 		taskMinutes: 30,
 	});
+	const tracePath = path.join(resources.base, "completion-order.jsonl");
+	await installHookTracer({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+		tracePath,
+	});
+	isolated.env.PI_WATCHDOG_HOOK_TRACE = tracePath;
+	const hooksAtContinuation = [];
 	const reflectionXml =
 		"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>pause</current_step><next_step>apply corrected route</next_step></reflection>";
 	const followupReflectionXml =
 		"<reflection><type>NO_ISSUE</type><reason>corrected route is sound</reason><done>follow-up checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>";
 	const provider = await startFakeProvider({
-		responsePlan: ({ requestIndex }) => ({
-			delay: 20,
-			chunks: [
-				{
-					content:
-						requestIndex === 0
-							? reflectionXml
-							: requestIndex === 2
-								? followupReflectionXml
-								: "correction applied automatically",
-				},
-			],
-		}),
+		responsePlan: ({ requestIndex }) => {
+			if (requestIndex === 1 || requestIndex === 3)
+				hooksAtContinuation.push(
+					existsSync(tracePath)
+						? readFileSync(tracePath, "utf8")
+								.trim()
+								.split("\n")
+								.map((line) => JSON.parse(line))
+						: [],
+				);
+			return {
+				delay: 20,
+				chunks: [
+					{
+						content:
+							requestIndex === 0
+								? reflectionXml
+								: requestIndex === 2
+									? followupReflectionXml
+									: "correction applied automatically",
+					},
+				],
+			};
+		},
 	});
 	resources.add(() => provider.close());
 	await writeJson(
@@ -666,25 +883,39 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		2,
 		"the correction starts exactly one ordinary turn without a user prompt",
 	);
-	const continuationMessages = JSON.stringify(
-		provider.requests[1].body.messages,
+	const providerMessages = provider.requests[1].body.messages;
+	const continuationMessages = JSON.stringify(providerMessages);
+	const reportIndex = providerMessages.findIndex(
+		(message) =>
+			message.role === "user" &&
+			providerMessageText(message).includes("Reflection · ROUTE_CORRECTION"),
+	);
+	const wakeIndexes = providerMessages
+		.map((message, index) =>
+			message.role === "user" &&
+			providerMessageText(message) === "[assistant]\ncontinue"
+				? index
+				: -1,
+		)
+		.filter((index) => index >= 0);
+	assert.ok(
+		reportIndex >= 0,
+		"manual reflection report reaches provider as user",
 	);
 	assert.match(
-		continuationMessages,
-		/Reconsider the current conversation using this perspective and choose the appropriate next response\./,
+		providerMessageText(providerMessages[reportIndex]),
+		/Reason: change route/,
+	);
+	assert.match(
+		providerMessageText(providerMessages[reportIndex]),
+		/Next step: apply corrected route/,
+	);
+	assert.deepEqual(wakeIndexes, [reportIndex + 1]);
+	assert.equal(
+		providerMessageText(providerMessages[wakeIndexes[0]]),
+		"[assistant]\ncontinue",
 	);
 	assert.doesNotMatch(continuationMessages, /Do not emit reflection XML/);
-	assert.match(
-		continuationMessages,
-		/Suggested next step: apply corrected route/,
-	);
-	assert.equal(
-		provider.requests[1].body.messages.some(
-			(message) => message.role === "assistant",
-		),
-		false,
-		"the internal reflection assistant is replaced before the next request",
-	);
 	assert.equal(
 		continuationMessages.includes(reflectionXml),
 		false,
@@ -731,7 +962,33 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		"the next reflection receives the plain report, not prior XML",
 	);
 	await waitForProviderResponse(provider.requests[2]);
-	await rpc.waitFor((message) => message.type === "agent_settled");
+	await waitForProviderRequests(provider, 4);
+	await waitForProviderResponse(provider.requests[3]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[3].finishedAt,
+	);
+	assert.equal(
+		provider.requests.length,
+		4,
+		"the idle manual NO_ISSUE also resumes once",
+	);
+	assert.equal(
+		provider.requests[3].body.messages.some(
+			(message) =>
+				message.role === "user" &&
+				providerMessageText(message).includes("Reflection · NO_ISSUE"),
+		),
+		true,
+	);
+	assert.deepEqual(
+		hooksAtContinuation.map(
+			(hooks) =>
+				hooks.filter((hook) => hook.name === "reflection-completed").length,
+		),
+		[1, 2],
+		"each native continuation reaches the provider after its one completion hook",
+	);
 
 	const sessionDirectory = isolated.env.PI_CODING_AGENT_SESSION_DIR;
 	const sessionFiles = (await readdir(sessionDirectory, { recursive: true }))
@@ -762,10 +1019,47 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		entries.filter(
 			(entry) =>
 				entry.type === "custom_message" &&
-				entry.customType === "pi-reflect-watchdog:route-correction",
+				entry.customType === "pi-reflect-watchdog:continuation" &&
+				entry.content === "[assistant]\ncontinue",
 		).length,
-		1,
+		2,
 	);
+	for (const [markerIndex, marker] of entries.entries()) {
+		if (
+			marker.type !== "custom_message" ||
+			marker.customType !== "pi-reflect-watchdog:continuation"
+		)
+			continue;
+		const correlation = marker.details.correlation;
+		const foldIndex = entries.findIndex(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:inquiry-fold" &&
+				entry.details?.inquiryId === correlation.inquiryId &&
+				entry.details?.attempt === correlation.attempt,
+		);
+		const resultIndex = entries.findIndex(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection" &&
+				entry.data?.report === marker.details.report,
+		);
+		const completionIndex = entries.findIndex(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection-completed" &&
+				entry.data?.inquiryId === correlation.inquiryId &&
+				entry.data?.attempt === correlation.attempt,
+		);
+		// sendMessage schedules the native turn; Pi persists its wake later on
+		// message_end. Do not impose synchronous persistence on that API.
+		assert.ok(
+			foldIndex >= 0 &&
+				foldIndex < resultIndex &&
+				resultIndex < completionIndex,
+		);
+		assert.ok(
+			foldIndex < markerIndex,
+			"the native wake retains its completed inquiry fold",
+		);
+	}
 });
 
 test("stock Pi loads global and trusted-project watchdog configuration", async (t) => {

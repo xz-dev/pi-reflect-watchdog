@@ -61,6 +61,8 @@ class MinimalPi {
 		this.commands.push({ name, handler: command.handler });
 	}
 
+	registerMessageRenderer() {}
+
 	sendMessage(message, options) {
 		this.messages.push({ message, options });
 	}

@@ -71,7 +71,7 @@ structure State where
   limits : Limits
   pending : List Trigger
   inquiryActive : Bool
-  correctionQueued : Bool
+  continuationQueued : Bool
   hookPairs : List HookPairState
   deriving Repr, DecidableEq
 
@@ -167,7 +167,7 @@ def step (state : State) (event : Event) : State :=
             !state.inquiryActive then
           { state with inquiryActive := true, runKind := .reflection }
         else state
-    | .reflectionFinished decision =>
+    | .reflectionFinished _ =>
         if state.inquiryActive then
           { state with
             inquiryActive := false
@@ -177,9 +177,7 @@ def step (state : State) (event : Event) : State :=
               rootLoops := 0
               allLoops := 0 }
             runKind := .ordinary
-            correctionQueued := match decision with
-              | .routeCorrection => true
-              | .noIssue => false }
+            continuationQueued := true }
         else state
     | .shutdown =>
         { state with
@@ -207,7 +205,7 @@ def initial : State :=
       allLoops := 500 }
     pending := []
     inquiryActive := false
-    correctionQueued := false
+    continuationQueued := false
     hookPairs := [{ pauseName := "inquiry-started", resumeName := "inquiry-finished", depth := 0 }] }
 
 -- Safety forbids active work, inquiries, and pending asks after shutdown.
@@ -217,7 +215,7 @@ def Safe (state : State) : Prop :=
       state.inquiryActive = false ∧ state.pending = []
 
 -- Supporting lemmas prove exact outcomes, internal and external time/loop exclusion, native queued
--- dispatch while work is busy, ownership recovery, correction, and shutdown.
+-- dispatch while work is busy, ownership recovery, valid-result continuation, and shutdown.
 theorem success_policy_exact (outcome : TurnOutcome) :
     modelTurnSucceeded outcome = true ↔
       outcome = .stop ∨ outcome = .toolUse := by
@@ -310,13 +308,34 @@ theorem observer_can_reclaim_main (state : State) :
     (step { state with phase := .observer } .acquireMain).phase = .main := by
   simp [step]
 
-theorem route_correction_queues_continuation
-    (state : State)
+theorem valid_reflection_queues_one_continuation
+    (state : State) (decision : ReflectionDecision)
     (openInquiry : state.inquiryActive = true)
     (notShutdown : state.phase ≠ .shutdown) :
-    (step state (.reflectionFinished .routeCorrection)).correctionQueued = true ∧
-    (step state (.reflectionFinished .noIssue)).correctionQueued = false := by
+    (step state (.reflectionFinished decision)).continuationQueued = true ∧
+    step (step state (.reflectionFinished decision)) (.reflectionFinished decision) =
+      step state (.reflectionFinished decision) := by
   simp [step, notShutdown, openInquiry]
+
+-- Branch-derived eligibility is checked before automatic dispatch. A report
+-- projection is not an ordinary turn; only successful ordinary loops advance it.
+def cooldownAllows (trigger : Trigger) (completedInquiry : Bool)
+    (ordinaryLoopsSince : Nat) : Bool :=
+  if trigger = .userRequest then true
+  else !completedInquiry || decide (ordinaryLoopsSince > 10)
+
+theorem cooldown_policy :
+    (cooldownAllows .rootLoopLimit true 10 = false ∧
+      cooldownAllows .rootLoopLimit true 11 = true) ∧
+    (∀ loops, cooldownAllows .userRequest true loops = true) ∧
+    (∀ trigger loops, cooldownAllows trigger false loops = true) := by
+  constructor
+  · decide
+  constructor
+  · intro loops
+    simp [cooldownAllows]
+  · intro trigger loops
+    simp [cooldownAllows]
 
 theorem shutdown_is_clean (state : State)
     (active : state.phase ≠ .shutdown) : Safe (step state .shutdown) := by
@@ -669,9 +688,14 @@ theorem process_is_correct :
       (step { state with phase := .observer } .acquireMain).phase = .main) ∧
     (∀ state : State, state.phase ≠ .shutdown → Safe (step state .shutdown)) ∧
     (∀ state event, state.phase = .shutdown → step state event = state) ∧
-    (∀ state, state.inquiryActive = true → state.phase ≠ .shutdown →
-      (step state (.reflectionFinished .routeCorrection)).correctionQueued = true ∧
-      (step state (.reflectionFinished .noIssue)).correctionQueued = false) ∧
+    (∀ state decision, state.inquiryActive = true → state.phase ≠ .shutdown →
+      (step state (.reflectionFinished decision)).continuationQueued = true ∧
+      step (step state (.reflectionFinished decision)) (.reflectionFinished decision) =
+        step state (.reflectionFinished decision)) ∧
+    ((cooldownAllows .rootLoopLimit true 10 = false ∧
+      cooldownAllows .rootLoopLimit true 11 = true) ∧
+      (∀ loops, cooldownAllows .userRequest true loops = true) ∧
+      (∀ trigger loops, cooldownAllows trigger false loops = true)) ∧
     anyLiveBusy offlineSample = false ∧
     (offlineSample.activeMs = synchronizedSample.activeMs ∧
       offlineSample.taskMs = synchronizedSample.taskMs) ∧
@@ -734,7 +758,9 @@ theorem process_is_correct :
   constructor
   · exact shutdown_is_absorbing
   constructor
-  · exact route_correction_queues_continuation
+  · exact valid_reflection_queues_one_continuation
+  constructor
+  · exact cooldown_policy
   constructor
   · exact offline_removes_busy_immediately
   constructor
@@ -757,4 +783,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "reflect lifecycle: native queued ask + successful loops; internal runs and paired external pauses excluded"
+  IO.println "reflect lifecycle: both valid verdicts resume once; ordinary loops and inclusive cooldown; internal runs and paired external pauses excluded"
