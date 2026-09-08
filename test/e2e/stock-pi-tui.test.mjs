@@ -63,7 +63,10 @@ test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 	);
 
 	tui.send("First real turn");
-	const first = await tui.waitFor(/Reflect Watchdog \| active \d+s\/0 loops/);
+	// Wait for a real active tick, not the idle screen's matching 0s/0 loops.
+	const first = await tui.waitFor(
+		/Reflect Watchdog \| active [1-9]\d*s\/0 loops/,
+	);
 	await new Promise((resolve) => setTimeout(resolve, 1_300));
 	const second = tui.capture();
 	assert.ok(
