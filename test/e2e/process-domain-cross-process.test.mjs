@@ -89,6 +89,8 @@ function minimalContext(sessionId) {
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getSessionFile: () => undefined,
+			getLeafId: () => null,
 			getBranch: () => [],
 		},
 		ui: {
@@ -433,6 +435,10 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		String(message?.customType ?? "").endsWith(":inquiry"),
 	);
 	assert.match(inquiry?.message?.content ?? "", /ROOT_LOOP_LIMIT/);
+	assert.match(
+		inquiry?.message?.content ?? "",
+		/Branch-scoped history recovery unavailable/,
+	);
 	assert.deepEqual(inquiry?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",

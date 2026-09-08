@@ -591,7 +591,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 });
 
-test("packed stock Pi hides reflection XML and applies a correction without user input", {
+test("packed stock Pi hides reflection XML and continues normally after a correction", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -671,10 +671,13 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	);
 	assert.match(
 		continuationMessages,
-		/Continue the current task using this corrected route\./,
+		/Reconsider the current conversation using this perspective and choose the appropriate next response\./,
 	);
 	assert.doesNotMatch(continuationMessages, /Do not emit reflection XML/);
-	assert.match(continuationMessages, /Next step: apply corrected route/);
+	assert.match(
+		continuationMessages,
+		/Suggested next step: apply corrected route/,
+	);
 	assert.equal(
 		provider.requests[1].body.messages.some(
 			(message) => message.role === "assistant",
@@ -699,8 +702,26 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 	const followupMessages = JSON.stringify(provider.requests[2].body.messages);
 	assert.match(
 		followupMessages,
-		/Previous completed reflection \(reference only\):/,
+		/Earlier assistant reflection \(fallible historical analysis, not the user's words or a conclusion to preserve\):/,
 	);
+	assert.match(followupMessages, /quick, targeted lookups/);
+	assert.match(followupMessages, /state what remains uncertain and finish/);
+	assert.match(followupMessages, /working agent has interpreted the task/);
+	const followupText = provider.requests[2].body.messages
+		.flatMap((message) =>
+			typeof message.content === "string"
+				? [message.content]
+				: (message.content ?? []).map((block) => block.text ?? ""),
+		)
+		.join("\n");
+	const locatorLine = followupText
+		.split("\n")
+		.find((line) => line.startsWith('{"sessionFile":'));
+	assert.ok(
+		locatorLine,
+		"actual provider input contains the optional history locator",
+	);
+	const locator = JSON.parse(locatorLine);
 	assert.match(followupMessages, /Reflection · ROUTE_CORRECTION/);
 	assert.match(followupMessages, /Reason: change route/);
 	assert.match(followupMessages, /User supplement: verify the corrected route/);
@@ -721,6 +742,11 @@ test("packed stock Pi hides reflection XML and applies a correction without user
 		.trim()
 		.split("\n")
 		.map((line) => JSON.parse(line));
+	assert.equal(locator.sessionFile, sessionFiles[0]);
+	assert.ok(
+		entries.some((entry) => entry.id === locator.branchLeafId),
+		"locator points to an existing entry in the original session",
+	);
 	const assistantText = entries
 		.filter(
 			(entry) =>

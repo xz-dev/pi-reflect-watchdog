@@ -243,7 +243,12 @@ class FakeDomain implements ReflectDomainCoordinator {
 
 function context(
 	sessionId = "root",
-	options: { idle?: boolean; hasUI?: boolean; mode?: "rpc" | "tui" } = {},
+	options: {
+		idle?: boolean;
+		hasUI?: boolean;
+		mode?: "rpc" | "tui";
+		sessionFile?: string;
+	} = {},
 ) {
 	let idle = options.idle ?? true;
 	let pendingMessages = false;
@@ -253,6 +258,8 @@ function context(
 	const widgets: Array<unknown> = [];
 	const manager = {
 		getSessionId: () => sessionId,
+		getSessionFile: () => options.sessionFile,
+		getLeafId: (): string | null => branch.at(-1)?.id ?? null,
 		getBranch: () => branch,
 	};
 	return {
@@ -860,11 +867,16 @@ test("valid final reflections publish exact payloads once after durable entries"
 			},
 		],
 	] as const) {
-		const ctx = context("root", { mode: "tui" });
+		const ctx = context("root", {
+			mode: "tui",
+			sessionFile: "/missing/hook-session.jsonl",
+		});
+		ctx.setBranch([ordinaryLoop("hook-anchor")]);
 		const { pi, domain } = install({ ctx });
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
 		await pi.commands[0]?.handler("", ctx);
+		assert.match(lastInquiry(pi)?.content ?? "", /hook-anchor/);
 		await startReflectionRun(pi, ctx);
 		await completeReflectionAttempt(pi, ctx, text);
 		assert.deepEqual(hooks, [
@@ -1318,7 +1330,12 @@ test("route correction starts one ordinary continuation without XML priming", as
 	const firstLine = correction.message.content.split("\n", 1)[0];
 	assert.equal(
 		firstLine,
-		"Continue the current task using this corrected route.",
+		"Reconsider the current conversation using this perspective and choose the appropriate next response.",
+	);
+	assert.match(correction.message.content, /Observation: change route/);
+	assert.match(
+		correction.message.content,
+		/Suggested next step: continue differently/,
 	);
 	assert.doesNotMatch(firstLine, /reflection|xml/i);
 	assert.doesNotMatch(
@@ -1392,20 +1409,51 @@ test("completed reflection becomes the next prompt's leading branch reference", 
 	assert.doesNotMatch(prompt, /poison/);
 });
 
+test("manual reflection remains available without a complete history locator", async () => {
+	for (const { sessionFile, withLeaf } of [
+		{ sessionFile: undefined, withLeaf: true },
+		{ sessionFile: "/missing/session.jsonl", withLeaf: false },
+		{ sessionFile: undefined, withLeaf: false },
+	]) {
+		const ctx = context("root", { sessionFile });
+		if (withLeaf) ctx.setBranch([ordinaryLoop("current-leaf")]);
+		const { pi } = install({ ctx });
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		assert.match(
+			lastInquiry(pi)?.content ?? "",
+			/Branch-scoped history recovery unavailable/,
+		);
+		assert.equal(pi.messages.length, 1);
+	}
+});
+
 test("queued second reflection dispatches after completed evidence is visible", async () => {
-	const ctx = context();
+	const ctx = context("root", { sessionFile: "/missing/queued-session.jsonl" });
 	const { pi } = install({ ctx });
-	const branch: any[] = [];
+	const branch: any[] = [
+		branchMessage(
+			{ role: "user", content: "Original request" },
+			"original-leaf",
+		),
+	];
+	ctx.setBranch(branch);
 	const originalAppendEntry = pi.appendEntry.bind(pi);
 	pi.appendEntry = (customType: string, data: unknown) => {
 		originalAppendEntry(customType, data);
-		branch.push({ type: "custom", customType, data });
+		branch.push({
+			type: "custom",
+			id: `saved-${branch.length}`,
+			customType,
+			data,
+		});
 		ctx.setBranch(branch);
 	};
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("first supplement", ctx);
 	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("second supplement", ctx);
+	const queuedAtLeaf = ctx.sessionManager.getLeafId();
 	await completeReflectionAttempt(pi, ctx, validNoIssue);
 
 	const inquiries = pi.messages.filter(({ message }) =>
@@ -1414,6 +1462,20 @@ test("queued second reflection dispatches after completed evidence is visible", 
 	assert.equal(inquiries.length, 2);
 	assert.match(inquiries[1]?.message.content ?? "", /Reason: sound/);
 	assert.match(inquiries[1]?.message.content ?? "", /second supplement/);
+	assert.notEqual(ctx.sessionManager.getLeafId(), queuedAtLeaf);
+	assert.ok(
+		inquiries[1]?.message.content.includes(
+			JSON.stringify({
+				sessionFile: ctx.sessionManager.getSessionFile(),
+				branchLeafId: ctx.sessionManager.getLeafId(),
+			}),
+		),
+		"history locator comes from dispatch, not the queued request",
+	);
+	assert.doesNotMatch(
+		JSON.stringify(pi.entries),
+		/historyLocator|sessionFile|branchLeafId/,
+	);
 	assert.deepEqual(pi.actions.slice(-4), [
 		"fold",
 		"entry:pi-reflect-watchdog:reflection",
@@ -1462,12 +1524,25 @@ test("surviving observer reclaims main and owns /reflect after shutdown", async 
 	assert.match(lastInquiry(observer.pi)?.content ?? "", /new owner/);
 });
 
-test("reflection tool budget blocks call eleven", async () => {
-	const { pi, ctx } = install();
+test("reflection tool budget and history hint stay shared across XML attempts", async () => {
+	const ctx = context("root", { sessionFile: "/missing/retry-session.jsonl" });
+	ctx.setBranch([ordinaryLoop("initial-anchor")]);
+	const { pi } = install({ ctx });
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await startReflectionRun(pi, ctx);
-	for (let index = 0; index < 10; index += 1)
+	const initialPrompt = lastInquiry(pi)?.content ?? "";
+	assert.match(initialPrompt, /initial-anchor/);
+	for (let index = 0; index < 5; index += 1)
+		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
+	ctx.setBranch([ordinaryLoop("later-anchor")]);
+	await completeReflectionAttempt(pi, ctx, "invalid XML");
+	await startReflectionRun(pi, ctx);
+	assert.doesNotMatch(
+		lastInquiry(pi)?.content ?? "",
+		/history locator|later-anchor/i,
+	);
+	for (let index = 0; index < 5; index += 1)
 		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
 	assert.deepEqual(await pi.emit("tool_call", {}, ctx), {
 		block: true,

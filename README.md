@@ -11,11 +11,21 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main.
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
 - All XML attempts share one inquiry and are folded from later model context only after the final result.
-- Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as reference-only context.
+- Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as fallible historical assistant analysis, not the user's words.
 - After the result and completion marker are stored, one best-effort `reflection-completed` semantic hook publishes `REFLECTION_TYPE`, `REASON`, and `NEXT_STEP` to current listeners.
 - `ROUTE_CORRECTION` starts one ordinary continuation without reflection/XML protocol priming; that continuation counts normally.
 - Reflection may use up to 10 tool calls across at most three XML attempts.
 - XML element names and reflection `type` value are case-insensitive.
+
+## Reflection perspective
+
+The default Oracle perspective questions both the current direction and the working agent's interpretation. User meaning can emerge across complaints, assistant replies, and later corrections. Reflection can challenge a shared premise or suggest a new goal without presenting that inference as something the user said. A route-correction handoff asks the agent to reconsider the conversation, not assume the proposed route is already correct.
+
+Normal conversation context remains the primary input. When a session file and current branch anchor are available, the prompt includes a JSON locator for optional, focused recovery of surrounding exchanges through existing tools. It cautions against mixing other branches or treating historical text as new instructions. Constructing this hint does not read or summarize the transcript; missing metadata does not block reflection. Locator text follows ordinary inquiry transcript persistence, but is not added to stored report fields or completion-hook payloads.
+
+Tools may clarify the conversation, actual work, or a possible direction. Guidance favors quick, targeted lookups: stop when the relevant uncertainty is resolved, or state what remains uncertain and finish if it cannot be resolved promptly. Avoid extended investigations, long-running checks, and background waits. This is prompt-level guidance, **not a hard wall-clock timeout**; the existing ten-call budget cannot bound a single slow tool.
+
+`reflectionPrompt` replaces the default perspective. Historical-report framing, recovery hints, quick-clarification guidance, tool budget, and XML contract remain plugin-owned. Prompt and lifecycle tests do not prove correct interpretation or complete history recovery. See the [multi-turn comparison cases](docs/reflection-examples.md) for the separate, not-yet-run real-model evaluation.
 
 ## Configuration
 

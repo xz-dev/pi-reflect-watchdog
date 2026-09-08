@@ -655,6 +655,10 @@ function beginReflection(runtime: Runtime, pending: PendingReflection): void {
 		runtime,
 		buildReflectionPrompt({
 			semanticPrefix: runtime.config.reflectionPrompt,
+			historyLocator: {
+				sessionFile: runtime.ctx?.sessionManager.getSessionFile(),
+				branchLeafId: runtime.ctx?.sessionManager.getLeafId() ?? null,
+			},
 			previousReflection:
 				previous === undefined
 					? undefined
@@ -717,11 +721,11 @@ function finishReflection(
 			{
 				customType: `${REFLECTION_INQUIRY_NAMESPACE}:route-correction`,
 				content: [
-					"Continue the current task using this corrected route.",
-					`Reason: ${decision.reason}`,
-					`Done: ${decision.done}`,
-					`Current step: ${decision.currentStep}`,
-					`Next step: ${decision.nextStep}`,
+					"Reconsider the current conversation using this perspective and choose the appropriate next response.",
+					`Observation: ${decision.reason}`,
+					`Reported progress: ${decision.done}`,
+					`Current focus: ${decision.currentStep}`,
+					`Suggested next step: ${decision.nextStep}`,
 				].join("\n"),
 				display: true,
 				details: { timestamp: active.timestamp, decision },
