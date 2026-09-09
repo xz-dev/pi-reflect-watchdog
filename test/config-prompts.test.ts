@@ -117,8 +117,12 @@ test("built-in reflection prompt preserves the Oracle persona and framing", () =
 		/Even if the current approach succeeds, will it solve the underlying problem\?/,
 	);
 	assert.match(DEFAULT_REFLECTION_PROMPT, /fear, inertia, sunk costs/);
-	assert.match(DEFAULT_REFLECTION_PROMPT, /Speak calmly, kindly, and directly/);
+	assert.match(
+		DEFAULT_REFLECTION_PROMPT,
+		/Your voice lives inside the structured answer fields you return: speak calmly, kindly, and directly there/,
+	);
 	assert.match(DEFAULT_REFLECTION_PROMPT, /short questions, simple analogies/);
+	assert.doesNotMatch(DEFAULT_REFLECTION_PROMPT, /^Speak calmly/m);
 	assert.match(
 		DEFAULT_REFLECTION_PROMPT,
 		/Distinguish facts from inference and uncertainty/,

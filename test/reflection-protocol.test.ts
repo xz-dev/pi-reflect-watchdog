@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	buildReflectionPrompt,
+	buildReflectionReaskPrompt,
 	DEFAULT_REFLECTION_PROMPT,
 	MAX_REFLECTION_TEXT_CHARACTERS,
 	parseReflectionXml,
@@ -118,6 +119,27 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 		/Do not.*extended investigation.*long-running checks.*wait on background work/,
 	);
 	assert.match(prompt, /<next_step>suggested next step<\/next_step>/);
+	assert.match(
+		prompt,
+		/Your entire response must be exactly one <reflection>\.\.\.<\/reflection> XML document, with no text before or after it/,
+	);
+	assert.match(
+		prompt,
+		/express all observations and reasoning inside the five fields/,
+	);
+	assert.doesNotMatch(prompt, /End the response with|[Tt]railing/);
+});
+
+test("reask prompt demands the entire-response XML contract", () => {
+	const reask = buildReflectionReaskPrompt(
+		"reflection type must be NO_ISSUE or ROUTE_CORRECTION",
+	);
+	assert.match(
+		reask,
+		/entire response must be exactly one valid <reflection> XML document with no text before or after it/,
+	);
+	assert.match(reask, /tool-call budget remains in force/);
+	assert.doesNotMatch(reask, /[Tt]railing/);
 });
 
 test("history recovery is optional, branch-scoped JSON data", () => {
