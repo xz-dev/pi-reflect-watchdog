@@ -25,4 +25,4 @@
 
 - [x] 5.1 Update README with queued/cancel behavior, config key, and why customization lives in the plugin config (no namespaced extension keybinding ids in Pi); verify docs render and examples match defaults
 - [x] 5.2 Run `npm run check` and fix all findings before commit
-- [ ] 5.3 Manual smoke on stock Pi (no downstream patches): busy → `/reflect` queued → cancel shortcut → no inquiry; busy → queued → settle → reflection runs once; verify observed behavior matches spec scenarios
+- [x] 5.3 Manual smoke on stock Pi (no downstream patches): busy → `/reflect` queued → cancel shortcut → no inquiry; busy → queued → settle → reflection runs once; verify observed behavior matches spec scenarios
