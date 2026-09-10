@@ -21,6 +21,8 @@ export interface WidgetState {
 	allLoops: number;
 	allLoopLimit: number;
 	cooldownRemainingLoops?: number;
+	/** Set while a manual reflection is queued: effective cancel key or /cancel-reflect. */
+	queuedCancelLabel?: string;
 }
 
 export function formatDuration(ms: number): string {
@@ -38,7 +40,10 @@ export function formatWidgetText(state: WidgetState): string {
 		` | active ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops} loops` +
 		` · task ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
 		` · root ${state.rootLoops}/${state.rootLoopLimit}` +
-		` · all ${state.allLoops}/${state.allLoopLimit}`
+		` · all ${state.allLoops}/${state.allLoopLimit}` +
+		(state.queuedCancelLabel !== undefined
+			? ` · queued · ${state.queuedCancelLabel} to cancel`
+			: "")
 	);
 }
 
@@ -48,7 +53,10 @@ export function formatCompactWidgetText(state: WidgetState): string {
 		` | a ${formatDuration(state.activity.elapsedMs)}/${state.activity.loops}` +
 		` · t ${formatDuration(state.taskElapsedMs)}/${state.taskMinutes}m` +
 		` · r ${state.rootLoops}/${state.rootLoopLimit}` +
-		` · all ${state.allLoops}/${state.allLoopLimit}`
+		` · all ${state.allLoops}/${state.allLoopLimit}` +
+		(state.queuedCancelLabel !== undefined
+			? ` · q ${state.queuedCancelLabel}`
+			: "")
 	);
 }
 

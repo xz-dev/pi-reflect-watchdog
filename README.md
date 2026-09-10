@@ -8,7 +8,7 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - Only successful assistant `turn_end` outcomes count: `stop` and `toolUse`.
 - `error`, `aborted`, `length`, `pending`, `deferred`, and unknown outcomes do not count.
 - Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.
-- `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main.
+- `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main. Invoked while the agent is busy, the request first waits in a plugin-side queue and dispatches when the agent settles; while queued it can be withdrawn with the cancel shortcut (default `alt+x`) or `/cancel-reflect`, and the status row shows the queued state with the effective cancel gesture. Repeating `/reflect` while one request is queued keeps the first request. Invoked while idle, the reflection starts immediately as before.
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
 - All XML attempts share one inquiry and are folded from later model context only after the final result.
 - Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as fallible historical assistant analysis, not the user's words.
@@ -57,7 +57,8 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
   "reflectionPrompt": "Reassess the current route using verified evidence.",
   "hookPauses": [
     { "pause": "inquiry-started", "resume": "inquiry-finished" }
-  ]
+  ],
+  "cancelShortcut": "alt+x"
 }
 ```
 
@@ -69,12 +70,20 @@ Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values o
 
 Runtime reset, dynamic limit controls, history/timeline tools, public pause APIs, and pause/resume commands are intentionally removed. Config-driven semantic-hook pauses are the only external counting control.
 
+`cancelShortcut` is a Pi key id string (default `"alt+x"`) or `false` to disable the cancel shortcut entirely; `/cancel-reflect` works regardless. Invalid values fall back to the default with a bounded startup diagnostic. Pi offers no namespaced keybinding ids for extension shortcuts, so the key lives in this plugin's own configuration rather than `keybindings.json`; conflicts with built-ins or other extensions surface through Pi's native startup diagnostics. The status row and notifications always render the effective merged value, so a customized key is what you see.
+
 ## TUI
 
 Below-editor live row uses same `setWidget`/`requestRender` pattern as Continue Watchdog:
 
 ```text
 Reflect Watchdog | active 12m40s/137 loops · task 12m40s/30m · root 37/100 · all 128/500
+```
+
+While a manual reflection waits in the queue, the row gains the cancel gesture:
+
+```text
+Reflect Watchdog | active 12m40s/137 loops · task 12m40s/30m · root 37/100 · all 128/500 · queued · alt+x to cancel
 ```
 
 When terminal is narrow it switches to compact form before final truncation:

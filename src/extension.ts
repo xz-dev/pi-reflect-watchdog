@@ -1,12 +1,11 @@
 import type {
 	ExtensionAPI,
-	ExtensionCommandContext,
 	ExtensionContext,
 	MessageEndEvent,
 	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, type KeyId, Text } from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	createInquiryRuntime,
@@ -59,6 +58,7 @@ import {
 
 const STATUS_KEY = "pi-reflect-watchdog";
 const REFLECT_COMMAND = "reflect";
+const CANCEL_REFLECT_COMMAND = "cancel-reflect";
 const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
 const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
@@ -740,6 +740,8 @@ function statusState(runtime: Runtime): WidgetState {
 		allLoops: safeNumber(counters?.allLoops.value),
 		allLoopLimit: runtime.config.allLoopLimit,
 		cooldownRemainingLoops: currentCooldown(runtime).remainingLoops,
+		queuedCancelLabel:
+			runtime.manualQueue.length > 0 ? cancelLabel(runtime) : undefined,
 	};
 }
 
@@ -861,8 +863,13 @@ function beginReflection(runtime: Runtime, pending: PendingReflection): void {
 
 function maybeDispatch(runtime: Runtime): void {
 	if (!safeToDispatch(runtime)) return;
-	const manual = runtime.manualQueue.shift();
+	const manual = runtime.manualQueue[0];
 	if (manual !== undefined) {
+		// Manual reflections never dispatch into a busy window. The probe is
+		// live because a settle -> new run race must not leak a dispatch; the
+		// request simply waits for the next settle instead.
+		if (probePiAgentState(runtime.ctx as ExtensionContext).busy) return;
+		runtime.manualQueue.shift();
 		beginReflection(runtime, manual);
 		return;
 	}
@@ -880,17 +887,43 @@ function maybeDispatch(runtime: Runtime): void {
 	beginReflection(runtime, automatic);
 }
 
-function queueManualReflection(runtime: Runtime, supplement?: string): void {
-	if (!owns(runtime)) return;
+type ManualQueueOutcome = "ignored" | "coalesced" | "queued" | "dispatched";
+
+function queueManualReflection(
+	runtime: Runtime,
+	supplement?: string,
+): ManualQueueOutcome {
+	if (!owns(runtime)) return "ignored";
+	if (runtime.manualQueue.length > 0) return "coalesced";
 	runtime.reflectionSequence += 1;
-	runtime.manualQueue.push({
+	const pending: PendingReflection = {
 		id: runtime.reflectionSequence,
 		reasons: ["USER_REQUEST"],
 		thresholds: thresholdSnapshot(runtime),
 		userSupplement: supplement,
 		timestamp: localTimestamp(),
-	});
+	};
+	runtime.manualQueue.push(pending);
 	maybeDispatch(runtime);
+	refreshWidget(runtime);
+	return runtime.manualQueue.includes(pending) ? "queued" : "dispatched";
+}
+
+function cancelLabel(runtime: Runtime): string {
+	return runtime.config.cancelShortcut === false
+		? `/${CANCEL_REFLECT_COMMAND}`
+		: runtime.config.cancelShortcut;
+}
+
+function cancelQueuedReflection(runtime: Runtime): void {
+	const ui = runtime.ctx?.ui;
+	if (runtime.manualQueue.length === 0) {
+		ui?.notify("No queued reflection to cancel.", "info");
+		return;
+	}
+	runtime.manualQueue = [];
+	refreshWidget(runtime);
+	ui?.notify("Queued reflection cancelled.", "info");
 }
 
 // Queue dispatch is deliberately caller-owned so completed evidence can be
@@ -942,10 +975,7 @@ function observe(runtime: Runtime, ctx: ExtensionContext): void {
 	refreshWidget(runtime);
 }
 
-function commandIsCurrent(
-	runtime: Runtime,
-	ctx: ExtensionCommandContext,
-): boolean {
+function commandIsCurrent(runtime: Runtime, ctx: ExtensionContext): boolean {
 	return (
 		owns(runtime) &&
 		runtime.ctx !== null &&
@@ -1091,8 +1121,27 @@ export function createWatchdogExtension(
 				"Queue an immediate reflection with optional user supplement",
 			handler: async (args, ctx) => {
 				if (!commandIsCurrent(runtime, ctx)) return;
-				queueManualReflection(runtime, args.trim() || undefined);
-				ctx.ui.notify("Reflection queued.", "info");
+				const outcome = queueManualReflection(
+					runtime,
+					args.trim() || undefined,
+				);
+				if (outcome === "ignored") return;
+				if (outcome === "coalesced")
+					ctx.ui.notify("A reflection is already queued.", "info");
+				else if (outcome === "queued")
+					ctx.ui.notify(
+						`Reflection queued · ${cancelLabel(runtime)} to cancel`,
+						"info",
+					);
+				else ctx.ui.notify("Reflection queued.", "info");
+			},
+		});
+
+		pi.registerCommand(CANCEL_REFLECT_COMMAND, {
+			description: "Cancel a queued manual reflection before it starts",
+			handler: async (_args, ctx) => {
+				if (!commandIsCurrent(runtime, ctx)) return;
+				cancelQueuedReflection(runtime);
 			},
 		});
 
@@ -1163,6 +1212,14 @@ export function createWatchdogExtension(
 				runtime.config.idleResetGapSeconds,
 			);
 			runtime.configReady = true;
+			if (runtime.config.cancelShortcut !== false)
+				pi.registerShortcut(runtime.config.cancelShortcut as KeyId, {
+					description: "Cancel queued reflection (pi-reflect-watchdog)",
+					handler: (shortcutCtx) => {
+						if (commandIsCurrent(runtime, shortcutCtx))
+							cancelQueuedReflection(runtime);
+					},
+				});
 			for (const diagnostic of loaded.diagnostics.slice(0, 3))
 				ctx.ui.notify(
 					`pi-reflect-watchdog ${diagnostic.source}: ${diagnostic.message}`,
@@ -1248,9 +1305,19 @@ export function createWatchdogExtension(
 
 		pi.on("agent_end", () => {});
 		pi.on("agent_settled", (_event, ctx) => {
+			// Identity guard: observe() can synchronously cascade through the hub
+			// into syncOwnership -> maybeDispatch and dispatch a queued manual
+			// reflection. That newborn reflection has no result yet and must not
+			// be treated as the settled run's reflection below; only the active
+			// reflection present at handler entry belongs to this settlement.
+			const activeAtEntry = runtime.activeReflection;
 			observe(runtime, ctx);
 			const active = runtime.activeReflection;
-			if (active !== undefined && runtime.internalRun.kind !== "none") {
+			if (
+				active !== undefined &&
+				active === activeAtEntry &&
+				runtime.internalRun.kind !== "none"
+			) {
 				const planned = active.planned;
 				runtime.internalRun = { kind: "none" };
 				if (planned !== undefined && "error" in planned) {

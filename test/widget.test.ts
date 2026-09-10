@@ -149,3 +149,39 @@ test("component re-reads live state on every render", () => {
 	elapsed = 2_000;
 	assert.match(widget.render(200)[0], /active 2s\/1 loops/);
 });
+
+test("queued reflection appends the effective cancel label to full and compact rows", () => {
+	const state: WidgetState = {
+		activity: { active: true, elapsedMs: 5_000, loops: 2 },
+		taskElapsedMs: 5_000,
+		taskMinutes: 30,
+		rootLoops: 2,
+		rootLoopLimit: 100,
+		allLoops: 2,
+		allLoopLimit: 500,
+		queuedCancelLabel: "alt+x",
+	};
+	assert.equal(
+		formatWidgetText(state),
+		"Reflect Watchdog | active 5s/2 loops · task 5s/30m · root 2/100 · all 2/500 · queued · alt+x to cancel",
+	);
+	assert.match(formatCompactWidgetText(state), /· q alt\+x$/);
+});
+
+test("disabled shortcut surfaces the cancel command in the queued segment", () => {
+	const state: WidgetState = {
+		activity: { active: true, elapsedMs: 5_000, loops: 2 },
+		taskElapsedMs: 5_000,
+		taskMinutes: 30,
+		rootLoops: 2,
+		rootLoopLimit: 100,
+		allLoops: 2,
+		allLoopLimit: 500,
+		queuedCancelLabel: "/cancel-reflect",
+	};
+	assert.match(
+		formatWidgetText(state),
+		/· queued · \/cancel-reflect to cancel$/,
+	);
+	assert.match(formatCompactWidgetText(state), /· q \/cancel-reflect$/);
+});

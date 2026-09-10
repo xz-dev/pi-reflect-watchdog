@@ -47,6 +47,11 @@ class Pi {
 	readonly messages: Array<{ message: any; options: any }> = [];
 	readonly entries: Array<{ customType: string; data: unknown }> = [];
 	readonly actions: string[] = [];
+	readonly shortcuts: Array<{
+		key: string;
+		description?: string;
+		handler: (ctx: any) => any;
+	}> = [];
 
 	readonly events = {
 		on: (channel: string, handler: (data: unknown) => void) => {
@@ -66,6 +71,10 @@ class Pi {
 
 	registerCommand(name: string, command: any) {
 		this.commands.push({ name, handler: command.handler });
+	}
+
+	registerShortcut(key: string, options: any) {
+		this.shortcuts.push({ key, ...options });
 	}
 
 	registerMessageRenderer() {}
@@ -325,6 +334,7 @@ const config: WatchdogConfig = {
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 	hookPauses: [],
+	cancelShortcut: "alt+x",
 };
 
 function install(
@@ -682,6 +692,13 @@ test("automatic Reflect is consumed during cooldown while manual Reflect bypasse
 		1,
 	);
 	await pi.commands[0]?.handler("manual bypass", ctx);
+	assert.equal(
+		lastInquiry(pi),
+		undefined,
+		"busy manual reflection waits in the queue",
+	);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
 	assert.match(lastInquiry(pi)?.content ?? "", /manual bypass/);
 });
 
@@ -708,6 +725,13 @@ test("paired semantic hooks nest independently, overlap, and keep manual reflect
 	assert.equal(lastInquiry(pi), undefined);
 
 	await pi.commands[0]?.handler("manual during pause", ctx);
+	assert.equal(
+		lastInquiry(pi),
+		undefined,
+		"busy manual reflection waits in the queue",
+	);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
 	assert.match(lastInquiry(pi)?.content ?? "", /USER_REQUEST/);
 	const manualCount = pi.messages.length;
 	publishHook(pi, "inquiry-finished");
@@ -849,12 +873,12 @@ test("observer shutdown preserves owner pause until final domain detach", async 
 	);
 });
 
-test("minimal core exposes only /reflect and no model tools", async () => {
+test("minimal core exposes only /reflect, /cancel-reflect and no model tools", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	assert.deepEqual(
 		pi.commands.map((command) => command.name),
-		["reflect"],
+		["reflect", "cancel-reflect"],
 	);
 	assert.equal("registerTool" in pi, false);
 });
@@ -1450,6 +1474,10 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 					await pi.emit("agent_start", {}, ctx);
 				}
 				await pi.commands[0]?.handler("check clarified request", ctx);
+				if (trigger === "busy-manual") {
+					ctx.setIdle(true);
+					await pi.emit("agent_settled", {}, ctx);
+				}
 			} else {
 				ctx.setIdle(false);
 				await pi.emit("agent_start", {}, ctx);
@@ -2461,4 +2489,175 @@ test("reflection tool budget and history hint stay shared across XML attempts", 
 		block: true,
 		reason: "Reflection tool-call budget exhausted.",
 	});
+});
+
+test("busy manual reflection queues until settle and dispatches exactly once", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("queued supplement", ctx);
+	assert.equal(lastInquiry(pi), undefined, "no inquiry while busy");
+	assert.ok(
+		ctx.notifications.includes("Reflection queued · alt+x to cancel"),
+		"queued notification names the effective cancel key",
+	);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	const inquiries = pi.messages.filter(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry"),
+	);
+	assert.equal(inquiries.length, 1, "settle dispatches the queued request");
+	assert.match(inquiries[0]?.message.content ?? "", /queued supplement/);
+	assert.match(inquiries[0]?.message.content ?? "", /USER_REQUEST/);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"a repeated settlement observation starts no second reflection",
+	);
+});
+
+test("duplicate /reflect while queued coalesces and keeps the first supplement", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("first supplement", ctx);
+	await pi.commands[0]?.handler("second supplement", ctx);
+	assert.ok(
+		ctx.notifications.includes("A reflection is already queued."),
+		"duplicate invocation is reported",
+	);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	const inquiries = pi.messages.filter(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry"),
+	);
+	assert.equal(inquiries.length, 1);
+	assert.match(inquiries[0]?.message.content ?? "", /first supplement/);
+	assert.doesNotMatch(inquiries[0]?.message.content ?? "", /second supplement/);
+});
+
+test("/cancel-reflect discards the queued request and it never dispatches", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("withdrawn", ctx);
+	await pi.commands[1]?.handler("", ctx);
+	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		lastInquiry(pi),
+		undefined,
+		"cancelled request never sends an inquiry",
+	);
+});
+
+test("/cancel-reflect with empty queue no-ops and never touches an active reflection", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[1]?.handler("", ctx);
+	assert.ok(ctx.notifications.includes("No queued reflection to cancel."));
+	await pi.commands[0]?.handler("active run", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.commands[1]?.handler("", ctx);
+	assert.equal(
+		ctx.notifications.filter(
+			(message) => message === "No queued reflection to cancel.",
+		).length,
+		2,
+		"cancel with an active reflection and empty queue stays a no-op",
+	);
+	const captured = await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.ok(captured, "the active reflection completes unaffected");
+});
+
+test("cancel shortcut registers from config and cancels; false disables registration", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	assert.equal(pi.shortcuts.length, 1);
+	assert.equal(pi.shortcuts[0]?.key, "alt+x");
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("shortcut target", ctx);
+	await pi.shortcuts[0]?.handler(ctx);
+	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(lastInquiry(pi), undefined);
+
+	const disabled = install({ limits: { cancelShortcut: false } });
+	await disabled.pi.emit("session_start", {}, disabled.ctx);
+	assert.equal(
+		disabled.pi.shortcuts.length,
+		0,
+		"false disables shortcut registration",
+	);
+	disabled.ctx.setIdle(false);
+	await disabled.pi.emit("agent_start", {}, disabled.ctx);
+	await disabled.pi.commands[0]?.handler("still queued", disabled.ctx);
+	assert.ok(
+		disabled.ctx.notifications.includes(
+			"Reflection queued · /cancel-reflect to cancel",
+		),
+		"disabled shortcut falls back to the command name in the notification",
+	);
+	await disabled.pi.commands[1]?.handler("", disabled.ctx);
+	assert.ok(
+		disabled.ctx.notifications.includes("Queued reflection cancelled."),
+		"/cancel-reflect still cancels when the shortcut is disabled",
+	);
+});
+
+test("queued state surfaces in the status text and clears on dispatch and cancel", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("visible", ctx);
+	assert.match(
+		ctx.statuses.filter(Boolean).at(-1) ?? "",
+		/· queued · alt\+x to cancel$/,
+		"status row shows the queued state with the effective key",
+	);
+	await pi.commands[1]?.handler("", ctx);
+	assert.doesNotMatch(
+		ctx.statuses.filter(Boolean).at(-1) ?? "",
+		/queued/,
+		"status clears on cancel",
+	);
+	await pi.commands[0]?.handler("visible again", ctx);
+	assert.match(
+		ctx.statuses.filter(Boolean).at(-1) ?? "",
+		/· queued · alt\+x to cancel$/,
+	);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(lastInquiry(pi));
+	assert.doesNotMatch(
+		ctx.statuses.filter(Boolean).at(-1) ?? "",
+		/queued/,
+		"status clears on dispatch",
+	);
+});
+
+test("queued manual reflection is discarded on session shutdown", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("doomed", ctx);
+	await pi.emit("session_shutdown", {}, ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		lastInquiry(pi),
+		undefined,
+		"no inquiry after the session is torn down",
+	);
 });

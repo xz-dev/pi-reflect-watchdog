@@ -129,3 +129,31 @@ test("built-in reflection prompt preserves the Oracle persona and framing", () =
 	);
 	assert.match(DEFAULT_REFLECTION_PROMPT, /Prioritize the one insight/);
 });
+
+test("cancelShortcut accepts a key id or false, falls back with a bounded diagnostic otherwise", () => {
+	assert.equal(BUILT_IN_CONFIG.cancelShortcut, "alt+x");
+	assert.equal(
+		mergeConfig({ cancelShortcut: "alt+z" }).config.cancelShortcut,
+		"alt+z",
+	);
+	assert.equal(
+		mergeConfig({ cancelShortcut: false }).config.cancelShortcut,
+		false,
+	);
+	assert.equal(
+		mergeConfig({ cancelShortcut: "alt+z" }, { cancelShortcut: false }).config
+			.cancelShortcut,
+		false,
+		"project layer overrides global like every other field",
+	);
+	for (const invalid of [42, "", null, true, ["alt+x"]]) {
+		const result = mergeConfig({ cancelShortcut: invalid });
+		assert.equal(
+			result.config.cancelShortcut,
+			BUILT_IN_CONFIG.cancelShortcut,
+			`invalid value ${JSON.stringify(invalid)} falls back to the default`,
+		);
+		assert.equal(result.diagnostics.length, 1);
+		assert.ok(result.diagnostics[0]?.message.length <= 240);
+	}
+});

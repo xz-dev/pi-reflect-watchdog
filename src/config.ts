@@ -13,6 +13,8 @@ export interface WatchdogConfig {
 	idleResetGapSeconds: number;
 	reflectionPrompt: string;
 	hookPauses: readonly HookPausePair[];
+	/** Key binding for cancelling a queued manual reflection, or false to disable. */
+	cancelShortcut: string | false;
 }
 
 export type ConfigInput = Record<string, unknown>;
@@ -39,6 +41,7 @@ export const BUILT_IN_CONFIG: Readonly<WatchdogConfig> = Object.freeze({
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 	hookPauses: Object.freeze([]),
+	cancelShortcut: "alt+x",
 });
 
 const MAX_DIAGNOSTIC_LENGTH = 240;
@@ -199,6 +202,18 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 		if (parsed.pairs !== undefined) config.hookPauses = parsed.pairs;
 	}
 
+	if (input.cancelShortcut !== undefined) {
+		if (input.cancelShortcut === false || template(input.cancelShortcut))
+			config.cancelShortcut = input.cancelShortcut;
+		else
+			diagnostics.push(
+				diagnostic(
+					source,
+					"cancelShortcut must be a non-empty key id string or false",
+				),
+			);
+	}
+
 	return { config, diagnostics };
 }
 
@@ -238,6 +253,8 @@ export function mergeConfig(
 			config.reflectionPrompt = partial.reflectionPrompt;
 		if (partial.hookPauses !== undefined)
 			config.hookPauses = partial.hookPauses.slice();
+		if (partial.cancelShortcut !== undefined)
+			config.cancelShortcut = partial.cancelShortcut;
 	}
 
 	return { config, diagnostics: layers.flatMap((layer) => layer.diagnostics) };
