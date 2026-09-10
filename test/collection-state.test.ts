@@ -106,6 +106,7 @@ test("retained reconnect restores loop delta but never backfills offline time", 
 		generation: 0n,
 		paused: false,
 		anyBusy: true,
+		phase: "collecting",
 		activeMs: 2_000n,
 		activeLoops: 5n,
 		taskMs: 2_000n,
@@ -230,6 +231,97 @@ test("pause generation crossing discards disconnected loop delta", () => {
 	assert.equal(snapshot.activeMs, 2_000n);
 });
 
+test("grace phase: main stop while subagent busy keeps collecting", () => {
+	// Lean: main_stop_not_all_stop — with ≥2 busy contributors, one leaving
+	// must not flip the aggregate out of collecting.
+	let state = createCollectionState();
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "subagent",
+		busy: true,
+		atMs: 1_000,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: false,
+		atMs: 2_000,
+	});
+	const snapshot = snapshotCollectionState(state);
+	assert.equal(snapshot.phase, "collecting");
+	assert.equal(snapshot.anyBusy, true);
+	assert.equal(snapshot.busyContributors, 1);
+});
+
+test("grace phase: last busy stop opens grace, fence expiry settles idle", () => {
+	// Lean: last_busy_enters_grace + grace_expires_to_idle — the last
+	// contributor stopping opens grace at the true all-idle instant, and
+	// only a fence-expired observation settles to idle with idleSince pinned
+	// at that instant.
+	let state = createCollectionState();
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: false,
+		atMs: 5_000,
+	});
+	// Still inside the fence: grace, not idle, and the active interval was
+	// cut at the true all-idle instant (5_000).
+	let snapshot = snapshotCollectionState(state, 10_000);
+	assert.equal(snapshot.phase, "grace");
+	assert.equal(snapshot.anyBusy, false);
+	assert.equal(snapshot.activeMs, 5_000n);
+	// A tick past the fence settles to idle.
+	state = reduceCollectionState(state, {
+		type: "tick",
+		atMs: 16_000,
+	});
+	snapshot = snapshotCollectionState(state);
+	assert.equal(snapshot.phase, "idle");
+	assert.equal(snapshot.activeMs, 5_000n);
+});
+
+test("grace phase: re-busy inside fence loses no active time", () => {
+	// Lean: no_active_loss_in_grace — a contributor rejoining inside the
+	// fence resumes the active interval instead of resetting the cycle.
+	let state = createCollectionState();
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: false,
+		atMs: 4_000,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "subagent",
+		busy: true,
+		atMs: 8_000,
+	});
+	const snapshot = snapshotCollectionState(state, 12_000);
+	assert.equal(snapshot.phase, "collecting");
+	// 0–4000 collecting + 8000–12000 collecting; the 4s grace gap between
+	// true idle and re-busy is not counted as active.
+	assert.equal(snapshot.activeMs, 8_000n);
+});
+
 test("idle reset preserves exactly sixty seconds and resets only after overflow", () => {
 	let state = createCollectionState({ idleResetGapMs: 60_000 });
 	state = reduceCollectionState(state, {
@@ -249,6 +341,13 @@ test("idle reset preserves exactly sixty seconds and resets only after overflow"
 		busy: false,
 		atMs: 100,
 	});
+	// grace opens at 100; a tick past the fence settles to idle
+	// with idleSince pinned at the true all-idle instant (100).
+	state = reduceCollectionState(state, {
+		type: "tick",
+		atMs: 10_200,
+	});
+	assert.equal(snapshotCollectionState(state).phase, "idle");
 	state = reduceCollectionState(state, {
 		type: "local-activity",
 		contributorId: "root",
@@ -262,6 +361,10 @@ test("idle reset preserves exactly sixty seconds and resets only after overflow"
 		contributorId: "root",
 		busy: false,
 		atMs: 60_200,
+	});
+	state = reduceCollectionState(state, {
+		type: "tick",
+		atMs: 70_300,
 	});
 	state = reduceCollectionState(state, {
 		type: "local-activity",

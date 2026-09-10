@@ -700,6 +700,12 @@ export function createReflectDomainCoordinator(
 				!snapshotCollectionState(collectionState, now()).anyBusy
 			)
 				return;
+			// Host heartbeat: drive the phase machine and the sleep freeze so a
+			// suspended interval is never counted as active (Lean: heartbeat).
+			collectionState = reduceCollectionState(collectionState, {
+				type: "tick",
+				atMs: now(),
+			});
 			void publishHost().catch(() => {});
 			scheduleTick();
 		}, activeTickMs);

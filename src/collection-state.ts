@@ -1,5 +1,17 @@
 export const CHECKPOINT_REPLAY_RETENTION_MS = 10_000;
 
+/**
+ * Grace fence after the last busy contributor goes idle before the machine
+ * settles to idle. Mirrors pi-continue-watchdog's inquiry fence and the
+ * formally verified model in
+ * docs/programming-thinking/reflect-activity-state-machine.idea.lean.
+ */
+export const GRACE_FENCE_MS = 10_000;
+
+/** Host heartbeat period and sleep-detection gap (Lean: BEAT_MS/SLEEP_GAP_MS). */
+export const HEARTBEAT_MS = 5_000;
+export const SLEEP_GAP_MS = 10_000;
+
 interface PeerContributor {
 	readonly kind: "peer";
 	readonly contributorId: string;
@@ -43,6 +55,7 @@ export interface CollectionAccounting {
 	readonly activeSinceMs: number | null;
 	readonly taskSinceMs: number | null;
 	readonly idleSinceMs: number | null;
+	readonly graceSinceMs: number | null;
 }
 
 export interface CollectionState {
@@ -57,6 +70,7 @@ export interface CollectionSnapshot {
 	readonly generation: bigint;
 	readonly paused: boolean;
 	readonly anyBusy: boolean;
+	readonly phase: "idle" | "collecting" | "grace";
 	readonly activeMs: bigint;
 	readonly activeLoops: bigint;
 	readonly taskMs: bigint;
@@ -116,6 +130,7 @@ export type CollectionEvent =
 			readonly paused: boolean;
 			readonly atMs: number;
 	  }
+	| { readonly type: "tick"; readonly atMs: number }
 	| { readonly type: "reminder-accepted"; readonly atMs: number };
 
 function localContributorKey(contributorId: string): string {
@@ -202,12 +217,15 @@ function withLive(
 ): CollectionState {
 	const wasBusy = busyCount(state.live) > 0;
 	const isBusy = busyCount(live) > 0;
+	const inGrace = state.accounting.graceSinceMs !== null;
 	let accounting = settleAccounting(state.accounting, atMs);
 
 	if (accounting.paused) {
 		return { ...state, nowMs: atMs, live: new Map(), ledger, accounting };
 	}
-	if (!wasBusy && isBusy) {
+	if (!wasBusy && !inGrace && isBusy) {
+		// idle -> collecting: reopen the active interval; a long idle gap
+		// resets counters only, never timestamps beyond the reopen.
 		if (
 			accounting.idleSinceMs !== null &&
 			atMs > accounting.idleSinceMs + state.idleResetGapMs
@@ -218,20 +236,49 @@ function withLive(
 			activeSinceMs: atMs,
 			taskSinceMs: atMs,
 			idleSinceMs: null,
+			graceSinceMs: null,
+		};
+	} else if (inGrace && isBusy) {
+		// grace -> collecting: a contributor rejoined inside the fence, so the
+		// aggregate never truly went idle; reopen the interval with no loss.
+		accounting = {
+			...accounting,
+			activeSinceMs: atMs,
+			taskSinceMs: atMs,
+			idleSinceMs: null,
+			graceSinceMs: null,
 		};
 	} else if (wasBusy && !isBusy) {
+		// collecting -> grace: the last busy contributor stopped, but the
+		// aggregate may pick up again (e.g. a subagent checkpoint landing after
+		// the main model settled). Cut the active interval at the true
+		// all-idle instant and open grace instead of settling immediately.
 		accounting = {
 			...accounting,
 			activeSinceMs: null,
 			taskSinceMs: null,
-			idleSinceMs: atMs,
+			idleSinceMs: null,
+			graceSinceMs: atMs,
 		};
+	} else if (inGrace && !isBusy) {
+		// grace -> idle: only after the fence elapsed with zero contributors.
+		const graceSinceMs = accounting.graceSinceMs as number;
+		if (atMs - graceSinceMs > GRACE_FENCE_MS) {
+			accounting = {
+				...accounting,
+				activeSinceMs: null,
+				taskSinceMs: null,
+				idleSinceMs: graceSinceMs,
+				graceSinceMs: null,
+			};
+		}
 	} else if (!isBusy) {
 		accounting = {
 			...accounting,
 			activeSinceMs: null,
 			taskSinceMs: null,
 			idleSinceMs: accounting.idleSinceMs ?? atMs,
+			graceSinceMs: null,
 		};
 	}
 	return { ...state, nowMs: atMs, live, ledger, accounting };
@@ -339,6 +386,7 @@ export function createCollectionState(
 			activeSinceMs: null,
 			taskSinceMs: null,
 			idleSinceMs: null,
+			graceSinceMs: null,
 		},
 	};
 }
@@ -479,6 +527,7 @@ export function reduceCollectionState(
 					pausedAtMs: atMs,
 					activeSinceMs: null,
 					taskSinceMs: null,
+					graceSinceMs: null,
 				};
 			} else {
 				const pausedDuration =
@@ -490,6 +539,7 @@ export function reduceCollectionState(
 					pausedAtMs: null,
 					activeSinceMs: null,
 					taskSinceMs: null,
+					graceSinceMs: null,
 					idleSinceMs:
 						accounting.idleSinceMs === null
 							? null
@@ -503,6 +553,36 @@ export function reduceCollectionState(
 				ledger: new Map(),
 				accounting,
 			};
+		}
+		case "tick": {
+			// Host heartbeat (Lean: advance/heartbeat). Detect sleep by the gap
+			// since the previous tick and freeze open timestamps forward so the
+			// slept wall time is never counted; then drive the phase machine so a
+			// fence-expired grace settles to idle even when no other event lands.
+			if (state.accounting.paused) return { ...state, nowMs: atMs };
+			// Sleep freeze (Lean: sleep_freeze_exact, precondition collecting):
+			// only an OPEN active interval loses wall time when the host sleeps,
+			// so only then is the gap since the last proof-of-life frozen. A gap
+			// while idle or in grace is just quiet time and shifts nothing.
+			const gap = atMs - state.nowMs;
+			let accounting = state.accounting;
+			if (accounting.activeSinceMs !== null && gap > SLEEP_GAP_MS) {
+				const shift = gap - HEARTBEAT_MS;
+				accounting = {
+					...accounting,
+					activeSinceMs: accounting.activeSinceMs + shift,
+					taskSinceMs:
+						accounting.taskSinceMs === null
+							? null
+							: accounting.taskSinceMs + shift,
+				};
+			}
+			return withLive(
+				{ ...state, accounting },
+				new Map(state.live),
+				pruneLedger(state.ledger, atMs),
+				atMs,
+			);
 		}
 		case "reminder-accepted": {
 			let accounting = settleAccounting(state.accounting, atMs);
@@ -531,10 +611,18 @@ export function snapshotCollectionState(
 	const nowMs = validTime(atMs) ? Math.max(state.nowMs, atMs) : state.nowMs;
 	const accounting = settleAccounting(state.accounting, nowMs);
 	const busyContributors = busyCount(state.live);
+	const phase = accounting.paused
+		? "idle"
+		: busyContributors > 0
+			? "collecting"
+			: accounting.graceSinceMs !== null
+				? "grace"
+				: "idle";
 	return {
 		generation: accounting.generation,
 		paused: accounting.paused,
 		anyBusy: !accounting.paused && busyContributors > 0,
+		phase,
 		activeMs: accounting.activeMs,
 		activeLoops: accounting.activeLoops,
 		taskMs: accounting.taskMs,
