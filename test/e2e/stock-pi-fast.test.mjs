@@ -180,7 +180,7 @@ function warningPlan({ requestIndex, request: { body } }) {
 	};
 }
 
-test("the installed packed tarball loads dist with only the reflect command", async (t) => {
+test("the installed packed tarball loads dist with only the reflect commands", async (t) => {
 	assertStockPi();
 	const resources = await createTestResources(t);
 	const isolated = await createIsolatedEnvironment(resources.base);
@@ -209,8 +209,9 @@ test("the installed packed tarball loads dist with only the reflect command", as
 			.filter((command) =>
 				command.sourceInfo?.path?.includes("pi-reflect-watchdog"),
 			)
-			.map((command) => command.name),
-		["reflect"],
+			.map((command) => command.name)
+			.sort(),
+		["cancel-reflect", "reflect"],
 	);
 });
 
