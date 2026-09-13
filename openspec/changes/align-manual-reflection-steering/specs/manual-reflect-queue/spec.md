@@ -1,10 +1,12 @@
-# manual-reflect-queue Specification
+## REMOVED Requirements
 
-## Purpose
+### Requirement: Busy manual reflections queue until the agent settles
 
-Submits user-invoked `/reflect` immediately into Pi's native steering queue when this attachment is the current main, so explicit requests reach the agent at the next turn boundary instead of after the whole run settles; retains a cancellable plugin-side waiting slot only behind an outstanding reflection inquiry, using only stock upstream Pi public extension APIs.
+**Reason**: Waiting for the ordinary agent to settle defeats an explicit request to reconsider work in progress and differs from automatic reflection's native steering behavior.
 
-## Requirements
+**Migration**: Manual requests use immediate native steering when no inquiry is outstanding. Only a request waiting behind another reflection remains plugin-pending and cancellable; ordinary-agent busyness no longer creates that waiting state.
+
+## ADDED Requirements
 
 ### Requirement: Manual reflections use immediate native steering
 
@@ -66,6 +68,8 @@ The plugin SHALL keep at most one reflection inquiry outstanding, including its 
 - **GIVEN** a manual request has already been submitted
 - **WHEN** repeated settlement observations arrive
 - **THEN** they do not submit the same request again
+
+## MODIFIED Requirements
 
 ### Requirement: Visible queued state
 
@@ -132,37 +136,3 @@ While a manual reflection is already plugin-pending behind an outstanding inquir
 - **WHEN** the user invokes `/reflect second correction`
 - **THEN** exactly one request remains pending with `first correction`
 - **AND** the user is told a reflection is already queued
-
-### Requirement: Configurable cancel shortcut
-
-The cancel shortcut key SHALL be configurable through the plugin's existing configuration file, with a documented default. Setting the key to a disabling value SHALL turn the shortcut off while leaving `/cancel-reflect` available. An invalid configured key SHALL fall back to the default with a bounded diagnostic, never crashing extension load. Shortcut registration SHALL rely on Pi's native conflict diagnostics rather than silent overrides.
-
-#### Scenario: Custom key from config
-
-- **GIVEN** the user configured a custom cancel shortcut key
-- **WHEN** the extension loads
-- **THEN** the cancel shortcut is registered on the configured key
-- **AND** the queued-status indication names the configured key
-
-#### Scenario: Shortcut disabled
-
-- **GIVEN** the user configured the cancel shortcut as disabled
-- **WHEN** the extension loads
-- **THEN** no cancel shortcut is registered
-- **AND** `/cancel-reflect` still cancels a plugin-pending request
-
-#### Scenario: Invalid key falls back
-
-- **GIVEN** the user configured an unrecognized cancel shortcut key
-- **WHEN** the extension loads
-- **THEN** the default key is used and a bounded diagnostic is emitted
-
-### Requirement: No host or protocol changes
-
-The queue, visibility, and cancellation behavior SHALL be implemented entirely inside the plugin using stock upstream Pi public extension APIs. The reflection inquiry message format, XML response contract, context folding, continuation semantics, and cross-process behavior SHALL remain unchanged. The change SHALL NOT require a forked or patched Pi.
-
-#### Scenario: Runs on stock Pi
-
-- **GIVEN** a stock upstream Pi installation without downstream patches
-- **WHEN** the plugin is loaded and a manual reflection is submitted, queued, and cancelled
-- **THEN** all submission, queue, and cancellation behaviors work without any host modification

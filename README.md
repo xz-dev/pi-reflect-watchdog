@@ -8,7 +8,7 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - Only successful assistant `turn_end` outcomes count: `stop` and `toolUse`.
 - `error`, `aborted`, `length`, `pending`, `deferred`, and unknown outcomes do not count.
 - Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.
-- `/reflect [optional supplement]` queues through the same native steering path when this attachment is the current main. Invoked while the agent is busy, the request first waits in a plugin-side queue and dispatches when the agent settles; while queued it can be withdrawn with the cancel shortcut (default `alt+x`) or `/cancel-reflect`, and the status row shows the queued state with the effective cancel gesture. Repeating `/reflect` while one request is queued keeps the first request. Invoked while idle, the reflection starts immediately as before.
+- `/reflect [optional supplement]` enters the same native steering queue immediately when this attachment is the current main, even while the ordinary agent is busy: submission does not wait for the run to settle, does not abort the current response or its tool calls, and does not reorder already queued native steering messages. Pi consumes the inquiry at the next steering boundary (after the current assistant turn and its complete tool batch, before the next model call). A request only waits in a plugin-side queue while another reflection inquiry is still outstanding; that waiting request can be withdrawn with the cancel shortcut (default `alt+x`) or `/cancel-reflect`, and the status row shows the queued state with the effective cancel gesture. Once submitted to native steering, a request can no longer be retracted. Repeating `/reflect` while one request is waiting keeps the first request.
 - Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
 - All XML attempts share one inquiry and are folded from later model context only after the final result.
 - Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as fallible historical assistant analysis, not the user's words.
@@ -80,7 +80,7 @@ Below-editor live row uses same `setWidget`/`requestRender` pattern as Continue 
 Reflect Watchdog | active 12m40s/137 loops · task 12m40s/30m · root 37/100 · all 128/500
 ```
 
-While a manual reflection waits in the queue, the row gains the cancel gesture:
+While a manual reflection waits behind another outstanding reflection, the row gains the cancel gesture:
 
 ```text
 Reflect Watchdog | active 12m40s/137 loops · task 12m40s/30m · root 37/100 · all 128/500 · queued · alt+x to cancel

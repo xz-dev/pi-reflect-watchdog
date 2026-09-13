@@ -662,6 +662,145 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 });
 
+test("manual reflection submitted mid-tool-turn steers after the full tool batch", {
+	timeout: 60_000,
+}, async (t) => {
+	assertStockPi();
+	const resources = await createTestResources(
+		t,
+		"pi-reflect-watchdog-manual-steer-boundary-",
+	);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		rootLoopLimit: 100,
+		allLoopLimit: 500,
+		taskMinutes: 30,
+	});
+	const reflectionXml =
+		"<reflection><type>NO_ISSUE</type><reason>manual steer boundary is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>";
+	const provider = await startFakeProvider({
+		responsePlan: ({ requestIndex }) => {
+			if (requestIndex === 0)
+				return {
+					delay: 1500,
+					halfway: 100,
+					chunks: [
+						{
+							tool_calls: [
+								{
+									index: 0,
+									id: "boundary-read-1",
+									type: "function",
+									function: {
+										name: "read",
+										arguments: '{"path":"package.json","limit":1,"offset":1}',
+									},
+								},
+								{
+									index: 1,
+									id: "boundary-read-2",
+									type: "function",
+									function: {
+										name: "read",
+										arguments: '{"path":"README.md","limit":1,"offset":1}',
+									},
+								},
+							],
+						},
+					],
+					finishReason: "tool_calls",
+				};
+			if (requestIndex === 1)
+				return { delay: 20, chunks: [{ content: reflectionXml }] };
+			return { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] };
+		},
+	});
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: isolated.env,
+		args: ["--provider", "watchdog-fixture", "--model", "watchdog-fixture"],
+		launcherArgs: ["--mode", "rpc", "--no-session"],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+
+	const accepted = await rpc.request({
+		type: "prompt",
+		message: "Run the two-step fixture task.",
+	});
+	assert.equal(accepted.success, true);
+	// While the first response (a tool call) is still streaming, submit the
+	// manual reflection: it must enter native steering now, not wait for the
+	// whole ordinary run to settle.
+	await waitForProviderRequests(provider, 1);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	const manual = await rpc.request({
+		type: "prompt",
+		message: "/reflect mid-tool-turn check",
+	});
+	assert.equal(manual.success, true);
+	assert.equal(
+		provider.requests[0].finishedAt,
+		undefined,
+		"manual command was invoked while the first response was still streaming",
+	);
+
+	await waitForProviderRequests(provider, 2);
+	const reflectionRequest = provider.requests[1];
+	const reflectionText = JSON.stringify(reflectionRequest.body.messages);
+	assert.match(
+		reflectionText,
+		/Trigger source\(s\): USER_REQUEST/,
+		"the manual inquiry is consumed as the very next model request",
+	);
+	assert.match(reflectionText, /mid-tool-turn check/);
+	// Boundary evidence: the reflection request starts only after the first
+	// response fully finished (both parallel tool calls streamed and both
+	// tool results returned); neither tool call was aborted or skipped.
+	assert.ok(
+		reflectionRequest.startedAt >= provider.requests[0].finishedAt,
+		"reflection consumption waits for the complete first turn",
+	);
+	const reflectionMessages = reflectionRequest.body.messages;
+	const toolResultCount = reflectionMessages.filter(
+		(message) => message.role === "tool",
+	).length;
+	assert.ok(
+		toolResultCount >= 2,
+		`both tool results are present before the steer boundary (found ${toolResultCount})`,
+	);
+	assert.ok(
+		reflectionText.includes('"boundary-read-1"') &&
+			reflectionText.includes('"boundary-read-2"'),
+		"both tool calls remain in history: nothing was aborted or skipped",
+	);
+	await waitForProviderResponse(reflectionRequest);
+	await waitForProviderRequests(provider, 3);
+	const resumed = provider.requests[2];
+	await waitForProviderResponse(resumed);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= resumed.finishedAt,
+	);
+	assert.equal(
+		provider.requests.length,
+		3,
+		"exactly one ordinary continuation follows the manual reflection",
+	);
+});
+
 for (const [origin, type] of [
 	["automatic", "ROUTE_CORRECTION"],
 	["busy-manual", "ROUTE_CORRECTION"],

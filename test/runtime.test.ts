@@ -416,6 +416,11 @@ function continuationMessages(pi: Pi) {
 	);
 }
 
+function runtimeQueuedState(pi: Pi, ctx: ReturnType<typeof context>) {
+	void pi;
+	return ctx.statuses.filter(Boolean).at(-1)?.includes("queued") ?? false;
+}
+
 async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
 	const prompt = lastInquiry(pi);
 	assert.ok(prompt);
@@ -692,14 +697,11 @@ test("automatic Reflect is consumed during cooldown while manual Reflect bypasse
 		1,
 	);
 	await pi.commands[0]?.handler("manual bypass", ctx);
-	assert.equal(
-		lastInquiry(pi),
-		undefined,
-		"busy manual reflection waits in the queue",
+	assert.match(
+		lastInquiry(pi)?.content ?? "",
+		/manual bypass/,
+		"busy manual reflection submits immediately during cooldown",
 	);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.match(lastInquiry(pi)?.content ?? "", /manual bypass/);
 });
 
 test("paired semantic hooks nest independently, overlap, and keep manual reflect available", async () => {
@@ -725,14 +727,11 @@ test("paired semantic hooks nest independently, overlap, and keep manual reflect
 	assert.equal(lastInquiry(pi), undefined);
 
 	await pi.commands[0]?.handler("manual during pause", ctx);
-	assert.equal(
-		lastInquiry(pi),
-		undefined,
-		"busy manual reflection waits in the queue",
+	assert.match(
+		lastInquiry(pi)?.content ?? "",
+		/USER_REQUEST/,
+		"busy manual reflection submits immediately while paused",
 	);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.match(lastInquiry(pi)?.content ?? "", /USER_REQUEST/);
 	const manualCount = pi.messages.length;
 	publishHook(pi, "inquiry-finished");
 	publishHook(pi, "review-finished");
@@ -1475,8 +1474,10 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				}
 				await pi.commands[0]?.handler("check clarified request", ctx);
 				if (trigger === "busy-manual") {
-					ctx.setIdle(true);
-					await pi.emit("agent_settled", {}, ctx);
+					assert.ok(
+						lastInquiry(pi),
+						"busy manual submits immediately without waiting for settlement",
+					);
 				}
 			} else {
 				ctx.setIdle(false);
@@ -2491,40 +2492,106 @@ test("reflection tool budget and history hint stay shared across XML attempts", 
 	});
 });
 
-test("busy manual reflection queues until settle and dispatches exactly once", async () => {
+test("busy manual reflection submits one native steer and completes after consumption", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
+	ctx.setPendingMessages(true);
 	await pi.commands[0]?.handler("queued supplement", ctx);
-	assert.equal(lastInquiry(pi), undefined, "no inquiry while busy");
-	assert.ok(
-		ctx.notifications.includes("Reflection queued · alt+x to cancel"),
-		"queued notification names the effective cancel key",
-	);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
 	const inquiries = pi.messages.filter(({ message }) =>
 		String(message.customType ?? "").endsWith(":inquiry"),
 	);
-	assert.equal(inquiries.length, 1, "settle dispatches the queued request");
+	assert.equal(inquiries.length, 1, "busy invocation submits exactly once");
 	assert.match(inquiries[0]?.message.content ?? "", /queued supplement/);
 	assert.match(inquiries[0]?.message.content ?? "", /USER_REQUEST/);
+	assert.deepEqual(inquiries[0]?.options, {
+		triggerTurn: true,
+		deliverAs: "steer",
+	});
+	assert.ok(
+		ctx.notifications.includes("Reflection queued."),
+		"submitted request is not advertised as cancellable",
+	);
+	assert.equal(
+		runtimeQueuedState(pi, ctx),
+		false,
+		"submitted request leaves the plugin-pending slot",
+	);
+	// The ordinary reply sharing the run passes through uncaptured while the
+	// inquiry stays provisional, then the inquiry is consumed and completed.
+	const ordinaryReplacement = await pi.emit(
+		"message_end",
+		assistant("ordinary work in progress"),
+		ctx,
+	);
+	assert.equal(
+		ordinaryReplacement,
+		undefined,
+		"provisional inquiry never captures the ordinary assistant",
+	);
+	await correlateReflection(pi, ctx);
+	const captured = await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.ok(captured, "consumed inquiry completes normally");
+	assert.ok(
+		pi.entries.some(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		),
+		"the submitted request stores its result after consumption",
+	);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"consumption adds no second submission",
+	);
+	assert.equal(continuationMessages(pi).length, 1);
+});
+
+test("unconsumed manual inquiry settles into a cancelled fold without results", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setPendingMessages(true);
+	await pi.commands[0]?.handler("never consumed", ctx);
+	assert.ok(lastInquiry(pi), "busy invocation submits immediately");
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(
+		lastInquiryFold(pi),
+		"an inquiry that settles without consumption folds itself away",
+	);
+	assert.equal(
+		pi.entries.some(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		),
+		false,
+		"no result is recorded for an unconsumed inquiry",
+	);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"settlement of an unconsumed inquiry starts no second reflection",
+	);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
 		pi.messages.filter(({ message }) =>
 			String(message.customType ?? "").endsWith(":inquiry"),
 		).length,
 		1,
-		"a repeated settlement observation starts no second reflection",
+		"a repeated settlement observation adds nothing",
 	);
 });
 
-test("duplicate /reflect while queued coalesces and keeps the first supplement", async () => {
+test("duplicate /reflect behind an outstanding inquiry coalesces and keeps the first supplement", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("initial request", ctx);
+	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("first supplement", ctx);
 	await pi.commands[0]?.handler("second supplement", ctx);
 	assert.ok(
@@ -2532,29 +2599,35 @@ test("duplicate /reflect while queued coalesces and keeps the first supplement",
 		"duplicate invocation is reported",
 	);
 	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
 	const inquiries = pi.messages.filter(({ message }) =>
 		String(message.customType ?? "").endsWith(":inquiry"),
 	);
-	assert.equal(inquiries.length, 1);
-	assert.match(inquiries[0]?.message.content ?? "", /first supplement/);
-	assert.doesNotMatch(inquiries[0]?.message.content ?? "", /second supplement/);
+	assert.equal(
+		inquiries.length,
+		2,
+		"waiting request dispatches after completion",
+	);
+	assert.match(inquiries[1]?.message.content ?? "", /first supplement/);
+	assert.doesNotMatch(inquiries[1]?.message.content ?? "", /second supplement/);
 });
 
-test("/cancel-reflect discards the queued request and it never dispatches", async () => {
+test("/cancel-reflect discards a plugin-pending request behind an outstanding inquiry", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("initial request", ctx);
+	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("withdrawn", ctx);
 	await pi.commands[1]?.handler("", ctx);
 	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
 	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
 	assert.equal(
-		lastInquiry(pi),
-		undefined,
-		"cancelled request never sends an inquiry",
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"cancelled request never sends an inquiry; the outstanding one remains",
 	);
 });
 
@@ -2582,14 +2655,20 @@ test("cancel shortcut registers from config and cancels; false disables registra
 	await pi.emit("session_start", {}, ctx);
 	assert.equal(pi.shortcuts.length, 1);
 	assert.equal(pi.shortcuts[0]?.key, "alt+x");
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("initial request", ctx);
+	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("shortcut target", ctx);
 	await pi.shortcuts[0]?.handler(ctx);
 	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
 	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(lastInquiry(pi), undefined);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"cancelled waiting request never sends an inquiry",
+	);
 
 	const disabled = install({ limits: { cancelShortcut: false } });
 	await disabled.pi.emit("session_start", {}, disabled.ctx);
@@ -2598,8 +2677,8 @@ test("cancel shortcut registers from config and cancels; false disables registra
 		0,
 		"false disables shortcut registration",
 	);
-	disabled.ctx.setIdle(false);
-	await disabled.pi.emit("agent_start", {}, disabled.ctx);
+	await disabled.pi.commands[0]?.handler("initial request", disabled.ctx);
+	await startReflectionRun(disabled.pi, disabled.ctx);
 	await disabled.pi.commands[0]?.handler("still queued", disabled.ctx);
 	assert.ok(
 		disabled.ctx.notifications.includes(
@@ -2617,8 +2696,8 @@ test("cancel shortcut registers from config and cancels; false disables registra
 test("queued state surfaces in the status text and clears on dispatch and cancel", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("initial request", ctx);
+	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("visible", ctx);
 	assert.match(
 		ctx.statuses.filter(Boolean).at(-1) ?? "",
@@ -2637,8 +2716,13 @@ test("queued state surfaces in the status text and clears on dispatch and cancel
 		/· queued · alt\+x to cancel$/,
 	);
 	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(lastInquiry(pi));
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.ok(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length >= 2,
+		"waiting request dispatches after finalization",
+	);
 	assert.doesNotMatch(
 		ctx.statuses.filter(Boolean).at(-1) ?? "",
 		/queued/,
@@ -2649,15 +2733,17 @@ test("queued state surfaces in the status text and clears on dispatch and cancel
 test("queued manual reflection is discarded on session shutdown", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
+	await pi.commands[0]?.handler("initial request", ctx);
+	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("doomed", ctx);
 	await pi.emit("session_shutdown", {}, ctx);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
-		lastInquiry(pi),
-		undefined,
-		"no inquiry after the session is torn down",
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		1,
+		"no further inquiry after the session is torn down; only the outstanding one remains",
 	);
 });

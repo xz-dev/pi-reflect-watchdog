@@ -165,13 +165,15 @@ def step (state : State) (event : Event) : State :=
     | .dispatchReflection =>
         if state.phase = .main && state.pending ≠ [] &&
             !state.inquiryActive then
-          { state with inquiryActive := true, runKind := .reflection }
+          -- Dispatch consumes the submitted head (manualQueue.shift in the
+          -- implementation); requests queued behind the inquiry remain pending.
+          let consumed := { state with pending := state.pending.tail }
+          { consumed with inquiryActive := true, runKind := .reflection }
         else state
     | .reflectionFinished _ =>
         if state.inquiryActive then
           { state with
             inquiryActive := false
-            pending := []
             counters := { state.counters with
               taskMs := 0
               rootLoops := 0
@@ -296,6 +298,27 @@ theorem local_busy_still_dispatches :
     let localRun := step main (.agentStart .ordinary)
     let queued := step localRun .queueManualReflection
     (step queued .dispatchReflection).inquiryActive = true := by
+  decide
+
+-- After a reflection finishes, a manual request that waited behind the
+-- outstanding inquiry dispatches immediately: no settle or idle gate applies.
+theorem waiting_manual_dispatches_after_finish :
+    let main := step initial .acquireMain
+    let first := step main .queueManualReflection
+    let running := step first .dispatchReflection
+    let waiting := step running .queueManualReflection
+    let finished := step waiting (.reflectionFinished .noIssue)
+    (step finished .dispatchReflection).inquiryActive = true := by
+  decide
+
+-- RED CHECK: a single submitted request must not be redispatchable after
+-- its reflection finishes (dispatch consumes the submitted head).
+theorem single_manual_not_redispatched_after_finish :
+    let main := step initial .acquireMain
+    let first := step main .queueManualReflection
+    let running := step first .dispatchReflection
+    let finished := step running (.reflectionFinished .noIssue)
+    (step finished .dispatchReflection).inquiryActive = false := by
   decide
 
 theorem dispatch_classifies_reflection :
@@ -672,6 +695,17 @@ theorem process_is_correct :
     (let main := step initial .acquireMain
       let queued := step main .queueManualReflection
       (step queued .dispatchReflection).runKind = .reflection) ∧
+    (let main := step initial .acquireMain
+      let first := step main .queueManualReflection
+      let running := step first .dispatchReflection
+      let waiting := step running .queueManualReflection
+      let finished := step waiting (.reflectionFinished .noIssue)
+      (step finished .dispatchReflection).inquiryActive = true) ∧
+    (let main := step initial .acquireMain
+      let first := step main .queueManualReflection
+      let running := step first .dispatchReflection
+      let finished := step running (.reflectionFinished .noIssue)
+      (step finished .dispatchReflection).inquiryActive = false) ∧
     (∀ state outcome, state.runKind = .ordinary →
       modelTurnSucceeded outcome = false →
       (countTurn state outcome).counters = state.counters) ∧
@@ -746,6 +780,10 @@ theorem process_is_correct :
   · exact local_busy_still_dispatches
   constructor
   · exact dispatch_classifies_reflection
+  constructor
+  · exact waiting_manual_dispatches_after_finish
+  constructor
+  · exact single_manual_not_redispatched_after_finish
   constructor
   · exact failed_ordinary_turn_never_counts
   constructor

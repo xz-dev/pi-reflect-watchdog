@@ -865,12 +865,12 @@ function maybeDispatch(runtime: Runtime): void {
 	if (!safeToDispatch(runtime)) return;
 	const manual = runtime.manualQueue[0];
 	if (manual !== undefined) {
-		// Manual reflections never dispatch into a busy window. The probe is
-		// live because a settle -> new run race must not leak a dispatch; the
-		// request simply waits for the next settle instead.
-		if (probePiAgentState(runtime.ctx as ExtensionContext).busy) return;
+		// Manual and automatic reflections share the native steering queue: a
+		// busy ordinary run (or a settle -> new run race) cannot delay the
+		// request, so it never re-enters a plugin-side waiting state here.
 		runtime.manualQueue.shift();
 		beginReflection(runtime, manual);
+		refreshWidget(runtime);
 		return;
 	}
 	if (runtime.externallyPaused) return;
