@@ -5,7 +5,10 @@ import { once } from "node:events";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { openProcessDomain } from "pi-extension-utils/process-domain";
+import {
+	openProcessDomain,
+	openSharedProcessDomain,
+} from "pi-extension-utils/process-domain";
 import { createReflectDomainCoordinator } from "../../dist/process-domain.js";
 import {
 	createIsolatedEnvironment,
@@ -194,6 +197,299 @@ function spawnChild(declaration, processDomainModule) {
 		},
 	};
 }
+
+// Real extension installs share one in-realm node via openSharedProcessDomain;
+// using it here reproduces the first-opener metadata that the bug hinges on.
+const sharedOpen = (options) =>
+	openSharedProcessDomain({
+		...options,
+		connectTimeoutMs: 2_000,
+		heartbeatIntervalMs: 100,
+		heartbeatTimeoutMs: 400,
+		heartbeatTimeToLiveMs: 300,
+	});
+
+const CONTINUE_DIST =
+	"/home/xz/.pi/agent/git/github.com/xz-dev/pi-continue-watchdog/dist/process-domain.js";
+
+function spawnContinueChild(declaration) {
+	// Minimal subprocess running the *actual installed* continue-watchdog
+	// coordinator (client role) over the real shared transport.
+	const source = [
+		'import { openProcessDomain } from "pi-extension-utils/process-domain";',
+		`import { createProcessDomainCoordinator } from ${JSON.stringify(pathToFileURL(CONTINUE_DIST).href)};`,
+		"const open = (options) => openProcessDomain({ ...options, connectTimeoutMs: 2000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 400, heartbeatTimeToLiveMs: 300 });",
+		"const coordinator = createProcessDomainCoordinator({ open });",
+		"const instance = {};",
+		"let idle = true;",
+		"function reply(id, data, error) { process.send?.({ id, data, error }); }",
+		'await coordinator.attach(instance, { getIdle: () => idle, onFatal: (error) => process.send?.({ event: "transport-error", message: error.message }) });',
+		'process.send?.({ event: "ready", pid: process.pid });',
+		'process.on("message", async (message) => {',
+		'	if (typeof message !== "object" || message === null) return;',
+		"	const { id, command } = message;",
+		'	if (!Number.isSafeInteger(id) || typeof command !== "string") return;',
+		"	try {",
+		"		switch (command) {",
+		'			case "busy": idle = false; await coordinator.reportIdle(instance, false); reply(id, true); break;',
+		'			case "idle": idle = true; await coordinator.reportIdle(instance, true); reply(id, true); break;',
+		'			case "snapshot": reply(id, coordinator.snapshot); break;',
+		'			case "shutdown": await coordinator.detach(instance, true); reply(id, true); setTimeout(() => process.disconnect?.(), 50); break;',
+		"			default: throw new Error(`unknown command: ${command}`);",
+		"		}",
+		"	} catch (error) { reply(id, undefined, error instanceof Error ? error.message : String(error)); }",
+		"});",
+	].join("\n");
+	const child = spawn(
+		process.execPath,
+		["--input-type=module", "--eval", source],
+		{
+			cwd: ROOT,
+			env: { ...process.env, PI_EXTENSION_UTILS_PROCESS_DOMAIN: declaration },
+			stdio: ["ignore", "pipe", "pipe", "ipc"],
+		},
+	);
+	let stdout = "";
+	let stderr = "";
+	let nextId = 0;
+	const pending = new Map();
+	child.stdout.on("data", (chunk) => {
+		stdout += String(chunk);
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	child.on("message", (message) => {
+		if (typeof message !== "object" || message === null) return;
+		if (Number.isSafeInteger(message.id)) {
+			const request = pending.get(message.id);
+			if (!request) return;
+			pending.delete(message.id);
+			clearTimeout(request.timer);
+			if (message.error) request.reject(new Error(message.error));
+			else request.resolve(message.data);
+			return;
+		}
+		if (message.event === "ready") child.ready = true;
+		if (message.event === "startup-error") child.startupError = message.message;
+	});
+	child.on("exit", (code, signal) => {
+		for (const request of pending.values()) {
+			clearTimeout(request.timer);
+			request.reject(
+				new Error(
+					`continue child exited (${code ?? signal}); stdout=${stdout}; stderr=${stderr}`,
+				),
+			);
+		}
+		pending.clear();
+	});
+	return {
+		process: child,
+		command(command) {
+			const id = ++nextId;
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(() => {
+					pending.delete(id);
+					reject(
+						new Error(
+							`continue child command ${command} timed out; stdout=${stdout}; stderr=${stderr}`,
+						),
+					);
+				}, 5_000);
+				pending.set(id, { resolve, reject, timer });
+				child.send({ id, command });
+			});
+		},
+		async ready() {
+			await waitFor(
+				() => child.ready || child.startupError,
+				"continue child startup",
+			);
+			if (child.startupError) throw new Error(child.startupError);
+		},
+		async stop() {
+			if (child.exitCode !== null || child.signalCode !== null) return;
+			try {
+				await this.command("shutdown");
+			} catch {
+				child.kill("SIGKILL");
+			}
+			if (child.exitCode === null && child.signalCode === null) {
+				await Promise.race([
+					once(child, "exit"),
+					new Promise((resolve) =>
+						setTimeout(() => {
+							child.kill("SIGKILL");
+							resolve();
+						}, 2_000),
+					),
+				]);
+			}
+		},
+	};
+}
+
+test("real shared transport: continue first opener preserves reflect child accounting", {
+	timeout: 30_000,
+}, async (t) => {
+	// Both actual installed watchdog coordinators share the real transport;
+	// Continue opens first, so its metadata ({role,pid} — no reflect protocol
+	// fields) populates the shared node declaration. Reflect must still admit
+	// the background child's accounting from private-protocol checkpoints.
+	const continueModule = pathToFileURL(CONTINUE_DIST).href;
+	const continueDomain = await import(continueModule);
+	const env = {};
+	const continueRoot = continueDomain.createProcessDomainCoordinator({
+		env,
+		open: sharedOpen,
+	});
+	const continueInstance = {};
+	await continueRoot.attach(continueInstance, {
+		getIdle: () => true,
+		onFatal() {},
+	});
+	t.after(() => continueRoot.detach(continueInstance, true));
+	assert.equal(continueRoot.isRootProcess, true, "continue opened first");
+	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
+	assert.ok(declaration);
+
+	const root = createReflectDomainCoordinator({
+		env,
+		open: sharedOpen,
+		activeTickMs: 100,
+		idleResetGapMs: 10_000,
+	});
+	const instance = {};
+	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	t.after(() => root.detach(instance));
+	const child = spawnChild(declaration);
+	t.after(() => child.stop());
+	await child.ready();
+
+	const start = root.counters()?.activeMs.value ?? 0n;
+	await child.command("busy");
+	await waitFor(
+		() => root.counters()?.otherBusy === true,
+		"reflect root observes reflect child busy",
+	);
+	await child.command("all-loop");
+	await child.command("all-loop");
+	await child.command("all-loop");
+	await waitFor(
+		() => root.counters()?.allLoops.value >= 3n,
+		"reflect child loops aggregate",
+	);
+	await new Promise((resolve) => setTimeout(resolve, 650));
+	const counters = root.counters();
+	assert.equal(
+		counters?.rootLoops.value,
+		0n,
+		"child work stays off root loops",
+	);
+	assert.ok(
+		(counters?.activeMs.value ?? 0n) > start,
+		"child-only work advances active time",
+	);
+	assert.ok((counters?.taskMs.value ?? 0n) > 0n, "task time advances");
+
+	// Continue must still observe the same background child through its own
+	// protocol on the shared transport.
+	const continueChild = spawnContinueChild(declaration);
+	t.after(() => continueChild.stop());
+	await continueChild.ready();
+	await continueChild.command("busy");
+	await waitFor(
+		() => continueRoot.snapshot.busyParticipants >= 1,
+		"continue root observes continue child busy",
+	);
+	assert.equal(root.counters()?.otherBusy, true);
+
+	await continueChild.command("idle");
+	await continueChild.stop();
+	await child.stop();
+	await waitFor(
+		() => root.counters()?.anyBusy === false,
+		"graceful child leave",
+		10_000,
+	);
+});
+
+test("real shared transport: reflect first opener keeps continue activity", {
+	timeout: 30_000,
+}, async (t) => {
+	// Reverse order: Reflect opens the shared node first, Continue joins
+	// second. Continue behavior must be unchanged and Reflect accounting
+	// must work identically.
+	const env = {};
+	const root = createReflectDomainCoordinator({
+		env,
+		open,
+		activeTickMs: 100,
+		idleResetGapMs: 10_000,
+	});
+	const instance = {};
+	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	t.after(() => root.detach(instance));
+	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
+	assert.ok(declaration);
+
+	const continueModule = pathToFileURL(CONTINUE_DIST).href;
+	const continueDomain = await import(continueModule);
+	const continueRoot = continueDomain.createProcessDomainCoordinator({
+		env,
+		open: sharedOpen,
+	});
+	const continueInstance = {};
+	await continueRoot.attach(continueInstance, {
+		getIdle: () => true,
+		onFatal() {},
+	});
+	t.after(() => continueRoot.detach(continueInstance, true));
+	// Continue joins as a non-host peer on the shared node but still claims
+	// isRootProcess semantics for its protocol; its child observes activity.
+	assert.equal(continueRoot.isRootProcess, false);
+
+	const child = spawnChild(declaration);
+	t.after(() => child.stop());
+	await child.ready();
+	await child.command("busy");
+	await waitFor(
+		() => root.counters()?.otherBusy === true,
+		"reflect root observes child busy",
+	);
+	await child.command("all-loop");
+	await waitFor(
+		() => root.counters()?.allLoops.value >= 1n,
+		"reflect child loop aggregates",
+	);
+
+	const continueChild = spawnContinueChild(declaration);
+	t.after(() => continueChild.stop());
+	await continueChild.ready();
+	// Continue here is a non-host peer on the Reflect-owned shared node: by
+	// design it reports to the host but does not aggregate. Verify that its
+	// join does not disrupt the Reflect accounting of the reflect child.
+	await continueChild.command("busy");
+	assert.equal(
+		root.counters()?.otherBusy,
+		true,
+		"reflect accounting unaffected",
+	);
+	assert.equal(
+		continueRoot.isRootProcess,
+		false,
+		"continue stays a non-host peer on the shared node",
+	);
+
+	await continueChild.stop();
+	await child.stop();
+	await waitFor(
+		() => root.counters()?.anyBusy === false,
+		"graceful child leave",
+		10_000,
+	);
+});
 
 test("wrong capability fails closed with status 78 and sanitized output", {
 	timeout: 10_000,

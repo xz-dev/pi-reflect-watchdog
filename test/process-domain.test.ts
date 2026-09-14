@@ -104,8 +104,9 @@ class FakeNode implements ProcessDomainNode {
 		nodeId: string,
 		status: "online" | "offline",
 		incarnation = "peer-incarnation",
+		metadata?: Record<string, string>,
 	) {
-		const peer = this.setPeerStatus(nodeId, status, incarnation);
+		const peer = this.setPeerStatus(nodeId, status, incarnation, metadata);
 		for (const listener of this.eventListeners)
 			listener({ type: "peer", peer });
 	}
@@ -114,11 +115,12 @@ class FakeNode implements ProcessDomainNode {
 		nodeId: string,
 		status: "online" | "offline",
 		incarnation = "peer-incarnation",
+		metadata?: Record<string, string>,
 	): ProcessDomainPeer {
 		const peer: ProcessDomainPeer = {
 			nodeId,
 			status,
-			metadata: {
+			metadata: metadata ?? {
 				role: "pi-reflect-watchdog",
 				protocol: "3",
 				incarnation,
@@ -257,6 +259,60 @@ function counterWire(
 		...overrides,
 	};
 }
+
+test("shared first-opener metadata preserves child accounting in either load order", async () => {
+	const run = async (metadata: Record<string, string>) => {
+		const node = new FakeNode("host");
+		const time = fakeClock();
+		let nowMs = 1_000;
+		const coordinator = createReflectDomainCoordinator({
+			open: async () => node,
+			clock: time.clock,
+			activeTickMs: 1_000,
+			now: () => nowMs,
+		});
+		const instance = {};
+		await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+		node.emitPeer("child", "online", "incarnation-a", metadata);
+		node.emitChannel(
+			"pi-reflect-watchdog.checkpoint.v3",
+			checkpoint("incarnation-a", "contributor-a", { busy: true }),
+			"child",
+			nowMs,
+		);
+		await flush();
+		for (let tick = 0; tick < 2; tick += 1) {
+			nowMs += 1_000;
+			time.fireNext();
+			await flush();
+		}
+		node.emitChannel(
+			"pi-reflect-watchdog.checkpoint.v3",
+			checkpoint("incarnation-a", "contributor-a", {
+				seq: "2",
+				busy: true,
+				allLoops: "3",
+			}),
+			"child",
+			nowMs,
+		);
+		await flush();
+		const counters = coordinator.counters();
+		assert.equal(counters?.otherBusy, true);
+		assert.equal(counters?.activeMs.value, 2_000n);
+		assert.equal(counters?.taskMs.value, 2_000n);
+		assert.equal(counters?.rootLoops.value, 0n);
+		assert.equal(counters?.allLoops.value, 3n);
+		await coordinator.detach(instance);
+	};
+	await run({ role: "pi-continue-watchdog", pid: "child-pid" });
+	await run({
+		role: "pi-reflect-watchdog",
+		pid: "child-pid",
+		protocol: "3",
+		incarnation: "incarnation-a",
+	});
+});
 
 test("abrupt peer death removes live busy state and replacement resumes accounting", async () => {
 	const node = new FakeNode("host");
@@ -475,16 +531,33 @@ test("ledger-expired reconnect needs receipt and seeds current totals as baselin
 	await coordinator.detach(instance);
 });
 
-test("compatible peer joining while paused receives current control snapshot", async () => {
+test("checkpoint from paused contributor learns current generation via control refresh", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
 	});
 	const instance = {};
 	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: false }),
+		"child",
+	);
+	await flush();
 	await setReflectDomainPausedForWatchdog(coordinator, true);
 
-	node.emitPeer("child", "online", "incarnation-a");
+	const pausedWire = latest(node, "pi-reflect-watchdog.counters.v3");
+	await flush();
+	assert.equal(latest(node, "pi-reflect-watchdog.counters.v3"), pausedWire);
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", {
+			accountingGeneration: "0",
+			busy: false,
+		}),
+		"child",
+	);
 	await flush();
 	const wire = latest(node, "pi-reflect-watchdog.counters.v3").value as {
 		accountingGeneration: string;
@@ -495,7 +568,7 @@ test("compatible peer joining while paused receives current control snapshot", a
 	await coordinator.detach(instance);
 });
 
-test("compatible peer joining after pause and resume receives advanced generation", async () => {
+test("stale-generation checkpoint after resume learns advanced generation", async () => {
 	const node = new FakeNode("host");
 	const coordinator = createReflectDomainCoordinator({
 		open: async () => node,
@@ -506,6 +579,14 @@ test("compatible peer joining after pause and resume receives advanced generatio
 	await setReflectDomainPausedForWatchdog(coordinator, false);
 
 	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", {
+			accountingGeneration: "1",
+			busy: false,
+		}),
+		"child",
+	);
 	await flush();
 	const wire = latest(node, "pi-reflect-watchdog.counters.v3").value as {
 		accountingGeneration: string;
@@ -688,7 +769,22 @@ test("lost initial ACK is recovered from pause control and resume does not repla
 	const receipt = accepted.checkpointAcks[0]?.resumeReceipt;
 	assert.ok(receipt);
 	assert.equal(host.counters()?.rootLoops.value, 1n);
-	// Deliberately do not deliver the initial ACK to the client.
+	// Deliberately do not deliver the initial ACK to the client. An
+	// authenticated leave then an in-place replacement preserves the retained
+	// replay registry, so the resumed host rejoin still carries its receipt.
+	hostNode.emitChannel(
+		"pi-reflect-watchdog.leave.v3",
+		{
+			version: 3,
+			incarnation: initial.incarnation,
+			contributorId: initial.contributorId,
+		},
+		"client-a",
+	);
+	await flush();
+	hostNode.emitPeer("client-a", "offline", initial.incarnation);
+	hostNode.emitPeer("client-a", "online", initial.incarnation);
+	await flush();
 
 	await setReflectDomainPausedForWatchdog(host, true);
 	const paused = latest(hostNode, "pi-reflect-watchdog.counters.v3").value as {
@@ -722,6 +818,43 @@ test("lost initial ACK is recovered from pause control and resume does not repla
 	assert.equal(host.counters()?.rootLoops.value, 1n);
 	await client.detach(clientInstance);
 	await host.detach(hostInstance);
+});
+
+test("delayed duplicate is fenced without identity replacement", async () => {
+	const node = new FakeNode("host");
+	const coordinator = createReflectDomainCoordinator({
+		open: async () => node,
+	});
+	const instance = {};
+	await coordinator.attach(instance, { getBusy: () => false, onFatal() {} });
+	node.emitPeer("child", "online", "incarnation-a");
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+	);
+	await flush();
+	// Deliberately do not deliver the initial ACK. A delayed duplicate
+	// (replay of the accepted seq) classifies as zero-delta acceptance:
+	// counters and busy are unchanged, and the in-place publish re-sends
+	// the authoritative ACK for recovery.
+	node.emitChannel(
+		"pi-reflect-watchdog.checkpoint.v3",
+		checkpoint("incarnation-a", "contributor-a", { busy: true }),
+		"child",
+	);
+	await flush();
+	const after = latest(node, "pi-reflect-watchdog.counters.v3").value as {
+		rootLoops: string;
+		allLoops: string;
+		anyBusy: boolean;
+	};
+	assert.equal(after.anyBusy, true);
+	assert.equal(after.rootLoops, "0");
+	assert.equal(after.allLoops, "0");
+	assert.equal(coordinator.counters()?.anyBusy, true);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	await coordinator.detach(instance);
 });
 
 test("replacement identity fences delayed checkpoint and leave", async () => {

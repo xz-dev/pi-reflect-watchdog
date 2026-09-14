@@ -574,22 +574,19 @@ export function createReflectDomainCoordinator(
 	};
 
 	const checkpointAcks = (): readonly CheckpointAckWire[] => {
-		if (node === undefined) return Object.freeze([]);
 		const acks: CheckpointAckWire[] = [];
 		for (const nodeId of controlPeers) {
-			const peer = node
-				.peers()
-				.find((candidate) => candidate.nodeId === nodeId);
-			if (
-				peer?.status !== "online" ||
-				peer.metadata.protocol !== String(PRIVATE_PROTOCOL_VERSION) ||
-				!validId(peer.metadata.incarnation)
-			)
+			const session = peerSessions.get(nodeId);
+			// The session anchor is preferred; after a pause (which clears live
+			// sessions) the retained registry receipt must still surface so a
+			// rejoining client recovers its ACK from the control snapshot.
+			if (session !== undefined) {
+				const entry = replayRegistry.get(session.replayKey);
+				if (entry !== undefined) acks.push(entry.ack);
 				continue;
-			const entry = replayRegistry.get(
-				replayKeyFor(nodeId, peer.metadata.incarnation),
-			);
-			if (entry !== undefined) acks.push(entry.ack);
+			}
+			for (const [key, entry] of replayRegistry)
+				if (key.startsWith(`${nodeId}:`)) acks.push(entry.ack);
 		}
 		return Object.freeze(acks);
 	};
@@ -762,12 +759,11 @@ export function createReflectDomainCoordinator(
 		const peer = node
 			.peers()
 			.find((candidate) => candidate.nodeId === message.senderId);
-		if (
-			peer?.status !== "online" ||
-			peer.metadata.protocol !== String(PRIVATE_PROTOCOL_VERSION) ||
-			peer.metadata.incarnation !== wire.incarnation
-		)
-			return;
+		if (peer?.status !== "online") return;
+		const resumeReceipt =
+			replayRegistry.get(replayKeyFor(message.senderId, wire.incarnation))?.ack
+				.resumeReceipt ??
+			receiptFor(replayKeyFor(message.senderId, wire.incarnation));
 		const checkpoint: PeerCheckpoint = {
 			generation: BigInt(wire.accountingGeneration),
 			seq: BigInt(wire.seq),
@@ -775,9 +771,47 @@ export function createReflectDomainCoordinator(
 			rootLoops: BigInt(wire.rootLoops),
 			allLoops: BigInt(wire.allLoops),
 		};
-		if (checkpoint.generation !== collectionState.accounting.generation) return;
 		const replayKey = replayKeyFor(message.senderId, wire.incarnation);
 		const current = peerSessions.get(message.senderId);
+		const refreshControl = (): void => {
+			// Control-plane synchronization without accounting admission: the
+			// rejected contributor learns the current generation and receives
+			// its authoritative checkpoint ACK directly, without entering the
+			// shared control snapshot targets.
+			const publication = captureHostPublication();
+			if (publication === undefined) return;
+			const counters: CountersWire =
+				publication.targets.length === 0
+					? publication.wire
+					: Object.freeze({
+							...publication.wire,
+							checkpointAcks: Object.freeze([
+								...publication.wire.checkpointAcks,
+								Object.freeze({
+									nodeId: message.senderId,
+									incarnation: wire.incarnation,
+									contributorId: wire.contributorId,
+									accountingGeneration: wire.accountingGeneration,
+									seq: wire.seq,
+									resumeReceipt,
+								}),
+							]),
+						});
+			void queueTransport(async () => {
+				try {
+					await node?.send(message.senderId, COUNTERS_CHANNEL, counters);
+				} catch (error) {
+					if (!isTransientTransportError(error))
+						reportError(
+							error instanceof Error ? error : new Error(String(error)),
+						);
+				}
+			});
+		};
+		if (checkpoint.generation !== collectionState.accounting.generation) {
+			refreshControl();
+			return;
+		}
 		let next: CollectionState;
 		let receipt: string;
 		if (
@@ -788,12 +822,20 @@ export function createReflectDomainCoordinator(
 			if (
 				wire.resumeReceipt !== null &&
 				wire.resumeReceipt !== current.resumeReceipt
-			)
+			) {
+				refreshControl();
 				return;
+			}
 			const previous = retainedLedger(replayKey, message.receivedAt);
-			if (previous === undefined) return;
+			if (previous === undefined) {
+				refreshControl();
+				return;
+			}
 			const delta = checkpointLoopDelta(previous, checkpoint);
-			if (delta === null) return;
+			if (delta === null) {
+				refreshControl();
+				return;
+			}
 			next = reduceCollectionState(collectionState, {
 				type: "peer-checkpoint-verified",
 				contributorId: wire.contributorId,
@@ -803,13 +845,23 @@ export function createReflectDomainCoordinator(
 			});
 			receipt = current.resumeReceipt;
 		} else {
+			// Fencing is now private-protocol identity, not transport metadata:
+			// a live session for a *different* incarnation on this nodeId must
+			// reject delayed messages from the superseded incarnation.
+			if (current !== undefined && current.incarnation !== wire.incarnation) {
+				refreshControl();
+				return;
+			}
 			const classified = classifySynchronization(
 				replayKey,
 				checkpoint,
 				wire.resumeReceipt,
 				message.receivedAt,
 			);
-			if (classified === null) return;
+			if (classified === null) {
+				refreshControl();
+				return;
+			}
 			if (current !== undefined)
 				reduce({
 					type: "peer-offline",
@@ -826,7 +878,10 @@ export function createReflectDomainCoordinator(
 			});
 			receipt = classified.receipt;
 		}
-		if (next === collectionState) return;
+		if (next === collectionState) {
+			refreshControl();
+			return;
+		}
 		collectionState = next;
 		controlPeers.add(message.senderId);
 		const ack: CheckpointAckWire = Object.freeze({
@@ -958,14 +1013,24 @@ export function createReflectDomainCoordinator(
 					.catch(() => {});
 			return;
 		}
-		if (
-			event.peer.metadata.protocol === String(PRIVATE_PROTOCOL_VERSION) &&
-			validId(event.peer.metadata.incarnation)
-		) {
-			controlPeers.add(event.peer.nodeId);
-			void publishHost().catch(() => {});
-		}
-		// Online peers remain isolated until a validated checkpoint arrives.
+		// A validated checkpoint already admitted peerSessions; any recorded
+		// acceptance for this exact nodeId/incarnation (including one retained
+		// after an offline projection) is eligible for the control snapshot.
+		// Enrollment authority is Reflect-private protocol messages, not shared
+		// transport metadata.
+		const session = peerSessions.get(event.peer.nodeId);
+		const receipt =
+			session === undefined
+				? replayRegistry.get(
+						replayKeyFor(
+							event.peer.nodeId,
+							String(event.peer.metadata.incarnation ?? ""),
+						),
+					)
+				: undefined;
+		if (session === undefined && receipt === undefined) return;
+		controlPeers.add(event.peer.nodeId);
+		void publishHost().catch(() => {});
 	};
 
 	const ensureOpen = (): Promise<void> => {
