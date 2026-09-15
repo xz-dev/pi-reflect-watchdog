@@ -35,9 +35,9 @@ export interface MergeConfigResult {
 }
 
 export const BUILT_IN_CONFIG: Readonly<WatchdogConfig> = Object.freeze({
-	rootLoopLimit: 100,
+	rootLoopLimit: 60,
 	allLoopLimit: 500,
-	taskMinutes: 30,
+	taskMinutes: 20,
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 	hookPauses: Object.freeze([]),

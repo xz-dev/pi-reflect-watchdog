@@ -330,7 +330,7 @@ function context(
 const config: WatchdogConfig = {
 	rootLoopLimit: 2,
 	allLoopLimit: 3,
-	taskMinutes: 30,
+	taskMinutes: 20,
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
 	hookPauses: [],
@@ -941,13 +941,13 @@ test("same-process child threshold queues reflection while the child stays busy"
 		hub,
 		domain,
 		ctx: context("root", { hasUI: true }),
-		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	const child = install({
 		hub,
 		domain,
 		ctx: context("child", { hasUI: false }),
-		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	await root.pi.emit("session_start", {}, root.ctx);
 	await child.pi.emit("session_start", {}, child.ctx);
@@ -961,7 +961,7 @@ test("same-process child threshold queues reflection while the child stays busy"
 
 test("cross-process child threshold queues reflection while the child stays busy", async () => {
 	const { pi, ctx, domain } = install({
-		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
@@ -973,7 +973,7 @@ test("cross-process child threshold queues reflection while the child stays busy
 
 test("native Pi steering queue accepts reflection despite an existing pending message", async () => {
 	const { pi, ctx, domain } = install({
-		limits: { allLoopLimit: 1, rootLoopLimit: 100 },
+		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
@@ -2428,7 +2428,7 @@ test("queued second reflection dispatches after completed evidence is visible", 
 
 test("domain snapshots, not local wall-clock state, drive status text", async () => {
 	const { pi, ctx, domain } = install({
-		limits: { rootLoopLimit: 100, allLoopLimit: 100 },
+		limits: { rootLoopLimit: 60, allLoopLimit: 100 },
 	});
 	await pi.emit("session_start", {}, ctx);
 	domain.setCounters({
@@ -2440,7 +2440,7 @@ test("domain snapshots, not local wall-clock state, drive status text", async ()
 	});
 	assert.match(
 		ctx.statuses.filter(Boolean).at(-1) ?? "",
-		/active 12s\/9 loops · task 7s\/30m · root 7\/100 · all 9\/100/,
+		/active 12s\/9 loops · task 7s\/20m · root 7\/60 · all 9\/100/,
 	);
 });
 

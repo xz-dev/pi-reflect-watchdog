@@ -650,7 +650,7 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 				config: {
 					rootLoopLimit: 3,
 					allLoopLimit: 500,
-					taskMinutes: 30,
+					taskMinutes: 20,
 					idleResetGapSeconds: 60,
 					reflectionPrompt: "Inspect current work and return reflection XML.",
 					hookPauses: [],

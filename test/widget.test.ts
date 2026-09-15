@@ -38,15 +38,15 @@ test("idle state renders the meaningful zero line", () => {
 	const state: WidgetState = {
 		activity: { active: false, elapsedMs: 0, loops: 0 },
 		taskElapsedMs: 0,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 0,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 0,
 		allLoopLimit: 500,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 0s/0 loops · task 0s/30m · root 0/100 · all 0/500",
+		"Reflect Watchdog | active 0s/0 loops · task 0s/20m · root 0/60 · all 0/500",
 	);
 });
 
@@ -58,15 +58,15 @@ test("live state renders the exact approved example format", () => {
 			loops: 137,
 		},
 		taskElapsedMs: 12 * 60_000 + 40_000,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 37,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 128,
 		allLoopLimit: 500,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · all 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/500",
 	);
 });
 
@@ -74,9 +74,9 @@ test("cooldown suffix renders only while loops remain", () => {
 	const state: WidgetState = {
 		activity: { active: false, elapsedMs: 0, loops: 0 },
 		taskElapsedMs: 0,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 0,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 0,
 		allLoopLimit: 500,
 		cooldownRemainingLoops: 3,
@@ -101,9 +101,9 @@ test("component switches to compact text before final truncation", () => {
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
 		activity: { active: true, elapsedMs: 8_040_000, loops: 137 },
 		taskElapsedMs: 760_000,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 37,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 128,
 		allLoopLimit: 500,
 	}));
@@ -111,7 +111,7 @@ test("component switches to compact text before final truncation", () => {
 	assert.equal(full.length, 1);
 	assert.equal(
 		full[0],
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/30m · root 37/100 · all 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/500",
 	);
 	width = 40;
 	const narrow = widget.render(width);
@@ -122,9 +122,9 @@ test("component switches to compact text before final truncation", () => {
 			formatCompactWidgetText({
 				activity: { active: true, elapsedMs: 8_040_000, loops: 137 },
 				taskElapsedMs: 760_000,
-				taskMinutes: 30,
+				taskMinutes: 20,
 				rootLoops: 37,
-				rootLoopLimit: 100,
+				rootLoopLimit: 60,
 				allLoops: 128,
 				allLoopLimit: 500,
 			}),
@@ -139,9 +139,9 @@ test("component re-reads live state on every render", () => {
 	const widget = createWatchdogWidget(fakeTheme(), () => ({
 		activity: { active: true, elapsedMs: elapsed, loops: 1 },
 		taskElapsedMs: elapsed,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 1,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 1,
 		allLoopLimit: 500,
 	}));
@@ -154,16 +154,16 @@ test("queued reflection appends the effective cancel label to full and compact r
 	const state: WidgetState = {
 		activity: { active: true, elapsedMs: 5_000, loops: 2 },
 		taskElapsedMs: 5_000,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 2,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 2,
 		allLoopLimit: 500,
 		queuedCancelLabel: "alt+x",
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 5s/2 loops · task 5s/30m · root 2/100 · all 2/500 · queued · alt+x to cancel",
+		"Reflect Watchdog | active 5s/2 loops · task 5s/20m · root 2/60 · all 2/500 · queued · alt+x to cancel",
 	);
 	assert.match(formatCompactWidgetText(state), /· q alt\+x$/);
 });
@@ -172,9 +172,9 @@ test("disabled shortcut surfaces the cancel command in the queued segment", () =
 	const state: WidgetState = {
 		activity: { active: true, elapsedMs: 5_000, loops: 2 },
 		taskElapsedMs: 5_000,
-		taskMinutes: 30,
+		taskMinutes: 20,
 		rootLoops: 2,
-		rootLoopLimit: 100,
+		rootLoopLimit: 60,
 		allLoops: 2,
 		allLoopLimit: 500,
 		queuedCancelLabel: "/cancel-reflect",
