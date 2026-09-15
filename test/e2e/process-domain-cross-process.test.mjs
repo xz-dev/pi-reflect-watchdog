@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { fork, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
+import { access, mkdtemp } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -15,6 +17,7 @@ import {
 	createTestResources,
 	installPackedArtifact,
 	ROOT,
+	runBoundedProcess,
 } from "../../scripts/e2e/harness.mjs";
 
 const open = (options) =>
@@ -209,15 +212,70 @@ const sharedOpen = (options) =>
 		heartbeatTimeToLiveMs: 300,
 	});
 
-const CONTINUE_DIST =
-	"/home/xz/.pi/agent/git/github.com/xz-dev/pi-continue-watchdog/dist/process-domain.js";
+// Cross-process tests exercise the *actual installed* continue-watchdog
+// coordinator over the real shared transport. Its dist is not published, so
+// we fetch it from the pinned upstream ref and build it once per run.
+const CONTINUE_REPO = "https://github.com/xz-dev/pi-continue-watchdog";
+const CONTINUE_REF = "b6297eed75e8ace20d7f065077c782e508135212";
 
-function spawnContinueChild(declaration) {
+let continueDistPromise;
+
+async function ensureContinueDist() {
+	if (!continueDistPromise) {
+		continueDistPromise = (async () => {
+			const worktree = await mkdtemp(
+				path.join(os.tmpdir(), "pi-continue-watchdog-e2e-"),
+			);
+			const clone = await runBoundedProcess(
+				"git",
+				["clone", "--quiet", CONTINUE_REPO, worktree],
+				{ timeoutMs: 120_000 },
+			);
+			if (clone.status !== 0 || clone.error)
+				throw new Error(`continue-watchdog clone failed:\n${clone.stderr}`);
+			const checkout = await runBoundedProcess(
+				"git",
+				["checkout", "--quiet", CONTINUE_REF],
+				{ cwd: worktree, timeoutMs: 120_000 },
+			);
+			if (checkout.status !== 0 || checkout.error)
+				throw new Error(
+					`continue-watchdog checkout ${CONTINUE_REF.slice(0, 12)} failed:\n${checkout.stderr}`,
+				);
+			const install = await runBoundedProcess(
+				"npm",
+				["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+				{ cwd: worktree, timeoutMs: 180_000 },
+			);
+			if (install.status !== 0 || install.error)
+				throw new Error(`continue-watchdog npm ci failed:\n${install.stderr}`);
+			const build = await runBoundedProcess(
+				"npx",
+				["tsc", "-p", "tsconfig.json"],
+				{ cwd: worktree, timeoutMs: 180_000 },
+			);
+			if (build.status !== 0 || build.error)
+				throw new Error(
+					`continue-watchdog build failed:\n${build.stdout}\n${build.stderr}`,
+				);
+			const dist = path.join(worktree, "dist", "process-domain.js");
+			await access(dist);
+			return dist;
+		})();
+		continueDistPromise.catch(() => {
+			// Allow a retry on the next call after a transient fetch failure.
+			continueDistPromise = undefined;
+		});
+	}
+	return continueDistPromise;
+}
+
+function spawnContinueChild(declaration, continueDist) {
 	// Minimal subprocess running the *actual installed* continue-watchdog
 	// coordinator (client role) over the real shared transport.
 	const source = [
 		'import { openProcessDomain } from "pi-extension-utils/process-domain";',
-		`import { createProcessDomainCoordinator } from ${JSON.stringify(pathToFileURL(CONTINUE_DIST).href)};`,
+		`import { createProcessDomainCoordinator } from ${JSON.stringify(pathToFileURL(continueDist).href)};`,
 		"const open = (options) => openProcessDomain({ ...options, connectTimeoutMs: 2000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 400, heartbeatTimeToLiveMs: 300 });",
 		"const coordinator = createProcessDomainCoordinator({ open });",
 		"const instance = {};",
@@ -337,7 +395,7 @@ test("real shared transport: continue first opener preserves reflect child accou
 	// Continue opens first, so its metadata ({role,pid} — no reflect protocol
 	// fields) populates the shared node declaration. Reflect must still admit
 	// the background child's accounting from private-protocol checkpoints.
-	const continueModule = pathToFileURL(CONTINUE_DIST).href;
+	const continueModule = pathToFileURL(await ensureContinueDist()).href;
 	const continueDomain = await import(continueModule);
 	const env = {};
 	const continueRoot = continueDomain.createProcessDomainCoordinator({
@@ -395,7 +453,10 @@ test("real shared transport: continue first opener preserves reflect child accou
 
 	// Continue must still observe the same background child through its own
 	// protocol on the shared transport.
-	const continueChild = spawnContinueChild(declaration);
+	const continueChild = spawnContinueChild(
+		declaration,
+		await ensureContinueDist(),
+	);
 	t.after(() => continueChild.stop());
 	await continueChild.ready();
 	await continueChild.command("busy");
@@ -434,7 +495,7 @@ test("real shared transport: reflect first opener keeps continue activity", {
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
 
-	const continueModule = pathToFileURL(CONTINUE_DIST).href;
+	const continueModule = pathToFileURL(await ensureContinueDist()).href;
 	const continueDomain = await import(continueModule);
 	const continueRoot = continueDomain.createProcessDomainCoordinator({
 		env,
@@ -464,7 +525,10 @@ test("real shared transport: reflect first opener keeps continue activity", {
 		"reflect child loop aggregates",
 	);
 
-	const continueChild = spawnContinueChild(declaration);
+	const continueChild = spawnContinueChild(
+		declaration,
+		await ensureContinueDist(),
+	);
 	t.after(() => continueChild.stop());
 	await continueChild.ready();
 	// Continue here is a non-host peer on the Reflect-owned shared node: by
