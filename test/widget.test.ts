@@ -3,10 +3,10 @@ import test from "node:test";
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+import { formatDuration } from "../src/duration.js";
 import {
 	createWatchdogWidget,
 	formatCompactWidgetText,
-	formatDuration,
 	formatWidgetText,
 	WIDGET_KEY,
 	WIDGET_PLACEMENT,
@@ -28,6 +28,7 @@ test("formatDuration renders compact paired units", () => {
 	assert.equal(formatDuration(0), "0s");
 	assert.equal(formatDuration(999), "0s");
 	assert.equal(formatDuration(45_000), "45s");
+	assert.equal(formatDuration(1_200_767), "20m0s");
 	assert.equal(formatDuration(60_000), "1m0s");
 	assert.equal(formatDuration(12 * 60_000 + 40_000), "12m40s");
 	assert.equal(formatDuration(2 * 3_600_000 + 14 * 60_000), "2h14m");

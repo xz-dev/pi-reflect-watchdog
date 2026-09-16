@@ -4,6 +4,9 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { ActivityStatus } from "./activity-types.js";
+import { formatDuration } from "./duration.js";
+
+export { formatDuration };
 
 export const WIDGET_KEY = "pi-reflect-watchdog";
 export const WIDGET_PLACEMENT = "belowEditor";
@@ -23,15 +26,6 @@ export interface WidgetState {
 	cooldownRemainingLoops?: number;
 	/** Set while a manual reflection is queued: effective cancel key or /cancel-reflect. */
 	queuedCancelLabel?: string;
-}
-
-export function formatDuration(ms: number): string {
-	const seconds = Math.max(0, Math.floor(ms / 1000));
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m${seconds % 60}s`;
-	const hours = Math.floor(minutes / 60);
-	return `${hours}h${minutes % 60}m`;
 }
 
 export function formatWidgetText(state: WidgetState): string {

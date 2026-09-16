@@ -14,6 +14,7 @@ export {
 	validateConfig,
 	type WatchdogConfig,
 } from "./config.js";
+export { formatDuration } from "./duration.js";
 export {
 	type ConfigFileIO,
 	type LoadedConfig,
@@ -58,7 +59,6 @@ export {
 export {
 	createWatchdogWidget,
 	formatCompactWidgetText,
-	formatDuration,
 	formatWidgetText,
 	WIDGET_KEY,
 	type WidgetState,

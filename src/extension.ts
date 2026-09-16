@@ -24,6 +24,7 @@ import {
 	type WatchdogConfig,
 } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
+import { formatDuration } from "./duration.js";
 import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
 import {
 	createHubAttachmentInstance,
@@ -575,7 +576,7 @@ function formatReflectionReport(
 		`Reflection · ${decision.type}`,
 		`Time: ${active.timestamp}`,
 		`Trigger: ${active.reasons.join(", ")}`,
-		`Thresholds: active=${active.thresholds.activeMs}ms/${active.thresholds.activeLoops} loops; task=${active.thresholds.taskMs}ms/${active.thresholds.taskMinutes}m; root=${active.thresholds.rootLoops}/${active.thresholds.rootLoopLimit}; all=${active.thresholds.allLoops}/${active.thresholds.allLoopLimit}`,
+		`Thresholds: active=${formatDuration(active.thresholds.activeMs)}/${active.thresholds.activeLoops} loops; task=${formatDuration(active.thresholds.taskMs)}/${active.thresholds.taskMinutes}m; root=${active.thresholds.rootLoops}/${active.thresholds.rootLoopLimit}; all=${active.thresholds.allLoops}/${active.thresholds.allLoopLimit}`,
 		`User supplement: ${supplement ? supplement : "(none)"}`,
 		`Reason: ${decision.reason}`,
 		`Done: ${decision.done}`,

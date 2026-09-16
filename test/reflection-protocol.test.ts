@@ -100,6 +100,11 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 		},
 	});
 	assert.match(prompt, /Current local RFC3339 time/);
+	assert.match(
+		prompt,
+		/Threshold snapshot: active=0s\/3 loops; task=0s\/20m; root=3\/60; all=5\/500/,
+	);
+	assert.doesNotMatch(prompt, /Threshold snapshot: active=.*ms|task=.*ms/);
 	assert.match(prompt, /User supplement: \(none\)/);
 	assert.match(prompt, /MAX_REFLECTION_TOOL_CALLS|10 tool calls/);
 	assert.match(prompt, /current_step/);

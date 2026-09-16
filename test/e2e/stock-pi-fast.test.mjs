@@ -588,7 +588,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 	assert.match(
 		continuationMessages,
-		/Threshold snapshot: active=\d+ms\/2 loops; task=\d+ms\/20m; root=2\/2; all=2\/500/,
+		/Threshold snapshot: active=\d+s\/2 loops; task=\d+s\/20m; root=2\/2; all=2\/500/,
 	);
 	assert.ok(
 		continuation.startedAt >= initialRequests[1].finishedAt,
@@ -658,7 +658,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 	assert.match(
 		JSON.stringify(reflections[1].body.messages),
-		/active=\d+ms\/14 loops/,
+		/active=\d+[smh]\/14 loops/,
 	);
 });
 
