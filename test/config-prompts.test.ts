@@ -128,6 +128,11 @@ test("built-in reflection prompt preserves the Oracle persona and framing", () =
 		/Distinguish facts from inference and uncertainty/,
 	);
 	assert.match(DEFAULT_REFLECTION_PROMPT, /Prioritize the one insight/);
+	assert.ok(
+		DEFAULT_REFLECTION_PROMPT.endsWith(
+			"Your core objective is to identify the direction that most quickly leads to the outcome the end user actually wants.",
+		),
+	);
 });
 
 test("cancelShortcut accepts a key id or false, falls back with a bounded diagnostic otherwise", () => {
