@@ -25,6 +25,7 @@ import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import type { WatchdogConfig } from "../src/config.js";
 import {
 	createWatchdogExtension,
+	reflectCooldownLoops,
 	reflectCooldownState,
 } from "../src/extension.js";
 import {
@@ -602,8 +603,9 @@ async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 }
 
 test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-loop boundary", () => {
+	const cooldownLoops = 10;
 	const completed = completedReflect();
-	assert.deepEqual(reflectCooldownState(completed as any), {
+	assert.deepEqual(reflectCooldownState(completed as any, cooldownLoops), {
 		skipAutomatic: true,
 		remainingLoops: 10,
 	});
@@ -613,20 +615,26 @@ test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-lo
 			ordinaryLoop(`ordinary-${index}`),
 		),
 	];
-	assert.deepEqual(reflectCooldownState(nineLoops as any), {
+	assert.deepEqual(reflectCooldownState(nineLoops as any, cooldownLoops), {
 		skipAutomatic: true,
 		remainingLoops: 1,
 	});
 	assert.deepEqual(
-		reflectCooldownState([...nineLoops, ordinaryLoop("ordinary-10")] as any),
+		reflectCooldownState(
+			[...nineLoops, ordinaryLoop("ordinary-10")] as any,
+			cooldownLoops,
+		),
 		{ skipAutomatic: true, remainingLoops: 0 },
 	);
 	assert.deepEqual(
-		reflectCooldownState([
-			...nineLoops,
-			ordinaryLoop("ordinary-10"),
-			ordinaryLoop("ordinary-11", "toolUse"),
-		] as any),
+		reflectCooldownState(
+			[
+				...nineLoops,
+				ordinaryLoop("ordinary-10"),
+				ordinaryLoop("ordinary-11", "toolUse"),
+			] as any,
+			cooldownLoops,
+		),
 		{ skipAutomatic: false, remainingLoops: 0 },
 	);
 	const invalidMarker = branchMessage(
@@ -645,7 +653,7 @@ test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-lo
 		},
 		"invalid-assistant",
 	);
-	assert.deepEqual(reflectCooldownState([invalidMarker] as any), {
+	assert.deepEqual(reflectCooldownState([invalidMarker] as any, 10), {
 		skipAutomatic: false,
 		remainingLoops: 0,
 	});
@@ -667,25 +675,41 @@ test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-lo
 		"later-incomplete",
 	);
 	assert.deepEqual(
-		reflectCooldownState([
-			...completed,
-			ordinaryLoop("after-valid"),
-			laterIncomplete,
-			orphanCompletion,
-		] as any),
+		reflectCooldownState(
+			[
+				...completed,
+				ordinaryLoop("after-valid"),
+				laterIncomplete,
+				orphanCompletion,
+			] as any,
+			cooldownLoops,
+		),
 		{ skipAutomatic: true, remainingLoops: 9 },
 	);
+});
+
+test("Reflect cooldown length clamps to [10, 30] at rootLoopLimit/3", () => {
+	assert.equal(reflectCooldownLoops(60), 20);
+	assert.equal(reflectCooldownLoops(30), 10);
+	assert.equal(reflectCooldownLoops(90), 30);
+	assert.equal(reflectCooldownLoops(120), 30);
+	assert.equal(reflectCooldownLoops(2), 10);
+	assert.equal(reflectCooldownLoops(0), 10);
+	assert.equal(reflectCooldownLoops(3), 10);
+	assert.equal(reflectCooldownLoops(33), 11);
+	assert.equal(reflectCooldownLoops(Number.POSITIVE_INFINITY), 30);
 });
 
 test("automatic Reflect is consumed during cooldown while manual Reflect bypasses", async () => {
 	const ctx = context("root", { mode: "tui" });
 	const { pi, domain } = install({
 		ctx,
-		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+		limits: { rootLoopLimit: 3, allLoopLimit: 100 },
 	});
 	ctx.setBranch([...completedReflect(), ordinaryLoop("ordinary-1")]);
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
+	domain.setCounters({ rootLoops: 3n });
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(lastInquiry(pi), undefined);
@@ -1462,7 +1486,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 			const { pi, ctx, domain } = install({
 				limits:
 					origin === "automatic"
-						? { rootLoopLimit: 1, allLoopLimit: 100 }
+						? { rootLoopLimit: 2, allLoopLimit: 100 }
 						: undefined,
 			});
 			const hooks = captureReflectionHooks(pi);
@@ -1482,6 +1506,8 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 			} else {
 				ctx.setIdle(false);
 				await pi.emit("agent_start", {}, ctx);
+				await pi.emit("turn_end", turnEnd("stop"), ctx);
+				// The first loop stays below the limit; the second crosses it.
 				await pi.emit("turn_end", turnEnd("stop"), ctx);
 			}
 			await startReflectionRun(pi, ctx);
@@ -1590,7 +1616,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				"raw reflection XML stays folded",
 			);
 			const writesBefore = domain.rootWrites;
-			assert.equal(writesBefore, origin === "automatic" ? 1 : 0);
+			assert.equal(writesBefore, origin === "automatic" ? 2 : 0);
 			ctx.setBranch([
 				branchMessage(captured.message, "source"),
 				...pi.entries.map((entry, index) => ({

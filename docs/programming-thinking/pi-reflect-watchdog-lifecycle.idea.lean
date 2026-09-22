@@ -342,19 +342,32 @@ theorem valid_reflection_queues_one_continuation
 
 -- Branch-derived eligibility is checked before automatic dispatch. A report
 -- projection is not an ordinary turn; only successful ordinary loops advance it.
+-- The cooldown window is a bound on ordinary loops since the last completed
+-- reflection: rootLoopLimit / 3, clamped to [10, 30].
+def cooldownBound (rootLoopLimit : Nat) : Nat :=
+  min (max (rootLoopLimit / 3) 10) 30
+
 def cooldownAllows (trigger : Trigger) (completedInquiry : Bool)
-    (ordinaryLoopsSince : Nat) : Bool :=
+    (rootLoopLimit ordinaryLoopsSince : Nat) : Bool :=
   if trigger = .userRequest then true
-  else !completedInquiry || decide (ordinaryLoopsSince > 10)
+  else
+    !completedInquiry ||
+      decide (ordinaryLoopsSince > cooldownBound rootLoopLimit)
 
 theorem cooldown_policy :
-    (cooldownAllows .rootLoopLimit true 10 = false ∧
-      cooldownAllows .rootLoopLimit true 11 = true) ∧
-    (∀ loops, cooldownAllows .userRequest true loops = true) ∧
-    (∀ trigger loops, cooldownAllows trigger false loops = true) := by
-  constructor
+    (cooldownBound 60 = 20 ∧ cooldownBound 90 = 30 ∧
+      cooldownBound 120 = 30 ∧ cooldownBound 30 = 10 ∧
+      cooldownBound 2 = 10 ∧ cooldownBound 33 = 11) ∧
+    (cooldownAllows .rootLoopLimit true 90 30 = false ∧
+      cooldownAllows .rootLoopLimit true 90 31 = true) ∧
+    (cooldownAllows .rootLoopLimit true 30 10 = false ∧
+      cooldownAllows .rootLoopLimit true 30 11 = true) ∧
+    (∀ loops, cooldownAllows .userRequest true 30 loops = true) ∧
+    (∀ trigger loops, cooldownAllows trigger false 30 loops = true) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · decide
-  constructor
+  · decide
+  · decide
   · intro loops
     simp [cooldownAllows]
   · intro trigger loops
@@ -726,10 +739,15 @@ theorem process_is_correct :
       (step state (.reflectionFinished decision)).continuationQueued = true ∧
       step (step state (.reflectionFinished decision)) (.reflectionFinished decision) =
         step state (.reflectionFinished decision)) ∧
-    ((cooldownAllows .rootLoopLimit true 10 = false ∧
-      cooldownAllows .rootLoopLimit true 11 = true) ∧
-      (∀ loops, cooldownAllows .userRequest true loops = true) ∧
-      (∀ trigger loops, cooldownAllows trigger false loops = true)) ∧
+    ((cooldownBound 60 = 20 ∧ cooldownBound 90 = 30 ∧
+      cooldownBound 120 = 30 ∧ cooldownBound 30 = 10 ∧
+      cooldownBound 2 = 10 ∧ cooldownBound 33 = 11) ∧
+    (cooldownAllows .rootLoopLimit true 90 30 = false ∧
+      cooldownAllows .rootLoopLimit true 90 31 = true) ∧
+    (cooldownAllows .rootLoopLimit true 30 10 = false ∧
+      cooldownAllows .rootLoopLimit true 30 11 = true) ∧
+    (∀ loops, cooldownAllows .userRequest true 30 loops = true) ∧
+    (∀ trigger loops, cooldownAllows trigger false 30 loops = true)) ∧
     anyLiveBusy offlineSample = false ∧
     (offlineSample.activeMs = synchronizedSample.activeMs ∧
       offlineSample.taskMs = synchronizedSample.taskMs) ∧

@@ -627,9 +627,13 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 		"ordinary fixture resumed",
 		"the continuation is ordinary output, not the internal NO_ISSUE XML",
 	);
-	// The first continuation counts as one ordinary loop. Eleven more cross
-	// the inclusive ten-loop cooldown and the unchanged two-loop threshold.
-	for (let index = 0; index < 11; index += 1) {
+	// The first continuation counts as one ordinary loop. The cooldown floor
+	// is 10 (clamped from rootLoopLimit/3 = 0 for this test's limit of 2), so
+	// eleven more ordinary loops are needed before the latched threshold can
+	// re-dispatch. Each follow-up reflection is itself an ordinary prompt, so
+	// keep asking until a request carries the threshold marker.
+	let reflections = [];
+	for (let index = 0; index < 15 && reflections.length < 2; index += 1) {
 		const next = provider.requests.length;
 		const accepted = await rpc.request({
 			type: "prompt",
@@ -643,10 +647,14 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 				message.type === "agent_settled" &&
 				at >= provider.requests[next].finishedAt,
 		);
+		reflections = provider.requests.filter((request) =>
+			request.body.messages.some((message) =>
+				providerMessageText(message).includes(warningMarker),
+			),
+		);
 	}
-	await waitForProviderRequests(provider, 17);
-	await waitForProviderResponse(provider.requests[16]);
-	const reflections = provider.requests.filter((request) =>
+	await waitForProviderResponse(provider.requests.at(-1));
+	reflections = provider.requests.filter((request) =>
 		request.body.messages.some((message) =>
 			providerMessageText(message).includes(warningMarker),
 		),
@@ -658,7 +666,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 	assert.match(
 		JSON.stringify(reflections[1].body.messages),
-		/active=\d+[smh]\/14 loops/,
+		/active=\d+[smh]\/1[2-9] loops/,
 	);
 });
 

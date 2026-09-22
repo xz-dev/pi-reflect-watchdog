@@ -23,6 +23,8 @@ const DIST_FILES = [
 	"config.js",
 	"collection-state.d.ts",
 	"collection-state.js",
+	"duration.d.ts",
+	"duration.js",
 	"extension.d.ts",
 	"extension.js",
 	"hub.d.ts",

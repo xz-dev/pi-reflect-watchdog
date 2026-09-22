@@ -67,7 +67,8 @@ const REFLECTION_COMPLETED_HOOK = "reflection-completed";
 const REFLECTION_CONTINUATION = "pi-reflect-watchdog:continuation";
 const REFLECTION_CONTINUATION_CONTENT = "[assistant]\ncontinue";
 const SEMANTIC_HOOK_TEXT_LIMIT = 4096;
-const REFLECT_COOLDOWN_LOOPS = 10;
+const REFLECT_COOLDOWN_MIN_LOOPS = 10;
+const REFLECT_COOLDOWN_MAX_LOOPS = 30;
 const ACTIVE_TICK_MS = 1_000;
 const RPC_STATUS_TICK_MS = 30_000;
 
@@ -635,7 +636,18 @@ function completedWatchdogReflection(entry: SessionEntry): string | undefined {
 	return watchdogInquiryKey(entry.data);
 }
 
-export function reflectCooldownState(entries: readonly SessionEntry[]): {
+export function reflectCooldownLoops(rootLoopLimit: number): number {
+	if (!Number.isFinite(rootLoopLimit)) return REFLECT_COOLDOWN_MAX_LOOPS;
+	return Math.min(
+		REFLECT_COOLDOWN_MAX_LOOPS,
+		Math.max(REFLECT_COOLDOWN_MIN_LOOPS, Math.floor(rootLoopLimit / 3)),
+	);
+}
+
+export function reflectCooldownState(
+	entries: readonly SessionEntry[],
+	cooldownLoops: number,
+): {
 	readonly skipAutomatic: boolean;
 	readonly remainingLoops: number;
 } {
@@ -658,11 +670,9 @@ export function reflectCooldownState(entries: readonly SessionEntry[]): {
 					watchdogInquiryAssistant(assistant) === completedInquiry
 				)
 					return {
-						skipAutomatic: loopsSinceReflect <= REFLECT_COOLDOWN_LOOPS,
-						remainingLoops: Math.max(
-							0,
-							REFLECT_COOLDOWN_LOOPS - loopsSinceReflect,
-						),
+						skipAutomatic:
+							cooldownLoops > 0 && loopsSinceReflect <= cooldownLoops,
+						remainingLoops: Math.max(0, cooldownLoops - loopsSinceReflect),
 					};
 			}
 			continue;
@@ -674,7 +684,10 @@ export function reflectCooldownState(entries: readonly SessionEntry[]): {
 }
 
 function currentCooldown(runtime: Runtime) {
-	return reflectCooldownState(runtime.ctx?.sessionManager.getBranch() ?? []);
+	return reflectCooldownState(
+		runtime.ctx?.sessionManager.getBranch() ?? [],
+		reflectCooldownLoops(runtime.config.rootLoopLimit),
+	);
 }
 
 function thresholdSnapshot(runtime: Runtime): ReflectionThresholdSnapshot {
