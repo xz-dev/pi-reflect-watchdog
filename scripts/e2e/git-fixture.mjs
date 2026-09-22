@@ -15,6 +15,7 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"src/config-loader.ts",
 	"src/config.ts",
 	"src/collection-state.ts",
+	"src/duration.ts",
 	"src/extension.ts",
 	"src/fatal-exit.ts",
 	"src/hub.ts",
