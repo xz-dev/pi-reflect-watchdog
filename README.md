@@ -51,7 +51,7 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
 ```json
 {
   "rootLoopLimit": 60,
-  "allLoopLimit": 500,
+  "allLoopLimit": 300,
   "taskMinutes": 20,
   "idleResetGapSeconds": 60,
   "reflectionPrompt": "Reassess the current route using verified evidence.",
@@ -77,19 +77,19 @@ Runtime reset, dynamic limit controls, history/timeline tools, public pause APIs
 Below-editor live row uses same `setWidget`/`requestRender` pattern as Continue Watchdog:
 
 ```text
-Reflect Watchdog | active 12m40s/137 loops · task 12m40s/20m · root 37/60 · all 128/500
+Reflect Watchdog | active 12m40s/137 loops · task 12m40s/20m · root 37/60 · all 128/300
 ```
 
 While a manual reflection waits behind another outstanding reflection, the row gains the cancel gesture:
 
 ```text
-Reflect Watchdog | active 12m40s/137 loops · task 12m40s/20m · root 37/60 · all 128/500 · queued · alt+x to cancel
+Reflect Watchdog | active 12m40s/137 loops · task 12m40s/20m · root 37/60 · all 128/300 · queued · alt+x to cancel
 ```
 
 When terminal is narrow it switches to compact form before final truncation:
 
 ```text
-RW | a 12m40s/137 · t 12m40s/20m · r 37/60 · all 128/500
+RW | a 12m40s/137 · t 12m40s/20m · r 37/60 · all 128/300
 ```
 
 ## Install

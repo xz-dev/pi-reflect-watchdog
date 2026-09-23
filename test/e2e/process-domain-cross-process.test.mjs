@@ -713,7 +713,7 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 			loadConfig: async () => ({
 				config: {
 					rootLoopLimit: 3,
-					allLoopLimit: 500,
+					allLoopLimit: 300,
 					taskMinutes: 20,
 					idleResetGapSeconds: 60,
 					reflectionPrompt: "Inspect current work and return reflection XML.",

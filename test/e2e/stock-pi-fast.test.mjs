@@ -230,7 +230,7 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 60,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
 	const tracePath = await installHookTracer({
@@ -311,7 +311,7 @@ test("packed stock Pi semantic hook pause suppresses then resumes automatic refl
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 1,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 		hookPauses: [{ pause: "fixture-pause", resume: "fixture-resume" }],
 	});
@@ -452,7 +452,7 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 60,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
 	const provider = await startFakeProvider({
@@ -540,7 +540,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 2,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
 	const provider = await startFakeProvider({ responsePlan: warningPlan });
@@ -588,7 +588,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	);
 	assert.match(
 		continuationMessages,
-		/Threshold snapshot: active=\d+s\/2 loops; task=\d+s\/20m; root=2\/2; all=2\/500/,
+		/Threshold snapshot: active=\d+s\/2 loops; task=\d+s\/20m; root=2\/2; all=2\/300/,
 	);
 	assert.ok(
 		continuation.startedAt >= initialRequests[1].finishedAt,
@@ -685,7 +685,7 @@ test("manual reflection submitted mid-tool-turn steers after the full tool batch
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 60,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
 	const reflectionXml =
@@ -829,7 +829,7 @@ for (const [origin, type] of [
 		});
 		await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 			rootLoopLimit: origin === "automatic" ? 1 : 100,
-			allLoopLimit: 500,
+			allLoopLimit: 300,
 			taskMinutes: 20,
 		});
 		const reflectionXml = `<reflection><type>${type}</type><reason>preserve the clarification</reason><done>checked current direction</done><current_step>reassess the abstraction layers</current_step><next_step>wait for the existing callback</next_step></reflection>`;
@@ -952,7 +952,7 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 	});
 	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
 		rootLoopLimit: 60,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
 	const tracePath = path.join(resources.base, "completion-order.jsonl");

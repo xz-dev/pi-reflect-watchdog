@@ -96,13 +96,13 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 			rootLoops: 3,
 			rootLoopLimit: 60,
 			allLoops: 5,
-			allLoopLimit: 500,
+			allLoopLimit: 300,
 		},
 	});
 	assert.match(prompt, /Current local RFC3339 time/);
 	assert.match(
 		prompt,
-		/Threshold snapshot: active=0s\/3 loops; task=0s\/20m; root=3\/60; all=5\/500/,
+		/Threshold snapshot: active=0s\/3 loops; task=0s\/20m; root=3\/60; all=5\/300/,
 	);
 	assert.doesNotMatch(prompt, /Threshold snapshot: active=.*ms|task=.*ms/);
 	assert.match(prompt, /User supplement: \(none\)/);
@@ -173,7 +173,7 @@ test("history recovery is optional, branch-scoped JSON data", () => {
 				rootLoops: 0,
 				rootLoopLimit: 60,
 				allLoops: 0,
-				allLoopLimit: 500,
+				allLoopLimit: 300,
 			},
 			historyLocator,
 		});
@@ -219,7 +219,7 @@ test("reflection prompt places the previous report before current trigger contex
 			rootLoops: 3,
 			rootLoopLimit: 60,
 			allLoops: 5,
-			allLoopLimit: 500,
+			allLoopLimit: 300,
 		},
 	});
 	const previous = prompt.indexOf(previousReport);

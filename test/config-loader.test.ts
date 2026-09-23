@@ -31,7 +31,7 @@ test("loads global and trusted project configuration with independent reflection
 	assert.equal(trusted.config.reflectionPrompt, "project");
 	assert.equal(trusted.diagnostics.length, 1);
 	const untrusted = await loadRuntimeConfig("/work", false, io, "/agent");
-	assert.equal(untrusted.config.allLoopLimit, 500);
+	assert.equal(untrusted.config.allLoopLimit, 300);
 });
 
 test("malformed and inaccessible configuration stay bounded and nonfatal", async () => {

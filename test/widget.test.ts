@@ -43,11 +43,11 @@ test("idle state renders the meaningful zero line", () => {
 		rootLoops: 0,
 		rootLoopLimit: 60,
 		allLoops: 0,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 0s/0 loops · task 0s/20m · root 0/60 · all 0/500",
+		"Reflect Watchdog | active 0s/0 loops · task 0s/20m · root 0/60 · all 0/300",
 	);
 });
 
@@ -63,11 +63,11 @@ test("live state renders the exact approved example format", () => {
 		rootLoops: 37,
 		rootLoopLimit: 60,
 		allLoops: 128,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/300",
 	);
 });
 
@@ -79,7 +79,7 @@ test("cooldown suffix renders only while loops remain", () => {
 		rootLoops: 0,
 		rootLoopLimit: 60,
 		allLoops: 0,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		cooldownRemainingLoops: 3,
 	};
 	assert.match(
@@ -106,13 +106,13 @@ test("component switches to compact text before final truncation", () => {
 		rootLoops: 37,
 		rootLoopLimit: 60,
 		allLoops: 128,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 	}));
 	const full = widget.render(width);
 	assert.equal(full.length, 1);
 	assert.equal(
 		full[0],
-		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/500",
+		"Reflect Watchdog | active 2h14m/137 loops · task 12m40s/20m · root 37/60 · all 128/300",
 	);
 	width = 40;
 	const narrow = widget.render(width);
@@ -127,7 +127,7 @@ test("component switches to compact text before final truncation", () => {
 				rootLoops: 37,
 				rootLoopLimit: 60,
 				allLoops: 128,
-				allLoopLimit: 500,
+				allLoopLimit: 300,
 			}),
 			width,
 		),
@@ -144,7 +144,7 @@ test("component re-reads live state on every render", () => {
 		rootLoops: 1,
 		rootLoopLimit: 60,
 		allLoops: 1,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 	}));
 	assert.match(widget.render(200)[0], /active 1s\/1 loops/);
 	elapsed = 2_000;
@@ -159,12 +159,12 @@ test("queued reflection appends the effective cancel label to full and compact r
 		rootLoops: 2,
 		rootLoopLimit: 60,
 		allLoops: 2,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		queuedCancelLabel: "alt+x",
 	};
 	assert.equal(
 		formatWidgetText(state),
-		"Reflect Watchdog | active 5s/2 loops · task 5s/20m · root 2/60 · all 2/500 · queued · alt+x to cancel",
+		"Reflect Watchdog | active 5s/2 loops · task 5s/20m · root 2/60 · all 2/300 · queued · alt+x to cancel",
 	);
 	assert.match(formatCompactWidgetText(state), /· q alt\+x$/);
 });
@@ -177,7 +177,7 @@ test("disabled shortcut surfaces the cancel command in the queued segment", () =
 		rootLoops: 2,
 		rootLoopLimit: 60,
 		allLoops: 2,
-		allLoopLimit: 500,
+		allLoopLimit: 300,
 		queuedCancelLabel: "/cancel-reflect",
 	};
 	assert.match(

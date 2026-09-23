@@ -59,7 +59,7 @@ test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 	});
 	resources.add(() => tui.close());
 	await tui.waitFor(
-		/Reflect Watchdog \| active 0s\/0 loops · task 0s\/20m · root 0\/60 · all 0\/500/,
+		/Reflect Watchdog \| active 0s\/0 loops · task 0s\/20m · root 0\/60 · all 0\/300/,
 	);
 
 	tui.send("First real turn");
@@ -74,7 +74,7 @@ test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 		"below-editor active time redraws about once per second",
 	);
 	const settled = await tui.waitFor(
-		/Reflect Watchdog \| active \d+s\/1 loops · task \d+s\/20m · root 1\/60 · all 1\/500/,
+		/Reflect Watchdog \| active \d+s\/1 loops · task \d+s\/20m · root 1\/60 · all 1\/300/,
 		12_000,
 	);
 	const frozen = activeSeconds(settled);
@@ -87,7 +87,7 @@ test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 
 	tui.send("Second real turn");
 	await tui.waitFor(
-		/Reflect Watchdog \| active \d+s\/2 loops · task \d+s\/20m · root 2\/60 · all 2\/500/,
+		/Reflect Watchdog \| active \d+s\/2 loops · task \d+s\/20m · root 2\/60 · all 2\/300/,
 		12_000,
 	);
 
