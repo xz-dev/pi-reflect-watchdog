@@ -131,7 +131,8 @@ export type CollectionEvent =
 			readonly atMs: number;
 	  }
 	| { readonly type: "tick"; readonly atMs: number }
-	| { readonly type: "reminder-accepted"; readonly atMs: number };
+	| { readonly type: "reminder-accepted"; readonly atMs: number }
+	| { readonly type: "cycle-reset"; readonly atMs: number };
 
 function localContributorKey(contributorId: string): string {
 	return `local:${JSON.stringify(contributorId)}`;
@@ -599,6 +600,27 @@ export function reduceCollectionState(
 				nowMs: atMs,
 				ledger: pruneLedger(state.ledger, atMs),
 				accounting,
+			};
+		}
+		case "cycle-reset": {
+			const accounting = settleAccounting(state.accounting, atMs);
+			const anyBusy = !accounting.paused && busyCount(state.live) > 0;
+			return {
+				...state,
+				nowMs: atMs,
+				ledger: pruneLedger(state.ledger, atMs),
+				accounting: {
+					...accounting,
+					activeMs: 0n,
+					activeLoops: 0n,
+					taskMs: 0n,
+					rootLoops: 0n,
+					allLoops: 0n,
+					activeSinceMs: anyBusy ? atMs : null,
+					taskSinceMs: anyBusy ? atMs : null,
+					idleSinceMs: anyBusy ? null : (accounting.idleSinceMs ?? atMs),
+					graceSinceMs: anyBusy ? null : accounting.graceSinceMs,
+				},
 			};
 		}
 	}

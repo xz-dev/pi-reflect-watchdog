@@ -380,6 +380,45 @@ test("idle reset preserves exactly sixty seconds and resets only after overflow"
 	assert.equal(reset.allLoops, 0n);
 });
 
+test("cycle reset zeroes every counter and preserves the live interval", () => {
+	let state = createCollectionState();
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-loop",
+		scope: "root",
+		atMs: 50,
+	});
+	state = reduceCollectionState(state, {
+		type: "cycle-reset",
+		atMs: 100,
+	});
+
+	let snapshot = snapshotCollectionState(state);
+	assert.equal(snapshot.activeMs, 0n);
+	assert.equal(snapshot.activeLoops, 0n);
+	assert.equal(snapshot.taskMs, 0n);
+	assert.equal(snapshot.rootLoops, 0n);
+	assert.equal(snapshot.allLoops, 0n);
+	assert.equal(snapshot.phase, "collecting");
+	assert.equal(snapshot.liveContributors, 1);
+	assert.equal(snapshot.busyContributors, 1);
+	assert.equal(state.ledger.size, 0);
+
+	state = reduceCollectionState(state, {
+		type: "tick",
+		atMs: 250,
+	});
+	snapshot = snapshotCollectionState(state);
+	assert.equal(snapshot.activeMs, 150n);
+	assert.equal(snapshot.taskMs, 150n);
+	assert.equal(snapshot.activeLoops, 0n);
+});
+
 test("new synchronized handle replaces the prior handle for one replay key", () => {
 	let state = synchronize(createCollectionState(), {
 		atMs: 0,

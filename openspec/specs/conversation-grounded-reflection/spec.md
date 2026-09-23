@@ -118,7 +118,7 @@ The handoff SHALL return the existing reflection report for assessment in the or
 
 The public reflection XML SHALL retain the five unique non-empty fields `type`, `reason`, `done`, `current_step`, and `next_step`, with only `NO_ISSUE` and `ROUTE_CORRECTION` as result types. Existing stored reports SHALL remain readable without migration. The history locator SHALL NOT be added to the stored report or completion-hook payload. Free-text report fields SHALL NOT become completion-state selectors.
 
-Inquiry folding, retry accounting, internal counter exclusions, automatic thresholds, cooldown, cross-process coordination, and completion-hook timing and values SHALL retain their existing contracts. The ordinary continuation for either valid result SHALL count as ordinary work, not another internal inquiry. The change SHALL NOT introduce new configuration options, a task-completion decision type, or a second inquiry lifecycle. Model-facing source projection SHALL NOT change which underlying turns count as ordinary work.
+Inquiry folding, retry accounting, internal counter exclusions, automatic thresholds, cooldown, cross-process coordination, and completion-hook timing and values SHALL retain their existing contracts, except that a confirmed user takeover SHALL reset the full automatic-threshold activity cycle before further threshold evaluation. The ordinary continuation for either valid result SHALL count as ordinary work, not another internal inquiry. The change SHALL NOT introduce new configuration options, a task-completion decision type, or a second inquiry lifecycle. Model-facing source projection SHALL NOT change which underlying turns count as ordinary work.
 
 #### Scenario: Completion and subsequent reflection
 - **WHEN** a valid reflection is completed and another reflection occurs later
@@ -146,6 +146,12 @@ Inquiry folding, retry accounting, internal counter exclusions, automatic thresh
 - **WHEN** XML validation exhausts or a settled inquiry has no captured decision and is cancelled
 - **THEN** this change does not add an ordinary continuation or completion hook for that path
 - **AND** existing warnings and cleanup behavior remain intact
+
+#### Scenario: User takeover restarts threshold accounting
+- **GIVEN** automatic thresholds were approaching or already crossed in the interrupted cycle
+- **WHEN** the user sends a real ordinary message or aborts the terminal assistant
+- **THEN** the full activity cycle is reset before automatic thresholds are evaluated again
+- **AND** the interrupted cycle's counters cannot trigger the next automatic reflection
 
 ### Requirement: Reflection feedback uses trigger-specific model-facing roles
 

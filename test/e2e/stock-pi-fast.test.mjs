@@ -119,6 +119,31 @@ async function tracedHooks(tracePath) {
 }
 
 function warningPlan({ requestIndex, request: { body } }) {
+	const lastMessage = body.messages.at(-1);
+	if (
+		lastMessage?.role === "user" &&
+		providerMessageText(lastMessage).includes("ordinary paired follow-up")
+	) {
+		return {
+			delay: 20,
+			chunks: [
+				{
+					tool_calls: [
+						{
+							index: 0,
+							id: "paired-read",
+							type: "function",
+							function: {
+								name: "read",
+								arguments: '{"path":"package.json","limit":1,"offset":1}',
+							},
+						},
+					],
+				},
+			],
+			finishReason: "tool_calls",
+		};
+	}
 	if (requestIndex === 0) {
 		return {
 			delay: 20,
@@ -621,19 +646,28 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 		4,
 		"completed evidence prevents the latched automatic reflection from redispatching during cooldown",
 	);
+	const takeover = await rpc.request({
+		type: "prompt",
+		message: "ordinary takeover",
+	});
+	assert.equal(takeover.success, true);
+	await waitForProviderRequests(provider, 5);
+	await waitForProviderResponse(provider.requests[4]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[4].finishedAt,
+	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(
 		last.data.text ?? "",
 		"ordinary fixture resumed",
 		"the continuation is ordinary output, not the internal NO_ISSUE XML",
 	);
-	// The first continuation counts as one ordinary loop. The cooldown floor
-	// is 10 (clamped from rootLoopLimit/3 = 0 for this test's limit of 2), so
-	// eleven more ordinary loops are needed before the latched threshold can
-	// re-dispatch. Each follow-up reflection is itself an ordinary prompt, so
-	// keep asking until a request carries the threshold marker.
-	let reflections = [];
-	for (let index = 0; index < 15 && reflections.length < 2; index += 1) {
+	// The takeover prompt resets the activity cycle and counts as one ordinary
+	// loop. Ten more one-loop prompts complete the cooldown floor; a later
+	// prompt must produce two turns inside the same cycle because every real
+	// user message now resets the counters first.
+	for (let index = 0; index < 10; index += 1) {
 		const next = provider.requests.length;
 		const accepted = await rpc.request({
 			type: "prompt",
@@ -647,14 +681,27 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 				message.type === "agent_settled" &&
 				at >= provider.requests[next].finishedAt,
 		);
-		reflections = provider.requests.filter((request) =>
-			request.body.messages.some((message) =>
-				providerMessageText(message).includes(warningMarker),
-			),
-		);
 	}
-	await waitForProviderResponse(provider.requests.at(-1));
-	reflections = provider.requests.filter((request) =>
+
+	const pairedStart = provider.requests.length;
+	const paired = await rpc.request({
+		type: "prompt",
+		message: "ordinary paired follow-up",
+	});
+	assert.equal(paired.success, true);
+	await waitForProviderRequests(provider, pairedStart + 2);
+	await waitForProviderResponse(provider.requests[pairedStart + 1]);
+	await waitForProviderRequests(provider, pairedStart + 3);
+	const laterReflection = provider.requests[pairedStart + 2];
+	await waitForProviderResponse(laterReflection);
+	await waitForProviderRequests(provider, pairedStart + 4);
+	await waitForProviderResponse(provider.requests[pairedStart + 3]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" &&
+			at >= provider.requests[pairedStart + 3].finishedAt,
+	);
+	const reflections = provider.requests.filter((request) =>
 		request.body.messages.some((message) =>
 			providerMessageText(message).includes(warningMarker),
 		),
@@ -662,12 +709,9 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	assert.equal(
 		reflections.length,
 		2,
-		"a later threshold still reflects after cooldown",
+		"a later same-cycle threshold still reflects after cooldown",
 	);
-	assert.match(
-		JSON.stringify(reflections[1].body.messages),
-		/active=\d+[smh]\/1[2-9] loops/,
-	);
+	assert.match(JSON.stringify(reflections[1].body.messages), /root=2\/2/);
 });
 
 test("manual reflection submitted mid-tool-turn steers after the full tool batch", {

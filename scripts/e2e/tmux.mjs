@@ -30,7 +30,7 @@ export function buildTmuxShellCommand({ cwd, env, executable, args }) {
 		...args.map((argument) => shellLiteral(argument, "Argument")),
 	].join(" ");
 	const environment = environmentAssignments(env);
-	return `cd ${shellLiteral(cwd, "Working directory")} && exec env ${environment.join(" ")} ${command}`;
+	return `cd ${shellLiteral(cwd, "Working directory")} && exec env -i ${environment.join(" ")} ${command}`;
 }
 
 export function assertTmux() {

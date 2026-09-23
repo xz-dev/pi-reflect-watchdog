@@ -87,7 +87,7 @@ test("stock Pi TUI renders, ticks, compacts, and freezes at idle", {
 
 	tui.send("Second real turn");
 	await tui.waitFor(
-		/Reflect Watchdog \| active \d+s\/2 loops · task \d+s\/20m · root 2\/60 · all 2\/300/,
+		/Reflect Watchdog \| active \d+s\/1 loops · task \d+s\/20m · root 1\/60 · all 1\/300/,
 		12_000,
 	);
 

@@ -78,6 +78,8 @@ structure State where
 inductive Event where
   | acquireMain
   | loseMain
+  | userTakeoverMessage
+  | terminalAbortSettled
   | agentStart (kind : RunKind)
   | observeOtherBusy (busy : Bool)
   | semanticHook (name : String)
@@ -130,6 +132,13 @@ def countTick (state : State) : State :=
     { next with pending := mergeTriggers next.pending (crossed next) }
   else state
 
+def resetCycle (_counters : Counters) : Counters :=
+  { activeMs := 0
+    activeLoops := 0
+    taskMs := 0
+    rootLoops := 0
+    allLoops := 0 }
+
 -- Ordinary successful turns increment the loop counters exactly once.
 -- Reflection turns and unsuccessful outcomes preserve every counter.
 def countTurn (state : State) (outcome : TurnOutcome) : State :=
@@ -159,6 +168,12 @@ def step (state : State) (event : Event) : State :=
     | .semanticHook name => { state with hookPairs := applyHook name state.hookPairs }
     | .activeTick => countTick state
     | .successfulTurn outcome => countTurn state outcome
+    | .userTakeoverMessage | .terminalAbortSettled =>
+        if state.phase = .main then
+          { state with
+            counters := resetCycle state.counters
+            pending := state.pending.filter (fun trigger => trigger = .userRequest) }
+        else state
     | .agentSettled => { state with localBusy := false }
     | .queueManualReflection =>
         { state with pending := state.pending ++ [.userRequest] }
@@ -265,6 +280,20 @@ theorem paused_successful_turn_never_counts
     (isPaused : paused state = true) :
     (countTurn state outcome).counters = state.counters := by
   simp [countTurn, isPaused]
+
+theorem user_takeover_resets_cycle_and_keeps_manual_pending :
+    let state := { initial with
+      phase := .main
+      counters := { activeMs := 1, activeLoops := 2, taskMs := 3, rootLoops := 4, allLoops := 5 }
+      pending := [.rootLoopLimit, .userRequest] }
+    let reset := step state .userTakeoverMessage
+    reset.counters = resetCycle state.counters ∧
+      reset.pending = [.userRequest] := by
+  simp [step, resetCycle]
+
+theorem observer_takeover_is_ignored :
+    (step initial .terminalAbortSettled).counters = initial.counters := by
+  decide
 
 theorem unmatched_resume_is_idempotent :
     let state := { initial with hookPairs :=

@@ -969,6 +969,14 @@ test("local attachments, loops, tick projection, and reminder reset share reduce
 	await coordinator.resetReminderCycle();
 	assert.equal(coordinator.counters()?.activeMs.value, 250n);
 	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	const beforeTakeoverReset = coordinator.counters()?.revision ?? 0n;
+	await coordinator.resetCycleOnUserTakeover();
+	assert.equal(coordinator.counters()?.activeMs.value, 0n);
+	assert.equal(coordinator.counters()?.activeLoops.value, 0n);
+	assert.equal(coordinator.counters()?.taskMs.value, 0n);
+	assert.equal(coordinator.counters()?.rootLoops.value, 0n);
+	assert.equal(coordinator.counters()?.allLoops.value, 0n);
+	assert.ok((coordinator.counters()?.revision ?? 0n) > beforeTakeoverReset);
 	await coordinator.detach(first);
 	assert.equal(coordinator.counters()?.localBusy, false);
 	await coordinator.detach(second);

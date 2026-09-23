@@ -183,6 +183,18 @@ class FakeDomain implements ReflectDomainCoordinator {
 		return this.value;
 	}
 
+	async resetCycleOnUserTakeover() {
+		this.value = this.next({
+			activeMs: 0n,
+			activeLoops: 0n,
+			taskMs: 0n,
+			rootLoops: 0n,
+			allLoops: 0n,
+		});
+		this.publish();
+		return this.value;
+	}
+
 	async setPaused(paused: boolean) {
 		this.paused = paused;
 		this.value = { ...this.value, paused };
@@ -904,6 +916,183 @@ test("minimal core exposes only /reflect, /cancel-reflect and no model tools", a
 		["reflect", "cancel-reflect"],
 	);
 	assert.equal("registerTool" in pi, false);
+});
+
+test("ordinary user message resets the full cycle without touching reflection-owned messages", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	domain.setCounters({
+		activeMs: 1_000n,
+		activeLoops: 2n,
+		taskMs: 3_000n,
+		rootLoops: 4n,
+		allLoops: 5n,
+	});
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	assert.equal(domain.counters().activeMs.value, 0n);
+	assert.equal(domain.counters().activeLoops.value, 0n);
+	assert.equal(domain.counters().taskMs.value, 0n);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	assert.equal(domain.counters().allLoops.value, 0n);
+
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
+	const resetBeforeReflection = domain.counters().revision;
+	await correlateReflection(pi, ctx);
+	assert.equal(
+		domain.counters().revision,
+		resetBeforeReflection,
+		"matching the reflection inquiry must not self-reset",
+	);
+});
+
+test("takeover discards stale automatic intent while preserving the manual queue", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
+
+	await pi.commands[0]?.handler("manual stays", ctx);
+	const manualInquiries = pi.messages.filter(({ message }) =>
+		String(message.customType ?? "").endsWith(":inquiry"),
+	).length;
+	assert.equal(runtimeQueuedState(pi, ctx), true);
+	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		manualInquiries,
+		"user takeover does not dispatch the stale automatic reflection",
+	);
+	assert.equal(
+		runtimeQueuedState(pi, ctx),
+		true,
+		"manual request remains queued after takeover",
+	);
+});
+
+test("non-main user message does not request a takeover reset", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const root = install({
+		hub,
+		domain,
+		ctx: context("root", { hasUI: true }),
+	});
+	const child = install({
+		hub,
+		domain,
+		ctx: context("child", { hasUI: false }),
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	await child.pi.emit("session_start", {}, child.ctx);
+	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
+	const revision = domain.counters().revision;
+	await child.pi.emit(
+		"message_start",
+		{ message: { role: "user" } },
+		child.ctx,
+	);
+	assert.equal(domain.counters().revision, revision);
+	assert.equal(domain.counters().rootLoops.value, 1n);
+	assert.equal(domain.counters().allLoops.value, 1n);
+});
+
+test("terminal abort resets while non-abort and missing boundary preserve counters", async () => {
+	const { pi, ctx, domain } = install();
+	await pi.emit("session_start", {}, ctx);
+	ctx.setBranch([ordinaryLoop("before")]);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setBranch([
+		ordinaryLoop("before"),
+		ordinaryLoop("aborted-tail", "aborted"),
+	]);
+	domain.setCounters({
+		activeMs: 1_000n,
+		activeLoops: 2n,
+		taskMs: 3_000n,
+		rootLoops: 4n,
+		allLoops: 5n,
+	});
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.counters().activeMs.value, 0n);
+	assert.equal(domain.counters().activeLoops.value, 0n);
+	assert.equal(domain.counters().taskMs.value, 0n);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	assert.equal(domain.counters().allLoops.value, 0n);
+
+	ctx.setBranch([ordinaryLoop("before")]);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setBranch([
+		ordinaryLoop("before"),
+		ordinaryLoop("ordinary-tail", "stop"),
+	]);
+	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.counters().rootLoops.value, 1n);
+	assert.equal(domain.counters().allLoops.value, 1n);
+
+	ctx.setBranch([ordinaryLoop("aborted-without-capture", "aborted")]);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.counters().rootLoops.value, 1n);
+	assert.equal(domain.counters().allLoops.value, 1n);
+});
+
+test("abort reset runs after reflection persistence and continuation", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const branch: any[] = [ordinaryLoop("before")];
+	ctx.setBranch(branch);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	assert.ok(captured);
+	ctx.setBranch([
+		...branch,
+		branchMessage(
+			{
+				...captured.message,
+				stopReason: "aborted",
+			},
+			"reflection-aborted-tail",
+		),
+	]);
+	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.ok(
+		pi.entries.some(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		),
+		"reflection result persistence is preserved",
+	);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	assert.equal(domain.counters().allLoops.value, 0n);
+	assert.deepEqual(
+		pi.actions.filter((action) => action === "continuation").length,
+		1,
+	);
 });
 
 test("authoritative domain loops trigger the ask from ordinary work", async () => {

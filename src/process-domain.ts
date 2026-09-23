@@ -197,6 +197,7 @@ export interface ReflectDomainCoordinator {
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
 	setIdleResetGapSeconds(seconds: number): void;
 	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
+	resetCycleOnUserTakeover(): Promise<ReflectDomainCounters | undefined>;
 }
 
 type ReflectDomainPauseControl = (
@@ -1310,6 +1311,12 @@ export function createReflectDomainCoordinator(
 		async resetReminderCycle() {
 			if (!rootProcess || collectionState === undefined) return countersValue;
 			reduce({ type: "reminder-accepted", atMs: now() });
+			await publishHost();
+			return countersValue;
+		},
+		async resetCycleOnUserTakeover() {
+			if (!rootProcess || collectionState === undefined) return countersValue;
+			reduce({ type: "cycle-reset", atMs: now() });
 			await publishHost();
 			return countersValue;
 		},

@@ -2,6 +2,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	MessageEndEvent,
+	MessageStartEvent,
 	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -161,6 +162,7 @@ interface Runtime {
 	manualQueue: PendingReflection[];
 	activeReflection?: ActiveReflection;
 	internalRun: InternalRun;
+	abortBoundaryLeafId?: string | null;
 	reflectionSequence: number;
 	ticker?: Timer;
 	widgetTui: { requestRender(): void } | null;
@@ -1005,6 +1007,38 @@ function isSuccessfulTurn(event: TurnEndEvent): boolean {
 	);
 }
 
+function isUserTakeoverMessageStart(event: MessageStartEvent): boolean {
+	return event.message.role === "user";
+}
+
+function resetCycleForUserTakeover(runtime: Runtime): void {
+	if (!owns(runtime)) return;
+	runtime.latched.clear();
+	runtime.pendingAutomatic = undefined;
+	void runtime.processDomain.resetCycleOnUserTakeover().catch(() => {});
+}
+
+function isAbortedTerminalTakeover(
+	branch: readonly SessionEntry[],
+	boundaryLeafId: string | null,
+): boolean {
+	let startIndex = 0;
+	if (boundaryLeafId !== null) {
+		const boundaryIndex = branch.findIndex(
+			(entry) => entry.id === boundaryLeafId,
+		);
+		if (boundaryIndex === -1) return false;
+		startIndex = boundaryIndex + 1;
+	}
+	let terminalStopReason: string | undefined;
+	for (let index = startIndex; index < branch.length; index++) {
+		const entry = branch[index];
+		if (entry?.type === "message" && entry.message.role === "assistant")
+			terminalStopReason = entry.message.stopReason;
+	}
+	return terminalStopReason === "aborted";
+}
+
 function syncOwnership(runtime: Runtime, services: RuntimeServices): void {
 	if (runtime.stopped || runtime.attachment === null) return;
 	if (runtime.hub.snapshot.main === null)
@@ -1047,6 +1081,7 @@ function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
 	runtime.claim = null;
 	runtime.ctx = null;
 	runtime.activeReflection = undefined;
+	runtime.abortBoundaryLeafId = undefined;
 	runtime.manualQueue = [];
 	runtime.pendingAutomatic = undefined;
 	if (runtime.domainAttached) {
@@ -1243,6 +1278,9 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("agent_start", (_event, ctx) => {
+			runtime.abortBoundaryLeafId = owns(runtime)
+				? ctx.sessionManager.getLeafId()
+				: undefined;
 			const active = runtime.activeReflection;
 			if (active !== undefined && runtime.internalRun.kind !== "confirmed") {
 				runtime.internalRun = {
@@ -1258,7 +1296,9 @@ export function createWatchdogExtension(
 			if (active?.handle.matchesPrompt(event.message)) {
 				runtime.internalRun = { kind: "confirmed", attempt: active.attempt };
 				observe(runtime, ctx);
+				return;
 			}
+			if (isUserTakeoverMessageStart(event)) resetCycleForUserTakeover(runtime);
 		});
 
 		pi.on("tool_call", () => {
@@ -1325,6 +1365,14 @@ export function createWatchdogExtension(
 			// be treated as the settled run's reflection below; only the active
 			// reflection present at handler entry belongs to this settlement.
 			const activeAtEntry = runtime.activeReflection;
+			const abortBoundaryLeafId = runtime.abortBoundaryLeafId;
+			runtime.abortBoundaryLeafId = undefined;
+			const abortedTakeover =
+				abortBoundaryLeafId !== undefined &&
+				isAbortedTerminalTakeover(
+					ctx.sessionManager.getBranch(),
+					abortBoundaryLeafId,
+				);
 			observe(runtime, ctx);
 			const active = runtime.activeReflection;
 			if (
@@ -1346,6 +1394,7 @@ export function createWatchdogExtension(
 							runtime,
 							buildReflectionReaskPrompt(planned.error),
 						);
+						if (abortedTakeover) resetCycleForUserTakeover(runtime);
 						return;
 					}
 					const fold = active.handle.complete();
@@ -1359,6 +1408,7 @@ export function createWatchdogExtension(
 						"warning",
 					);
 					finishReflection(runtime);
+					if (abortedTakeover) resetCycleForUserTakeover(runtime);
 					maybeDispatch(runtime);
 					return;
 				}
@@ -1374,6 +1424,7 @@ export function createWatchdogExtension(
 					pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
 					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
 					publishReflectionCompleted(runtime, planned);
+					if (abortedTakeover) resetCycleForUserTakeover(runtime);
 					maybeDispatch(runtime);
 					return;
 				}
@@ -1384,9 +1435,11 @@ export function createWatchdogExtension(
 						triggerTurn: false,
 					});
 				finishReflection(runtime);
+				if (abortedTakeover) resetCycleForUserTakeover(runtime);
 				maybeDispatch(runtime);
 				return;
 			}
+			if (abortedTakeover) resetCycleForUserTakeover(runtime);
 			latchAutomaticReflection(runtime);
 			maybeDispatch(runtime);
 		});

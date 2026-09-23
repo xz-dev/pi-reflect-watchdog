@@ -40,7 +40,7 @@ test("tmux argv and environment preserve shell metacharacters literally", async 
 		executable: process.execPath,
 		args: [
 			"-e",
-			`require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({env:process.env.WATCHDOG_LITERAL,args:process.argv.slice(1)}))`,
+			`require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({env:process.env.WATCHDOG_LITERAL,inherited:process.env.PI_EXTENSION_UTILS_PROCESS_DOMAIN,args:process.argv.slice(1)}))`,
 			...values,
 		],
 	});
@@ -51,7 +51,13 @@ test("tmux argv and environment preserve shell metacharacters literally", async 
 		true,
 		"shell substitutions never execute",
 	);
-	assert.deepEqual(JSON.parse(await readFile(output, "utf8")), {
+	const observed = JSON.parse(await readFile(output, "utf8"));
+	assert.equal(
+		"inherited" in observed,
+		false,
+		"tmux environment does not inherit the parent process-domain declaration",
+	);
+	assert.deepEqual(observed, {
 		env: values.join("|"),
 		args: values,
 	});
