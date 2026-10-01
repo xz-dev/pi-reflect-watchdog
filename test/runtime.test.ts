@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
 	createAssistantMessageEventStream,
+	normalizeContext,
 	type StreamFunction,
 	Type,
 } from "@earendil-works/pi-ai";
@@ -2286,7 +2287,11 @@ test("built-in compaction and branch summaries see only the wake for either trig
 		const messages = session.buildSessionContext().messages;
 		const captured: string[] = [];
 		const streamFn = (_model: any, request: any) => {
-			captured.push(providerMessageTextForRuntime(request.messages[0]));
+			captured.push(
+				providerMessageTextForRuntime(
+					request.messages.find((message: any) => message.role === "user"),
+				),
+			);
 			const stream = createAssistantMessageEventStream();
 			stream.push({
 				type: "done",
@@ -2474,7 +2479,7 @@ for (const [label, provider, modelId, api, adapter] of [
 				const stream: StreamFunction<any> = adapter;
 				const result = await stream(
 					model,
-					{
+					normalizeContext({
 						messages,
 						tools: [
 							{
@@ -2483,7 +2488,7 @@ for (const [label, provider, modelId, api, adapter] of [
 								parameters: Type.Object({ path: Type.String() }),
 							},
 						],
-					},
+					}),
 					{
 						apiKey: "offline-fixture",
 						env: {},
