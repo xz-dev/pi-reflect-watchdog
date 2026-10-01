@@ -5,8 +5,8 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 ## Behavior
 
 - Pi lifecycle state comes from `agent_start`, live `probePiAgentState`, and authoritative `agent_settled`.
-- Only successful assistant `turn_end` outcomes count: `stop` and `toolUse`.
-- `error`, `aborted`, `length`, `pending`, `deferred`, and unknown outcomes do not count.
+- A loop is one agent-produced assistant `turn_end`. It counts only when the reply ends with `stop` or `toolUse`, has no `errorMessage`, is not a plugin inquiry reply (any `details.piInquiry`), and contains non-empty text or a tool call. The same rule drives the reflect cooldown.
+- These never count: provider and gateway failures (`error`), `aborted`, `length`, `pending`, `deferred`, unknown outcomes, replies a plugin rewrote (for example `pi-continue-watchdog:preempted`), other plugins' inquiry replies, and empty or thinking-only replies. Active/task time is unchanged.
 - A real current-main user `message_start` starts a fresh activity cycle: active/task time and active/root/all loop counters reset to zero before automatic thresholds are evaluated again. Plugin-owned reflection inquiries, folds, continuations, assistant messages, and non-main observations do not reset the cycle.
 - A terminal assistant abort detected from the branch suffix captured at main `agent_start` also starts that fresh cycle after existing reflection completion/cancellation handling. A missing boundary or non-aborted settlement never infers a takeover.
 - Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.

@@ -407,8 +407,15 @@ async function flushAsync() {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-function turnEnd(stopReason: string) {
-	return { message: { role: "assistant", stopReason } };
+function turnEnd(stopReason: string, extra: Record<string, unknown> = {}) {
+	return {
+		message: {
+			role: "assistant",
+			stopReason,
+			content: [{ type: "text", text: "agent output" }],
+			...extra,
+		},
+	};
 }
 
 function lastInquiry(pi: Pi) {
@@ -631,6 +638,30 @@ test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-lo
 		skipAutomatic: true,
 		remainingLoops: 1,
 	});
+	assert.deepEqual(
+		reflectCooldownState(
+			[
+				...nineLoops,
+				branchMessage(
+					{ role: "assistant", stopReason: "stop", content: [] },
+					"empty",
+				),
+				branchMessage(
+					{
+						role: "assistant",
+						stopReason: "stop",
+						errorMessage: "pi-continue-watchdog:preempted",
+						content: [{ type: "text", text: "x" }],
+					},
+					"rewritten",
+				),
+				ordinaryLoop("gateway", "error"),
+			] as any,
+			cooldownLoops,
+		),
+		{ skipAutomatic: true, remainingLoops: 1 },
+		"non-agent replies never advance the cooldown",
+	);
 	assert.deepEqual(
 		reflectCooldownState(
 			[...nineLoops, ordinaryLoop("ordinary-10")] as any,
@@ -1145,6 +1176,39 @@ test("failed and unknown assistant outcomes never reach domain counters", async 
 		await pi.emit("turn_end", turnEnd(reason), ctx);
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 0);
+});
+
+test("only agent-produced text or tool calls count as loops", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 100, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	const inquiry = {
+		version: 1,
+		namespace: "pi-continue-watchdog",
+		inquiryId: "other",
+		attempt: 1,
+	};
+	for (const extra of [
+		{ errorMessage: "pi-continue-watchdog:preempted" },
+		{ details: { piInquiry: inquiry } },
+		{ content: [] },
+		{ content: [{ type: "thinking", thinking: "x" }] },
+		{ content: [{ type: "text", text: "   " }] },
+	])
+		await pi.emit("turn_end", turnEnd("stop", extra), ctx);
+	assert.equal(domain.rootWrites, 0);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await pi.emit(
+		"turn_end",
+		turnEnd("toolUse", {
+			content: [{ type: "toolCall", id: "t", name: "read", arguments: {} }],
+		}),
+		ctx,
+	);
+	assert.equal(domain.rootWrites, 2);
 });
 
 test("same-process child threshold queues reflection while the child stays busy", async () => {

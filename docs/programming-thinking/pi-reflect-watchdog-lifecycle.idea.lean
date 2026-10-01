@@ -5,7 +5,7 @@ set_option autoImplicit false
 namespace PiReflectWatchdogLifecycle
 
 -- Process vocabulary separates ordinary work from watchdog-owned reflection
--- work and names the exact successful model outcomes.
+-- work and names the exact agent-produced replies that count as loops.
 inductive RunKind where
   | ordinary
   | reflection
@@ -20,6 +20,16 @@ inductive TurnOutcome where
   | pending
   | deferred
   | unknown
+  deriving Repr, DecidableEq
+
+-- One assistant reply as observed at turn end: provider outcome, whether a
+-- plugin attached errorMessage or piInquiry, and whether the agent produced
+-- non-empty text or a tool call.
+structure AssistantReply where
+  outcome : TurnOutcome
+  hasErrorMessage : Bool
+  isInquiryReply : Bool
+  hasAgentOutput : Bool
   deriving Repr, DecidableEq
 
 inductive Trigger where
@@ -84,7 +94,7 @@ inductive Event where
   | observeOtherBusy (busy : Bool)
   | semanticHook (name : String)
   | activeTick
-  | successfulTurn (outcome : TurnOutcome)
+  | successfulTurn (reply : AssistantReply)
   | agentSettled
   | queueManualReflection
   | dispatchReflection
@@ -92,10 +102,14 @@ inductive Event where
   | shutdown
   deriving Repr, DecidableEq
 
--- Successful-loop and threshold guards are total and derived from one state.
+-- Loop allowlist and threshold guards are total and derived from one state.
 def modelTurnSucceeded : TurnOutcome → Bool
   | .stop | .toolUse => true
   | _ => false
+
+def agentLoop (reply : AssistantReply) : Bool :=
+  modelTurnSucceeded reply.outcome && !reply.hasErrorMessage &&
+    !reply.isInquiryReply && reply.hasAgentOutput
 
 def crossed (state : State) : List Trigger :=
   let root := if state.counters.rootLoops >= state.limits.rootLoops
@@ -140,9 +154,9 @@ def resetCycle (_counters : Counters) : Counters :=
     allLoops := 0 }
 
 -- Ordinary successful turns increment the loop counters exactly once.
--- Reflection turns and unsuccessful outcomes preserve every counter.
-def countTurn (state : State) (outcome : TurnOutcome) : State :=
-  if !paused state && modelTurnSucceeded outcome && state.runKind = .ordinary then
+-- Reflection turns and replies outside the allowlist preserve every counter.
+def countTurn (state : State) (reply : AssistantReply) : State :=
+  if !paused state && agentLoop reply && state.runKind = .ordinary then
     let next :=
       { state with counters :=
           { state.counters with
@@ -167,7 +181,7 @@ def step (state : State) (event : Event) : State :=
     | .observeOtherBusy busy => { state with otherBusy := busy }
     | .semanticHook name => { state with hookPairs := applyHook name state.hookPairs }
     | .activeTick => countTick state
-    | .successfulTurn outcome => countTurn state outcome
+    | .successfulTurn reply => countTurn state reply
     | .userTakeoverMessage | .terminalAbortSettled =>
         if state.phase = .main then
           { state with
@@ -231,12 +245,16 @@ def Safe (state : State) : Prop :=
     state.localBusy = false ∧ state.otherBusy = false ∧
       state.inquiryActive = false ∧ state.pending = []
 
--- Supporting lemmas prove exact outcomes, internal and external time/loop exclusion, native queued
+-- Supporting lemmas prove the exact loop allowlist, internal and external time/loop exclusion, native queued
 -- dispatch while work is busy, ownership recovery, valid-result continuation, and shutdown.
-theorem success_policy_exact (outcome : TurnOutcome) :
-    modelTurnSucceeded outcome = true ↔
-      outcome = .stop ∨ outcome = .toolUse := by
-  cases outcome <;> simp [modelTurnSucceeded]
+theorem success_policy_exact (reply : AssistantReply) :
+    agentLoop reply = true ↔
+      (reply.outcome = .stop ∨ reply.outcome = .toolUse) ∧
+      reply.hasErrorMessage = false ∧ reply.isInquiryReply = false ∧
+      reply.hasAgentOutput = true := by
+  rcases reply with ⟨outcome, err, inq, out⟩
+  cases outcome <;> cases err <;> cases inq <;> cases out <;>
+    simp [agentLoop, modelTurnSucceeded]
 
 theorem reflection_tick_never_counts
     (state : State) (reflection : state.runKind = .reflection) :
@@ -244,28 +262,28 @@ theorem reflection_tick_never_counts
   simp [countTick, reflection]
 
 theorem reflection_turn_never_counts
-    (state : State) (outcome : TurnOutcome)
+    (state : State) (reply : AssistantReply)
     (reflection : state.runKind = .reflection) :
-    (countTurn state outcome).counters = state.counters := by
+    (countTurn state reply).counters = state.counters := by
   simp [countTurn, reflection]
 
 theorem failed_ordinary_turn_never_counts
-    (state : State) (outcome : TurnOutcome)
+    (state : State) (reply : AssistantReply)
     (ordinary : state.runKind = .ordinary)
-    (failed : modelTurnSucceeded outcome = false) :
-    (countTurn state outcome).counters = state.counters := by
+    (failed : agentLoop reply = false) :
+    (countTurn state reply).counters = state.counters := by
   simp [countTurn, ordinary, failed]
 
 theorem successful_ordinary_turn_counts_once
-    (state : State) (outcome : TurnOutcome)
+    (state : State) (reply : AssistantReply)
     (ordinary : state.runKind = .ordinary)
     (running : paused state = false)
-    (success : modelTurnSucceeded outcome = true) :
-    (countTurn state outcome).counters.activeLoops =
+    (success : agentLoop reply = true) :
+    (countTurn state reply).counters.activeLoops =
       state.counters.activeLoops + 1 ∧
-    (countTurn state outcome).counters.rootLoops =
+    (countTurn state reply).counters.rootLoops =
       state.counters.rootLoops + 1 ∧
-    (countTurn state outcome).counters.allLoops =
+    (countTurn state reply).counters.allLoops =
       state.counters.allLoops + 1 := by
   simp [countTurn, ordinary, running, success]
 
@@ -276,9 +294,9 @@ theorem paused_tick_never_counts
   simp [countTick, isPaused]
 
 theorem paused_successful_turn_never_counts
-    (state : State) (outcome : TurnOutcome)
+    (state : State) (reply : AssistantReply)
     (isPaused : paused state = true) :
-    (countTurn state outcome).counters = state.counters := by
+    (countTurn state reply).counters = state.counters := by
   simp [countTurn, isPaused]
 
 theorem user_takeover_resets_cycle_and_keeps_manual_pending :
@@ -701,20 +719,22 @@ theorem cross_generation_synchronization_is_rejected :
       (.peerSynchronized "live-2" "child/process-1" returnedCheckpoint zeroAccepted) = changed := by
   decide
 
--- Top-level correctness combines exact successful-loop policy, complete
+-- Top-level correctness combines exact agent-loop allowlist, complete
 -- internal/external time and loop exclusion, floor resume, native queued dispatch/reclaim, correction,
 -- and termination.
 theorem process_is_correct :
-    (∀ outcome, modelTurnSucceeded outcome = true ↔
-      outcome = .stop ∨ outcome = .toolUse) ∧
+    (∀ reply, agentLoop reply = true ↔
+      (reply.outcome = .stop ∨ reply.outcome = .toolUse) ∧
+      reply.hasErrorMessage = false ∧ reply.isInquiryReply = false ∧
+      reply.hasAgentOutput = true) ∧
     (∀ state, state.runKind = .reflection →
       (countTick state).counters = state.counters) ∧
-    (∀ state outcome, state.runKind = .reflection →
-      (countTurn state outcome).counters = state.counters) ∧
+    (∀ state reply, state.runKind = .reflection →
+      (countTurn state reply).counters = state.counters) ∧
     (∀ state, paused state = true →
       (countTick state).counters = state.counters) ∧
-    (∀ state outcome, paused state = true →
-      (countTurn state outcome).counters = state.counters) ∧
+    (∀ state reply, paused state = true →
+      (countTurn state reply).counters = state.counters) ∧
     ((let state := { initial with hookPairs :=
       [{ pauseName := "pause-a", resumeName := "resume-a", depth := 0 }] }
       step state (.semanticHook "resume-a") = state)) ∧
@@ -748,17 +768,17 @@ theorem process_is_correct :
       let running := step first .dispatchReflection
       let finished := step running (.reflectionFinished .noIssue)
       (step finished .dispatchReflection).inquiryActive = false) ∧
-    (∀ state outcome, state.runKind = .ordinary →
-      modelTurnSucceeded outcome = false →
-      (countTurn state outcome).counters = state.counters) ∧
-    (∀ state outcome, state.runKind = .ordinary →
+    (∀ state reply, state.runKind = .ordinary →
+      agentLoop reply = false →
+      (countTurn state reply).counters = state.counters) ∧
+    (∀ state reply, state.runKind = .ordinary →
       paused state = false →
-      modelTurnSucceeded outcome = true →
-      (countTurn state outcome).counters.activeLoops =
+      agentLoop reply = true →
+      (countTurn state reply).counters.activeLoops =
         state.counters.activeLoops + 1 ∧
-      (countTurn state outcome).counters.rootLoops =
+      (countTurn state reply).counters.rootLoops =
         state.counters.rootLoops + 1 ∧
-      (countTurn state outcome).counters.allLoops =
+      (countTurn state reply).counters.allLoops =
         state.counters.allLoops + 1) ∧
     (∀ state : State,
       (step { state with phase := .observer } .acquireMain).phase = .main) ∧
@@ -868,4 +888,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "reflect lifecycle: both valid verdicts resume once; ordinary loops and inclusive cooldown; internal runs and paired external pauses excluded"
+  IO.println "reflect lifecycle: both valid verdicts resume once; agent-output loops only and inclusive cooldown; internal runs and paired external pauses excluded"

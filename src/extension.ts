@@ -655,11 +655,7 @@ export function reflectCooldownState(
 } {
 	let loopsSinceReflect = 0;
 	const ordinaryAssistant = (entry: SessionEntry): boolean =>
-		entry.type === "message" &&
-		entry.message.role === "assistant" &&
-		watchdogInquiryAssistant(entry) === undefined &&
-		(entry.message.stopReason === "stop" ||
-			entry.message.stopReason === "toolUse");
+		entry.type === "message" && isAgentLoopMessage(entry.message);
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const entry = entries[index];
 		if (entry === undefined) continue;
@@ -999,12 +995,35 @@ function commandIsCurrent(runtime: Runtime, ctx: ExtensionContext): boolean {
 	);
 }
 
-function isSuccessfulTurn(event: TurnEndEvent): boolean {
+/**
+ * Allowlist for one agent loop: a completed assistant reply that the agent
+ * itself produced (non-empty text or a tool call). Provider/gateway failures,
+ * plugin-rewritten replies (errorMessage), any plugin inquiry reply
+ * (details.piInquiry), and empty/thinking-only replies never count.
+ */
+export function isAgentLoopMessage(message: unknown): boolean {
+	const value = record(message);
+	if (value?.role !== "assistant") return false;
+	if (value.stopReason !== "stop" && value.stopReason !== "toolUse")
+		return false;
+	if (value.errorMessage) return false;
+	if (record(value.details)?.piInquiry !== undefined) return false;
 	return (
-		event.message.role === "assistant" &&
-		(event.message.stopReason === "stop" ||
-			event.message.stopReason === "toolUse")
+		Array.isArray(value.content) &&
+		value.content.some((item) => {
+			const block = record(item);
+			return (
+				block?.type === "toolCall" ||
+				(block?.type === "text" &&
+					typeof block.text === "string" &&
+					block.text.trim().length > 0)
+			);
+		})
 	);
+}
+
+function isSuccessfulTurn(event: TurnEndEvent): boolean {
+	return isAgentLoopMessage(event.message);
 }
 
 function isUserTakeoverMessageStart(event: MessageStartEvent): boolean {
