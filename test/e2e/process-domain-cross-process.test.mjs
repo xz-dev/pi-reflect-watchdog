@@ -785,7 +785,13 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 	await pi.emit("agent_start", {}, context);
 	await pi.emit(
 		"turn_end",
-		{ message: { role: "assistant", stopReason: "stop" } },
+		{
+			message: {
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "agent output" }],
+			},
+		},
 		context,
 	);
 	await waitFor(
