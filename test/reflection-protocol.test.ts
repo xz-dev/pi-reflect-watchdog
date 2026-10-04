@@ -5,7 +5,7 @@ import {
 	buildReflectionReaskPrompt,
 	DEFAULT_REFLECTION_PROMPT,
 	MAX_REFLECTION_TEXT_CHARACTERS,
-	parseReflectionXml,
+	parseReflectionArguments,
 } from "../src/index.js";
 
 test("default perspective questions interpretation across contextual exchanges", () => {
@@ -25,61 +25,54 @@ test("default perspective questions interpretation across contextual exchanges",
 	);
 });
 
-test("reflection XML is strict, decodes entities, and requires unique fields", () => {
-	const result = parseReflectionXml(
-		"thought\n<reflection><type>ROUTE_CORRECTION</type><reason>a &amp; b</reason><done>done</done><current_step>now</current_step><next_step>next</next_step></reflection>",
-	);
-	assert.deepEqual(result, {
+test("reflection arguments preserve text and require exactly five non-empty fields", () => {
+	const valid = {
+		type: "ROUTE_CORRECTION",
+		reason: "a & b <notes>",
+		done: "done",
+		current_step: "now",
+		next_step: "next",
+	};
+	assert.deepEqual(parseReflectionArguments(valid), {
 		valid: true,
 		decision: {
 			type: "ROUTE_CORRECTION",
-			reason: "a & b",
+			reason: "a & b <notes>",
 			done: "done",
 			currentStep: "now",
 			nextStep: "next",
 		},
 	});
-	assert.equal(
-		parseReflectionXml(
-			"<reflection><type>NO_ISSUE</type><reason>x</reason><reason>y</reason><done>d</done><current_step>c</current_step><next_step>n</next_step></reflection>",
-		).valid,
-		false,
-	);
 	assert.deepEqual(
-		parseReflectionXml(
-			"<Reflection><TYPE>no_issue</TYPE><Reason>x</Reason><DONE>d</DONE><CURRENT_STEP>c</CURRENT_STEP><NEXT_STEP>n</NEXT_STEP></Reflection>",
-		),
-		{
-			valid: true,
-			decision: {
-				type: "NO_ISSUE",
-				reason: "x",
-				done: "d",
-				currentStep: "c",
-				nextStep: "n",
-			},
-		},
+		parseReflectionArguments({
+			TYPE: "route_correction",
+			Reason: "a & b <notes>",
+			DONE: "done",
+			CURRENT_STEP: "now",
+			NEXT_STEP: "next",
+		}),
+		parseReflectionArguments(valid),
 	);
-});
-
-test("reflection XML rejects duplicate roots, attributes, missing values, and oversized text", () => {
-	const valid =
-		"<reflection><type>NO_ISSUE</type><reason>r</reason><done>d</done><current_step>c</current_step><next_step>n</next_step></reflection>";
-	assert.equal(parseReflectionXml(`${valid}${valid}`).valid, false);
+	for (const invalid of [
+		null,
+		[],
+		"<reflection>not a function call</reflection>",
+		{},
+		{ ...valid, reason: " " },
+		{ ...valid, reason: 42 },
+		{ ...valid, type: "UNKNOWN" },
+		{ ...valid, extra: "unexpected" },
+		{ ...valid, REASON: "duplicate" },
+		{ ...valid, reason: "x".repeat(MAX_REFLECTION_TEXT_CHARACTERS) },
+	])
+		assert.equal(parseReflectionArguments(invalid).valid, false);
+	const remaining =
+		MAX_REFLECTION_TEXT_CHARACTERS -
+		Array.from(JSON.stringify({ ...valid, reason: "" })).length;
 	assert.equal(
-		parseReflectionXml(valid.replace("<type>", "<type x='1'>")).valid,
-		false,
-	);
-	assert.equal(
-		parseReflectionXml(
-			valid.replace("<reason>r</reason>", "<reason> </reason>"),
-		).valid,
-		false,
-	);
-	assert.equal(
-		parseReflectionXml(`${"x".repeat(MAX_REFLECTION_TEXT_CHARACTERS)}${valid}`)
+		parseReflectionArguments({ ...valid, reason: "😀".repeat(remaining) })
 			.valid,
-		false,
+		true,
 	);
 });
 
@@ -106,7 +99,7 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 	);
 	assert.doesNotMatch(prompt, /Threshold snapshot: active=.*ms|task=.*ms/);
 	assert.match(prompt, /User supplement: \(none\)/);
-	assert.match(prompt, /MAX_REFLECTION_TOOL_CALLS|10 tool calls/);
+	assert.match(prompt, /10 lookup tool calls/);
 	assert.match(prompt, /current_step/);
 	assert.ok(prompt.startsWith("Review the route."));
 	assert.match(
@@ -123,26 +116,22 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 		prompt,
 		/Do not.*extended investigation.*long-running checks.*wait on background work/,
 	);
-	assert.match(prompt, /<next_step>suggested next step<\/next_step>/);
+	assert.match(prompt, /"next_step":"suggested next step"/);
+	assert.match(prompt, /finish by calling ref with one JSON object/);
 	assert.match(
 		prompt,
-		/Your entire response must be exactly one <reflection>\.\.\.<\/reflection> XML document, with no text before or after it/,
+		/express all observations and reasoning inside its five fields/,
 	);
-	assert.match(
-		prompt,
-		/express all observations and reasoning inside the five fields/,
-	);
+	assert.doesNotMatch(prompt, /XML|<reflection>/);
 	assert.doesNotMatch(prompt, /End the response with|[Tt]railing/);
 });
 
-test("reask prompt demands the entire-response XML contract", () => {
+test("reask prompt requires function submission", () => {
 	const reask = buildReflectionReaskPrompt(
 		"reflection type must be NO_ISSUE or ROUTE_CORRECTION",
 	);
-	assert.match(
-		reask,
-		/entire response must be exactly one valid <reflection> XML document with no text before or after it/,
-	);
+	assert.match(reask, /Call ref alone with exactly/);
+	assert.doesNotMatch(reask, /XML|<reflection>/);
 	assert.match(reask, /tool-call budget remains in force/);
 	assert.doesNotMatch(reask, /[Tt]railing/);
 });

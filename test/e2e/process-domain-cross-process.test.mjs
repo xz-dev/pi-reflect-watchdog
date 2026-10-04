@@ -67,6 +67,8 @@ class MinimalPi {
 		this.commands.push({ name, handler: command.handler });
 	}
 
+	registerTool() {}
+
 	registerShortcut() {}
 
 	registerMessageRenderer() {}
@@ -716,7 +718,7 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 					allLoopLimit: 300,
 					taskMinutes: 20,
 					idleResetGapSeconds: 60,
-					reflectionPrompt: "Inspect current work and return reflection XML.",
+					reflectionPrompt: "Inspect current work.",
 					hookPauses: [],
 				},
 				diagnostics: [],

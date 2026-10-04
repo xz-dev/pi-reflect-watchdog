@@ -117,6 +117,25 @@ export async function startFakeProvider({
 	};
 }
 
+export function reflectionResponse(args) {
+	return {
+		delay: 20,
+		chunks: [
+			{
+				tool_calls: [
+					{
+						index: 0,
+						id: "reflection-result",
+						type: "function",
+						function: { name: "ref", arguments: JSON.stringify(args) },
+					},
+				],
+			},
+		],
+		finishReason: "tool_calls",
+	};
+}
+
 export function modelConfig(baseUrl) {
 	return {
 		providers: {

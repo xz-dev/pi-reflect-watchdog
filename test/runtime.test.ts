@@ -40,6 +40,7 @@ import type {
 import { DEFAULT_REFLECTION_PROMPT } from "../src/prompts.js";
 
 class Pi {
+	readonly tools = new Map<string, any>();
 	readonly handlers = new Map<string, (event: any, ctx: any) => any>();
 	readonly bus = new Map<string, Set<(data: unknown) => void>>();
 	readonly commands: Array<{
@@ -79,6 +80,10 @@ class Pi {
 		this.shortcuts.push({ key, ...options });
 	}
 
+	registerTool(tool: any) {
+		this.tools.set(tool.name, tool);
+	}
+
 	registerMessageRenderer() {}
 
 	sendMessage(message: unknown, options: unknown) {
@@ -98,7 +103,26 @@ class Pi {
 	}
 
 	async emit(name: string, event: any, ctx: any) {
-		return await this.handlers.get(name)?.(event, ctx);
+		const result = await this.handlers.get(name)?.(event, ctx);
+		if (name === "message_end") {
+			for (const block of (result?.message ?? event.message).content ?? []) {
+				if (block.type !== "toolCall" || !this.tools.has(block.name)) continue;
+				const blocked = await this.emit(
+					"tool_call",
+					{
+						toolName: block.name,
+						toolCallId: block.id,
+						input: block.arguments,
+					},
+					ctx,
+				);
+				if (!blocked?.block)
+					await this.tools
+						.get(block.name)
+						.execute(block.id, block.arguments, undefined, undefined, ctx);
+			}
+		}
+		return result;
 	}
 }
 
@@ -391,7 +415,7 @@ function captureReflectionHooks(pi: Pi, throws = false) {
 	return hooks;
 }
 
-function reflectionXml({
+function reflectionArguments({
 	type = "NO_ISSUE",
 	reason = "sound",
 	nextStep = "continue",
@@ -400,7 +424,13 @@ function reflectionXml({
 	reason?: string;
 	nextStep?: string;
 } = {}) {
-	return `<reflection><type>${type}</type><reason>${reason}</reason><done>checked</done><current_step>verify</current_step><next_step>${nextStep}</next_step></reflection>`;
+	return {
+		type,
+		reason,
+		done: "checked",
+		current_step: "verify",
+		next_step: nextStep,
+	};
 }
 
 async function flushAsync() {
@@ -458,11 +488,21 @@ async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
 	);
 }
 
-function assistant(text: string) {
+function assistant(text: string | ReturnType<typeof reflectionArguments>) {
 	return {
 		message: {
 			role: "assistant",
-			content: [{ type: "text", text }],
+			content:
+				typeof text === "string"
+					? [{ type: "text", text }]
+					: [
+							{
+								type: "toolCall",
+								id: "reflect-result",
+								name: "ref",
+								arguments: text,
+							},
+						],
 			api: "openai-completions",
 			provider: "fixture",
 			model: "fixture-model",
@@ -475,7 +515,7 @@ function assistant(text: string) {
 				totalTokens: 2,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "stop",
+			stopReason: typeof text === "string" ? "stop" : "toolUse",
 			timestamp: 0,
 		},
 	};
@@ -597,8 +637,8 @@ function ordinaryLoop(id: string, stopReason = "stop") {
 	);
 }
 
-const validNoIssue = reflectionXml();
-const validCorrection = reflectionXml({
+const validNoIssue = reflectionArguments();
+const validCorrection = reflectionArguments({
 	type: "ROUTE_CORRECTION",
 	reason: "change route",
 	nextStep: "continue differently",
@@ -607,7 +647,7 @@ const validCorrection = reflectionXml({
 async function completeReflectionAttempt(
 	pi: Pi,
 	ctx: ReturnType<typeof context>,
-	text: string,
+	text: string | ReturnType<typeof reflectionArguments>,
 ) {
 	const captured = await pi.emit("message_end", assistant(text), ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
@@ -621,6 +661,58 @@ async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	await pi.emit("agent_start", {}, ctx);
 	await correlateReflection(pi, ctx);
 }
+
+test("reserved result tool reveals no usage and rejects calls outside confirmed reflection", async () => {
+	const { pi, ctx } = install();
+	const tool = pi.tools.get("ref");
+	assert.ok(tool, "result tool must be registered");
+	assert.equal(tool.description, "don't use unless ask");
+	assert.deepEqual(tool.parameters.properties, {});
+	assert.equal(tool.parameters.required, undefined);
+	assert.equal(tool.promptSnippet, undefined);
+	assert.equal(tool.promptGuidelines, undefined);
+	const declaration = JSON.stringify(tool.parameters);
+	const reject = () =>
+		assert.rejects(
+			() => tool.execute("reserved", {}, undefined, undefined, ctx),
+			{
+				message:
+					"This function is reserved for the plugin. Please try another function.",
+			},
+		);
+	await reject();
+	await pi.emit("session_start", {}, ctx);
+	await reject();
+	await pi.commands[0]?.handler("", ctx);
+	await reject();
+	assert.equal(pi.entries.length, 0);
+	await startReflectionRun(pi, ctx);
+	assert.match(lastInquiry(pi).content, /ref/);
+	assert.match(lastInquiry(pi).content, /current_step/);
+	const result = await tool.execute(
+		"result",
+		{
+			type: "NO_ISSUE",
+			reason: "sound",
+			done: "checked",
+			current_step: "verify",
+			next_step: "continue",
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.equal(result.terminate, true);
+	assert.equal(result.isError, undefined);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(JSON.stringify(tool.parameters), declaration);
+	assert.equal(pi.tools.size, 1);
+	await reject();
+	await pi.emit("session_shutdown", {}, ctx);
+	await reject();
+});
 
 test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-loop boundary", () => {
 	const cooldownLoops = 10;
@@ -940,14 +1032,14 @@ test("observer shutdown preserves owner pause until final domain detach", async 
 	);
 });
 
-test("minimal core exposes only /reflect, /cancel-reflect and no model tools", async () => {
+test("minimal core exposes /reflect, /cancel-reflect and one reserved tool", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	assert.deepEqual(
 		pi.commands.map((command) => command.name),
 		["reflect", "cancel-reflect"],
 	);
-	assert.equal("registerTool" in pi, false);
+	assert.deepEqual([...pi.tools.keys()], ["ref"]);
 });
 
 test("ordinary user message resets the full cycle without touching reflection-owned messages", async () => {
@@ -1345,7 +1437,7 @@ test("completion hook clips transport text without changing durable result", asy
 		await completeReflectionAttempt(
 			pi,
 			ctx,
-			reflectionXml({ reason: item.reason, nextStep: item.nextStep }),
+			reflectionArguments({ reason: item.reason, nextStep: item.nextStep }),
 		);
 		const result = pi.entries.find(
 			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
@@ -1367,7 +1459,7 @@ test("completion hook clips transport text without changing durable result", asy
 });
 
 test("incomplete persistence never publishes completion", async () => {
-	for (const xml of [validNoIssue, validCorrection])
+	for (const args of [validNoIssue, validCorrection])
 		for (const failingType of [
 			"pi-reflect-watchdog:reflection",
 			"pi-reflect-watchdog:reflection-completed",
@@ -1383,7 +1475,7 @@ test("incomplete persistence never publishes completion", async () => {
 			await pi.emit("session_start", {}, ctx);
 			await pi.commands[0]?.handler("", ctx);
 			await startReflectionRun(pi, ctx);
-			await pi.emit("message_end", assistant(xml), ctx);
+			await pi.emit("message_end", assistant(args), ctx);
 			await pi.emit("turn_end", turnEnd("stop"), ctx);
 			ctx.setIdle(true);
 			await assert.rejects(
@@ -1516,7 +1608,10 @@ test("provisional reflection, valid response, and its turn_end add no activity o
 		assistant(validNoIssue),
 		ctx,
 	);
-	assert.deepEqual(replacement.message.content, []);
+	assert.deepEqual(
+		replacement.message.content,
+		assistant(validNoIssue).message.content,
+	);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(
 		domain.rootWrites,
@@ -1561,10 +1656,13 @@ test("provisional reflection never captures an uncorrelated ordinary assistant",
 	await pi.emit("agent_start", {}, ctx);
 	await correlateReflection(pi, ctx);
 	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	assert.deepEqual(captured.message.content, []);
+	assert.deepEqual(
+		captured.message.content,
+		assistant(validNoIssue).message.content,
+	);
 	assert.equal(
 		captured.message.stopReason ?? "stop",
-		"stop",
+		"toolUse",
 		"neutralized inquiry assistant keeps a non-abort terminal state",
 	);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
@@ -1582,7 +1680,7 @@ test("confirmed neutralized assistant never synthesizes aborted stopReason", asy
 		{
 			message: {
 				role: "assistant",
-				content: [{ type: "text", text: validNoIssue }],
+				content: assistant(validNoIssue).message.content,
 				stopReason: "stop",
 			},
 		},
@@ -1592,12 +1690,16 @@ test("confirmed neutralized assistant never synthesizes aborted stopReason", asy
 	assert.equal(replacement.message.errorMessage, undefined);
 });
 
-test("invalid XML re-ask folds every attempt out of later context", async () => {
+test("invalid result re-ask folds every attempt out of later context", async () => {
 	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await startReflectionRun(pi, ctx);
-	const firstCaptured = await pi.emit("message_end", assistant("not XML"), ctx);
+	const firstCaptured = await pi.emit(
+		"message_end",
+		assistant("not result"),
+		ctx,
+	);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 0);
@@ -1609,7 +1711,7 @@ test("invalid XML re-ask folds every attempt out of later context", async () => 
 			String(message.customType ?? "").endsWith(":inquiry"),
 		).length,
 		2,
-		"invalid XML dispatches one correlated re-ask after settlement",
+		"invalid result dispatches one correlated re-ask after settlement",
 	);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
@@ -1655,13 +1757,13 @@ test("invalid XML re-ask folds every attempt out of later context", async () => 
 	);
 });
 
-test("three-attempt XML correction chain emits one final fold and leaves no context", async () => {
+test("three-attempt result correction chain emits one final fold and leaves no context", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await startReflectionRun(pi, ctx);
 	const captured = [
-		await completeReflectionAttempt(pi, ctx, "invalid attempt one"),
+		await completeReflectionAttempt(pi, ctx, { ...validNoIssue, reason: "" }),
 	];
 	await startReflectionRun(pi, ctx);
 	captured.push(
@@ -1699,7 +1801,7 @@ test("three-attempt XML correction chain emits one final fold and leaves no cont
 	assert.deepEqual(folded.messages, []);
 });
 
-test("three invalid XML attempts emit one final fold without result evidence", async () => {
+test("three invalid result attempts emit one final fold without result evidence", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
@@ -1723,9 +1825,9 @@ test("three invalid XML attempts emit one final fold without result evidence", a
 	);
 	assert.equal(pi.entries.length, 0);
 	assert.deepEqual(ctx.notifications.slice(notificationsBeforeAttempts), [
-		"Reflection attempt 1/3 invalid: response must end with one valid XML block; retrying.",
-		"Reflection attempt 2/3 invalid: response must end with one valid XML block; retrying.",
-		"Reflection failed: response must end with one valid XML block",
+		"Reflection attempt 1/3 invalid: reflection must be submitted with ref; retrying.",
+		"Reflection attempt 2/3 invalid: reflection must be submitted with ref; retrying.",
+		"Reflection failed: reflection must be submitted with ref",
 	]);
 });
 
@@ -1733,7 +1835,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 	for (const trigger of ["automatic", "busy-manual", "idle-manual"] as const)
 		test(`${trigger} ${type} resumes once with a trigger-specific report`, async () => {
 			const origin = trigger === "automatic" ? "automatic" : "manual";
-			const xml = reflectionXml({
+			const args = reflectionArguments({
 				type,
 				nextStep: "wait for the existing callback",
 			});
@@ -1765,7 +1867,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				await pi.emit("turn_end", turnEnd("stop"), ctx);
 			}
 			await startReflectionRun(pi, ctx);
-			const captured = await pi.emit("message_end", assistant(xml), ctx);
+			const captured = await pi.emit("message_end", assistant(args), ctx);
 			assert.ok(captured);
 			await pi.emit("turn_end", turnEnd("stop"), ctx);
 			ctx.setIdle(true);
@@ -1865,9 +1967,9 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				"report and wake stay separate and adjacent",
 			);
 			assert.equal(
-				JSON.stringify(providerMessages).includes(xml),
+				JSON.stringify(providerMessages).includes(JSON.stringify(args)),
 				false,
-				"raw reflection XML stays folded",
+				"raw reflection result stays folded",
 			);
 			const writesBefore = domain.rootWrites;
 			assert.equal(writesBefore, origin === "automatic" ? 2 : 0);
@@ -2275,7 +2377,7 @@ test("incomplete persisted handoffs omit reports rather than guessing an origin 
 	}
 });
 
-test("built-in compaction and branch summaries see only the wake for either trigger", async () => {
+test("built-in compaction and branch summaries do not project the report for either trigger", async () => {
 	const model = openaiProvider()
 		.getModels()
 		.find((model) => model.id === "gpt-4.1");
@@ -2330,7 +2432,7 @@ test("built-in compaction and branch summaries see only the wake for either trig
 			assert.equal(prompt.split("[assistant]\ncontinue").length - 1, 1);
 			assert.equal(prompt.includes(handoff.result.report), false);
 			assert.equal(prompt.includes("Reflection · NO_ISSUE"), false);
-			assert.equal(prompt.includes(validNoIssue), false);
+			assert.match(prompt, /ref\(/);
 			assert.equal(prompt.includes('"origin"'), false);
 		}
 		const marker = session
@@ -2417,12 +2519,7 @@ for (const [label, provider, modelId, api, adapter] of [
 						thinking: "private reflection thought",
 						thinkingSignature: "private signature",
 					},
-					{
-						type: "text",
-						text: validNoIssue,
-						textSignature:
-							'{"v":1,"id":"msg_original_reflection","phase":"final_answer"}',
-					},
+					...assistant(validNoIssue).message.content,
 				],
 			};
 			const handoff = await reflectionHandoff(origin, reply);
@@ -2560,7 +2657,7 @@ for (const [label, provider, modelId, api, adapter] of [
 					wire,
 					/private reflection thought|private signature|msg_original_reflection|original-reflection-response-id/,
 				);
-				assert.equal(wire.includes(validNoIssue), false);
+				assert.equal(wire.includes(JSON.stringify(validNoIssue)), false);
 				if (tail.length > 0) assert.ok(wire.includes("ordinary tool result"));
 			}
 			assert.equal(
@@ -2750,7 +2847,7 @@ test("surviving observer reclaims main and owns /reflect after shutdown", async 
 	assert.match(lastInquiry(observer.pi)?.content ?? "", /new owner/);
 });
 
-test("reflection tool budget and history hint stay shared across XML attempts", async () => {
+test("reflection tool budget and history hint stay shared across result attempts", async () => {
 	const ctx = context("root", { sessionFile: "/missing/retry-session.jsonl" });
 	ctx.setBranch([ordinaryLoop("initial-anchor")]);
 	const { pi } = install({ ctx });
@@ -2762,7 +2859,7 @@ test("reflection tool budget and history hint stay shared across XML attempts", 
 	for (let index = 0; index < 5; index += 1)
 		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
 	ctx.setBranch([ordinaryLoop("later-anchor")]);
-	await completeReflectionAttempt(pi, ctx, "invalid XML");
+	await completeReflectionAttempt(pi, ctx, "invalid result");
 	await startReflectionRun(pi, ctx);
 	assert.doesNotMatch(
 		lastInquiry(pi)?.content ?? "",
@@ -2774,6 +2871,12 @@ test("reflection tool budget and history hint stay shared across XML attempts", 
 		block: true,
 		reason: "Reflection tool-call budget exhausted.",
 	});
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.equal(
+		continuationMessages(pi).length,
+		1,
+		"submission survives lookup budget exhaustion",
+	);
 });
 
 test("busy manual reflection submits one native steer and completes after consumption", async () => {

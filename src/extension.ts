@@ -1,3 +1,4 @@
+import { Type } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -46,7 +47,8 @@ import {
 	buildReflectionReaskPrompt,
 	MAX_REFLECTION_REASKS,
 	MAX_REFLECTION_TOOL_CALLS,
-	parseReflectionXml,
+	parseReflectionArguments,
+	REFLECTION_TOOL_NAME,
 	type ReflectionDecision,
 	type ReflectionThresholdSnapshot,
 	type ReflectionTriggerReason,
@@ -303,7 +305,11 @@ function continuationProjection<T extends object>(messages: T[]): T[] {
 			if (
 				candidate.role !== "assistant" ||
 				!Array.isArray(candidate.content) ||
-				candidate.content.length !== 0 ||
+				!candidate.content.every(
+					(block) =>
+						isRecord(block) &&
+						(block.type === "toolCall" || block.type === "thinking"),
+				) ||
 				!isRecord(candidate.details)
 			)
 				continue;
@@ -325,6 +331,8 @@ function continuationProjection<T extends object>(messages: T[]): T[] {
 				? {
 						...source,
 						content: [{ type: "text", text: details.report }],
+						stopReason:
+							source.stopReason === "toolUse" ? "stop" : source.stopReason,
 						details: Object.fromEntries(
 							Object.entries(source.details as Record<string, unknown>).filter(
 								([key]) => key !== "piInquiry",
@@ -1167,6 +1175,44 @@ export function createWatchdogExtension(
 			pauseTail: Promise.resolve(),
 		};
 
+		pi.registerTool({
+			name: REFLECTION_TOOL_NAME,
+			label: REFLECTION_TOOL_NAME,
+			description: "don't use unless ask",
+			parameters: Type.Object({}, { additionalProperties: true }),
+			async execute(_toolCallId, params) {
+				const active = runtime.activeReflection;
+				if (
+					!owns(runtime) ||
+					active === undefined ||
+					runtime.internalRun.kind !== "confirmed" ||
+					runtime.internalRun.attempt !== active.attempt
+				)
+					throw new Error(
+						"This function is reserved for the plugin. Please try another function.",
+					);
+				if (active.planned !== undefined)
+					throw new Error("Reflection result already submitted.");
+				const validation = parseReflectionArguments(params);
+				active.planned = validation.valid
+					? validation.decision
+					: { error: validation.error };
+				return {
+					content: [
+						{
+							type: "text",
+							text: validation.valid
+								? "Reflection received."
+								: validation.error,
+						},
+					],
+					details: undefined,
+					...(validation.valid ? {} : { isError: true }),
+					terminate: true,
+				};
+			},
+		});
+
 		pi.on("context", (event) => ({
 			messages: reflectionContext(event.messages),
 		}));
@@ -1320,10 +1366,11 @@ export function createWatchdogExtension(
 			if (isUserTakeoverMessageStart(event)) resetCycleForUserTakeover(runtime);
 		});
 
-		pi.on("tool_call", () => {
+		pi.on("tool_call", (event) => {
 			const active = runtime.activeReflection;
 			if (active === undefined || runtime.internalRun.kind !== "confirmed")
 				return;
+			if (event.toolName === REFLECTION_TOOL_NAME) return;
 			if (active.toolCalls >= MAX_REFLECTION_TOOL_CALLS)
 				return {
 					block: true,
@@ -1343,17 +1390,31 @@ export function createWatchdogExtension(
 				runtime.internalRun.attempt !== active.attempt
 			)
 				return;
-			const text = active.handle.capture(event.message);
-			if (text === null) return;
-			const validation = parseReflectionXml(text);
-			active.planned = validation.valid
-				? validation.decision
-				: { error: validation.error };
-			// Keep the provider's original stopReason. Synthesizing "aborted"
-			// here would leak this plugin's internal lifecycle into the global
-			// abort semantics other extensions legitimately observe.
+			if (
+				active.handle.capture(event.message) === null ||
+				event.message.role !== "assistant"
+			)
+				return;
+			const toolCalls = event.message.content.filter(
+				(block) => block.type === "toolCall",
+			);
+			if (toolCalls.length === 0 && active.planned === undefined)
+				active.planned = {
+					error: `reflection must be submitted with ${REFLECTION_TOOL_NAME}`,
+				};
+			// Preserve executable calls until Pi runs them; the completed inquiry
+			// folds calls and results together out of subsequent context.
 			return {
-				message: active.handle.neutralize(event.message),
+				message: {
+					...active.handle.neutralize(event.message),
+					content:
+						toolCalls.length === 0
+							? []
+							: event.message.content.filter(
+									(block) =>
+										block.type === "toolCall" || block.type === "thinking",
+								),
+				},
 			};
 		};
 		(pi as ExtensionAPI & Partial<UninterruptibleMessageEndAPI>).on(

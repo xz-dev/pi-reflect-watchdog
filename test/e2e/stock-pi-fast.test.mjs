@@ -13,6 +13,7 @@ import path from "node:path";
 import test from "node:test";
 import {
 	modelConfig,
+	reflectionResponse,
 	startFakeProvider,
 } from "../../scripts/e2e/fake-provider.mjs";
 import {
@@ -194,15 +195,13 @@ function warningPlan({ requestIndex, request: { body } }) {
 		)
 	)
 		return { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] };
-	return {
-		delay: 20,
-		chunks: [
-			{
-				content:
-					"fixture complete\n<reflection><type>NO_ISSUE</type><reason>route is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
-			},
-		],
-	};
+	return reflectionResponse({
+		type: "NO_ISSUE",
+		reason: "route is sound",
+		done: "fixture checked",
+		current_step: "finish",
+		next_step: "stop",
+	});
 }
 
 test("the installed packed tarball loads dist with only the reflect commands", async (t) => {
@@ -264,15 +263,19 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 		tracePath: path.join(resources.base, "semantic-hooks.jsonl"),
 	});
 	const provider = await startFakeProvider({
-		responsePlan: () => ({
-			delay: 20,
-			chunks: [
-				{
-					content:
-						"<reflection><type>NO_ISSUE</type><reason>route is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
-				},
-			],
-		}),
+		responsePlan: ({ requestIndex }) => {
+			if (requestIndex === 0 || requestIndex === 2)
+				return reflectionResponse({});
+			if (requestIndex === 3)
+				return reflectionResponse({
+					type: "NO_ISSUE",
+					reason: "route is sound",
+					done: "fixture checked",
+					current_step: "finish",
+					next_step: "stop",
+				});
+			return { chunks: [{ content: "ordinary fixture resumed" }] };
+		},
 	});
 	resources.add(() => provider.close());
 	await writeJson(
@@ -286,7 +289,8 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 			"--mode",
 			"rpc",
 			"--no-session",
-			"--no-tools",
+			"--tools",
+			"ref",
 			"--provider",
 			"watchdog-fixture",
 			"--model",
@@ -299,15 +303,65 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 		path.join(artifact.packagePath, "dist", "extension.js"),
 	);
 
+	await rpc.request({
+		type: "prompt",
+		message: "Exercise the reserved function outside reflection.",
+	});
+	await waitForProviderRequests(provider, 2);
+	await waitForProviderResponse(provider.requests[1]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[1].finishedAt,
+	);
+	assert.deepEqual(await tracedHooks(tracePath), []);
+	const declaration = provider.requests[0].body.tools.find(
+		(tool) => tool.function.name === "ref",
+	);
+	assert.ok(declaration);
+	assert.equal(declaration.function.description, "don't use unless ask");
+	assert.deepEqual(declaration.function.parameters.properties, {});
+	assert.equal(declaration.function.parameters.required, undefined);
+	const rejection = provider.requests[1].body.messages.find(
+		(message) => message.role === "tool",
+	);
+	assert.match(
+		providerMessageText(rejection),
+		/This function is reserved for the plugin\. Please try another function\./,
+	);
+	assert.doesNotMatch(
+		providerMessageText(rejection),
+		/current_step|next_step|NO_ISSUE/,
+	);
+
 	const accepted = await rpc.request({
 		type: "prompt",
 		message: "/reflect verify final hook",
 	});
 	assert.equal(accepted.success, true);
-	await waitForProviderRequests(provider, 1);
-	await waitForProviderResponse(provider.requests[0]);
-	await rpc.waitFor((message) => message.type === "agent_settled");
-	await new Promise((resolve) => setTimeout(resolve, 100));
+	await waitForProviderRequests(provider, 5);
+	await waitForProviderResponse(provider.requests[4]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[4].finishedAt,
+	);
+	assert.match(
+		JSON.stringify(provider.requests[2].body.messages),
+		/current_step/,
+	);
+	assert.match(
+		JSON.stringify(provider.requests[3].body.messages),
+		/previous reflection response was invalid/,
+	);
+	assert.doesNotMatch(
+		JSON.stringify(provider.requests[4].body.messages),
+		/current_step|previous reflection response was invalid/,
+	);
+	for (const request of provider.requests)
+		assert.deepEqual(
+			request.body.tools.find((tool) => tool.function.name === "ref"),
+			declaration,
+		);
+	assert.equal(provider.requests.length, 5);
 	assert.deepEqual(await tracedHooks(tracePath), [
 		{
 			version: 1,
@@ -488,7 +542,7 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 					content:
 						requestIndex < 3
 							? `private invalid reflection ${requestIndex + 1}`
-							: "<reflection><type>NO_ISSUE</type><reason>unexpected retry</reason><done>none</done><current_step>stop</current_step><next_step>stop</next_step></reflection>",
+							: "unexpected retry",
 				},
 			],
 		}),
@@ -505,7 +559,8 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 			"--mode",
 			"rpc",
 			"--no-session",
-			"--no-tools",
+			"--tools",
+			"ref",
 			"--provider",
 			"watchdog-fixture",
 			"--model",
@@ -520,7 +575,7 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 
 	const accepted = await rpc.request({
 		type: "prompt",
-		message: "/reflect exercise invalid XML correction",
+		message: "/reflect exercise invalid result correction",
 	});
 	assert.equal(accepted.success, true);
 	await waitForProviderRequests(provider, 3);
@@ -542,9 +597,9 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 	assert.deepEqual(warnings, [
-		"Reflection attempt 1/3 invalid: response must end with one valid XML block; retrying.",
-		"Reflection attempt 2/3 invalid: response must end with one valid XML block; retrying.",
-		"Reflection failed: response must end with one valid XML block",
+		"Reflection attempt 1/3 invalid: reflection must be submitted with ref; retrying.",
+		"Reflection attempt 2/3 invalid: reflection must be submitted with ref; retrying.",
+		"Reflection failed: reflection must be submitted with ref",
 	]);
 	await new Promise((resolve) => setTimeout(resolve, 250));
 	assert.equal(provider.requests.length, 3, "terminal failure does not retry");
@@ -661,7 +716,7 @@ test("packed stock Pi completes one root-loop reflection without redispatching d
 	assert.equal(
 		last.data.text ?? "",
 		"ordinary fixture resumed",
-		"the continuation is ordinary output, not the internal NO_ISSUE XML",
+		"the continuation is ordinary output, not the internal NO_ISSUE result",
 	);
 	// The takeover prompt resets the activity cycle and counts as one ordinary
 	// loop. Ten more one-loop prompts complete the cooldown floor; a later
@@ -732,8 +787,13 @@ test("manual reflection submitted mid-tool-turn steers after the full tool batch
 		allLoopLimit: 300,
 		taskMinutes: 20,
 	});
-	const reflectionXml =
-		"<reflection><type>NO_ISSUE</type><reason>manual steer boundary is sound</reason><done>fixture checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>";
+	const reflectionArgs = {
+		type: "NO_ISSUE",
+		reason: "manual steer boundary is sound",
+		done: "fixture checked",
+		current_step: "finish",
+		next_step: "stop",
+	};
 	const provider = await startFakeProvider({
 		responsePlan: ({ requestIndex }) => {
 			if (requestIndex === 0)
@@ -766,8 +826,7 @@ test("manual reflection submitted mid-tool-turn steers after the full tool batch
 					],
 					finishReason: "tool_calls",
 				};
-			if (requestIndex === 1)
-				return { delay: 20, chunks: [{ content: reflectionXml }] };
+			if (requestIndex === 1) return reflectionResponse(reflectionArgs);
 			return { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] };
 		},
 	});
@@ -876,21 +935,28 @@ for (const [origin, type] of [
 			allLoopLimit: 300,
 			taskMinutes: 20,
 		});
-		const reflectionXml = `<reflection><type>${type}</type><reason>preserve the clarification</reason><done>checked current direction</done><current_step>reassess the abstraction layers</current_step><next_step>wait for the existing callback</next_step></reflection>`;
+		const reflectionArgs = {
+			type,
+			reason: "preserve the clarification",
+			done: "checked current direction",
+			current_step: "reassess the abstraction layers",
+			next_step: "wait for the existing callback",
+		};
 		const provider = await startFakeProvider({
-			responsePlan: ({ requestIndex }) => ({
-				delay: origin === "busy-manual" && requestIndex === 0 ? 1000 : 20,
-				chunks: [
-					{
-						content:
-							requestIndex === 0
-								? "I will remove error handling."
-								: requestIndex === 1
-									? reflectionXml
-									: "clarification preserved",
-					},
-				],
-			}),
+			responsePlan: ({ requestIndex }) =>
+				requestIndex === 1
+					? reflectionResponse(reflectionArgs)
+					: {
+							delay: origin === "busy-manual" && requestIndex === 0 ? 1000 : 20,
+							chunks: [
+								{
+									content:
+										requestIndex === 0
+											? "I will remove error handling."
+											: "clarification preserved",
+								},
+							],
+						},
 		});
 		resources.add(() => provider.close());
 		await writeJson(
@@ -903,7 +969,8 @@ for (const [origin, type] of [
 			launcherArgs: [
 				"--mode",
 				"rpc",
-				"--no-tools",
+				"--tools",
+				"ref",
 				"--provider",
 				"watchdog-fixture",
 				"--model",
@@ -967,7 +1034,10 @@ for (const [origin, type] of [
 			1,
 			"original user clarification stays unchanged",
 		);
-		assert.equal(JSON.stringify(messages).includes(reflectionXml), false);
+		assert.equal(
+			JSON.stringify(messages).includes(JSON.stringify(reflectionArgs)),
+			false,
+		);
 		await waitForProviderResponse(provider.requests[2]);
 		await rpc.waitFor(
 			(message, at) =>
@@ -981,7 +1051,7 @@ for (const [origin, type] of [
 		);
 	});
 
-test("packed stock Pi hides reflection XML and continues normally after a correction", {
+test("packed stock Pi hides reflection result and continues normally after a correction", {
 	timeout: 45_000,
 }, async (t) => {
 	assertStockPi();
@@ -1007,10 +1077,20 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 	});
 	isolated.env.PI_WATCHDOG_HOOK_TRACE = tracePath;
 	const hooksAtContinuation = [];
-	const reflectionXml =
-		"<reflection><type>ROUTE_CORRECTION</type><reason>change route</reason><done>checked</done><current_step>pause</current_step><next_step>apply corrected route</next_step></reflection>";
-	const followupReflectionXml =
-		"<reflection><type>NO_ISSUE</type><reason>corrected route is sound</reason><done>follow-up checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>";
+	const reflectionArgs = {
+		type: "ROUTE_CORRECTION",
+		reason: "change route",
+		done: "checked",
+		current_step: "pause",
+		next_step: "apply corrected route",
+	};
+	const followupReflectionArgs = {
+		type: "NO_ISSUE",
+		reason: "corrected route is sound",
+		done: "follow-up checked",
+		current_step: "finish",
+		next_step: "stop",
+	};
 	const provider = await startFakeProvider({
 		responsePlan: ({ requestIndex }) => {
 			if (requestIndex === 1 || requestIndex === 3)
@@ -1022,18 +1102,11 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 								.map((line) => JSON.parse(line))
 						: [],
 				);
+			if (requestIndex === 0) return reflectionResponse(reflectionArgs);
+			if (requestIndex === 2) return reflectionResponse(followupReflectionArgs);
 			return {
 				delay: 20,
-				chunks: [
-					{
-						content:
-							requestIndex === 0
-								? reflectionXml
-								: requestIndex === 2
-									? followupReflectionXml
-									: "correction applied automatically",
-					},
-				],
+				chunks: [{ content: "correction applied automatically" }],
 			};
 		},
 	});
@@ -1048,7 +1121,8 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		launcherArgs: [
 			"--mode",
 			"rpc",
-			"--no-tools",
+			"--tools",
+			"ref",
 			"--provider",
 			"watchdog-fixture",
 			"--model",
@@ -1107,11 +1181,11 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 		providerMessageText(providerMessages[wakeIndexes[0]]),
 		"[assistant]\ncontinue",
 	);
-	assert.doesNotMatch(continuationMessages, /Do not emit reflection XML/);
+	assert.doesNotMatch(continuationMessages, /Do not emit reflection result/);
 	assert.equal(
-		continuationMessages.includes(reflectionXml),
+		continuationMessages.includes(JSON.stringify(reflectionArgs)),
 		false,
-		"the raw reflection XML is absent from the next provider request",
+		"the raw reflection result is absent from the next provider request",
 	);
 	const last = await rpc.request({ type: "get_last_assistant_text" });
 	assert.equal(last.data.text, "correction applied automatically");
@@ -1149,9 +1223,9 @@ test("packed stock Pi hides reflection XML and continues normally after a correc
 	assert.match(followupMessages, /Reason: change route/);
 	assert.match(followupMessages, /User supplement: verify the corrected route/);
 	assert.equal(
-		followupMessages.includes(reflectionXml),
+		followupMessages.includes(JSON.stringify(reflectionArgs)),
 		false,
-		"the next reflection receives the plain report, not prior XML",
+		"the next reflection receives the plain report, not prior result",
 	);
 	await waitForProviderResponse(provider.requests[2]);
 	await waitForProviderRequests(provider, 4);

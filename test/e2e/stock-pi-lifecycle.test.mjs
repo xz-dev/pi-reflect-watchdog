@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
 	modelConfig,
+	reflectionResponse,
 	startFakeProvider,
 } from "../../scripts/e2e/fake-provider.mjs";
 import {
@@ -38,7 +39,17 @@ async function setup(t, { taskMinutes = 30, ...providerOptions } = {}) {
 	const rpc = new RpcPi({
 		cwd: isolated.workspace,
 		env: isolated.env,
-		args: ["--provider", "watchdog-fixture", "--model", "watchdog-fixture"],
+		launcherArgs: [
+			"--mode",
+			"rpc",
+			"--no-session",
+			"--tools",
+			"ref",
+			"--provider",
+			"watchdog-fixture",
+			"--model",
+			"watchdog-fixture",
+		],
 	});
 	resources.add(() => rpc.close());
 	await assertSingleWatchdogCommand(
@@ -77,15 +88,13 @@ test("the real one-minute wall warning steers exactly once while active", {
 					chunks: [{ content: "working " }, { content: "done" }],
 				};
 			if (requestIndex === 1)
-				return {
-					delay: 20,
-					chunks: [
-						{
-							content:
-								"<reflection><type>NO_ISSUE</type><reason>timing route is sound</reason><done>checked</done><current_step>finish</current_step><next_step>stop</next_step></reflection>",
-						},
-					],
-				};
+				return reflectionResponse({
+					type: "NO_ISSUE",
+					reason: "timing route is sound",
+					done: "checked",
+					current_step: "finish",
+					next_step: "stop",
+				});
 			return {
 				delay: 20,
 				chunks: [{ content: "post-threshold completion" }],
