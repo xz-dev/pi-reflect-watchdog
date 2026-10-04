@@ -1,10 +1,16 @@
-# reflection-response-contract Specification
+## REMOVED Requirements
 
-## Purpose
+### Requirement: Entire response is the reflection XML document
 
-Define reflection result submission through a minimally described, fixed function declaration, with execution restricted to confirmed reflection and usage explained only by reflection prompts.
+**Reason**: Reflection results now arrive through a function call instead of assistant text.
+**Migration**: Follow the reflection prompt and submit the five fields as arguments to `ref`.
 
-## Requirements
+### Requirement: Lenient parser acceptance is unchanged
+
+**Reason**: XML parsing, including trailing-XML acceptance, is no longer a result-submission path.
+**Migration**: Submit an argument object through `ref`; keep the existing field names and result types.
+
+## MODIFIED Requirements
 
 ### Requirement: Persona voice lives inside the fields
 
@@ -32,6 +38,8 @@ A reask after an invalid reflection response SHALL require a call to `ref` with 
 - **WHEN** the invalid attempt settles and fewer than three attempts have been used
 - **THEN** the plugin issues a correlated correction prompt without an ordinary continuation or completion hook
 - **AND** exhausted validation ends through the existing failure cleanup path without granting a new lookup budget
+
+## ADDED Requirements
 
 ### Requirement: Result function has a fixed minimal declaration
 

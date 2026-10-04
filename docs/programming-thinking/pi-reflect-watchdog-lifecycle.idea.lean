@@ -387,6 +387,30 @@ theorem valid_reflection_queues_one_continuation
       step state (.reflectionFinished decision) := by
   simp [step, notShutdown, openInquiry]
 
+-- Result submission is a function call, not assistant text. Its declaration
+-- stays fixed; the runtime accepts submissions only for a confirmed main inquiry.
+def resultToolAllowed (state : State) (promptConfirmed : Bool) : Bool :=
+  state.phase == .main && state.inquiryActive && promptConfirmed &&
+    state.runKind == .reflection
+
+def submitResult (state : State) (promptConfirmed : Bool)
+    (decision : ReflectionDecision) : Except String ReflectionDecision :=
+  if resultToolAllowed state promptConfirmed then .ok decision
+  else .error "This function is reserved for the plugin. Please try another function."
+
+-- The gate excludes ordinary work, provisional inquiries, observers, and shutdown.
+theorem result_tool_gate (state : State) (confirmed : Bool) :
+    resultToolAllowed state confirmed = true ↔
+      state.phase = .main ∧ state.inquiryActive = true ∧
+        confirmed = true ∧ state.runKind = .reflection := by
+  simp [resultToolAllowed, and_assoc]
+
+theorem ordinary_result_is_rejected (state : State) (decision : ReflectionDecision)
+    (ordinary : state.runKind = .ordinary) :
+    submitResult state true decision =
+      .error "This function is reserved for the plugin. Please try another function." := by
+  simp [submitResult, resultToolAllowed, ordinary]
+
 -- Branch-derived eligibility is checked before automatic dispatch. A report
 -- projection is not an ordinary turn; only successful ordinary loops advance it.
 -- The cooldown window is a bound on ordinary loops since the last completed
@@ -723,6 +747,9 @@ theorem cross_generation_synchronization_is_rejected :
 -- internal/external time and loop exclusion, floor resume, native queued dispatch/reclaim, correction,
 -- and termination.
 theorem process_is_correct :
+    (∀ state confirmed, resultToolAllowed state confirmed = true ↔
+      state.phase = .main ∧ state.inquiryActive = true ∧
+        confirmed = true ∧ state.runKind = .reflection) ∧
     (∀ reply, agentLoop reply = true ↔
       (reply.outcome = .stop ∨ reply.outcome = .toolUse) ∧
       reply.hasErrorMessage = false ∧ reply.isInquiryReply = false ∧
@@ -826,6 +853,8 @@ theorem process_is_correct :
       stepCollection changed
         (.peerSynchronized "live-2" "child/process-1" returnedCheckpoint zeroAccepted) = changed)) := by
   constructor
+  · exact result_tool_gate
+  constructor
   · exact success_policy_exact
   constructor
   · exact reflection_tick_never_counts
@@ -888,4 +917,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "reflect lifecycle: both valid verdicts resume once; agent-output loops only and inclusive cooldown; internal runs and paired external pauses excluded"
+  IO.println "reflect lifecycle: result tool requires confirmed main inquiry; both valid verdicts resume once; agent-output loops only and inclusive cooldown; internal runs and paired external pauses excluded"

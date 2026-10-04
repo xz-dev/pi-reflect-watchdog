@@ -11,13 +11,14 @@ Minimal Pi reflection watchdog rebuilt on `pi-continue-watchdog` lifecycle rules
 - A terminal assistant abort detected from the branch suffix captured at main `agent_start` also starts that fresh cycle after existing reflection completion/cancellation handling. A missing boundary or non-aborted settlement never infers a takeover.
 - Automatic reflection triggers at configured root-loop, all-loop, or active task-time thresholds and enters Pi's native steering queue immediately, even while child agents remain busy.
 - `/reflect [optional supplement]` enters the same native steering queue immediately when this attachment is the current main, even while the ordinary agent is busy: submission does not wait for the run to settle, does not abort the current response or its tool calls, and does not reorder already queued native steering messages. Pi consumes the inquiry at the next steering boundary (after the current assistant turn and its complete tool batch, before the next model call). A request only waits in a plugin-side queue while another reflection inquiry is still outstanding; that waiting request can be withdrawn with the cancel shortcut (default `alt+x`) or `/cancel-reflect`, and the status row shows the queued state with the effective cancel gesture. Once submitted to native steering, a request can no longer be retracted. Repeating `/reflect` while one request is waiting keeps the first request.
-- Watchdog-owned reflection and XML re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
-- All XML attempts share one inquiry and are folded from later model context only after the final result.
+- Watchdog-owned reflection and result re-ask turns are correlated as internal work and excluded from active/task/root/all counters without pausing anything.
+- Results are submitted with the reserved `ref` function, not XML. Its declaration stays fixed: description `don't use unless ask`, no advertised parameter fields or required arguments. Outside a confirmed reflection it fails with `This function is reserved for the plugin. Please try another function.` Only reflection prompts explain the submission format.
+- All attempts share one inquiry; prompts, function calls, and results are folded from later model context only after the final result.
 - Every valid result is stored as a context-excluded entry on the current session branch; the next reflection receives the latest valid report as fallible historical assistant analysis, not the user's words.
 - After the result and completion marker are stored, one best-effort `reflection-completed` semantic hook publishes `REFLECTION_TYPE`, `REASON`, and `NEXT_STEP` to current listeners.
-- Both `NO_ISSUE` and `ROUTE_CORRECTION` start exactly one ordinary continuation without reflection/XML protocol priming, including busy and idle manual `/reflect`; that continuation counts normally.
-- Reflection may use up to 10 tool calls across at most three XML attempts.
-- XML element names and reflection `type` value are case-insensitive.
+- Both `NO_ISSUE` and `ROUTE_CORRECTION` start exactly one ordinary continuation without reflection protocol priming, including busy and idle manual `/reflect`; that continuation counts normally.
+- Reflection may use up to 10 lookup tool calls across at most three result attempts. Submitting a result does not consume the lookup budget.
+- Result field names and the reflection `type` value are case-insensitive.
 
 ## Returning to ordinary work
 
@@ -34,7 +35,7 @@ The wake has the synthetic **user transport role**; its text label does not turn
 
 The report, trigger origin, and inquiry correlation live in private marker metadata. Ordinary context projection restores the report once, including after reload, only while its correlated source assistant remains available. Missing source or malformed origin/correlation means no reconstructed report, not a guessed role or a report copied into the wake.
 
-Built-in compaction and branch summarization bypass this projection. For either trigger, a new handoff contributes only the fixed wake to their conversational input; report retention in a generated summary is not guaranteed. The existing stored report remains available to later reflections. Old sessions and unrelated extensions' messages are not rewritten.
+Built-in compaction and branch summarization bypass this projection. They see the fixed wake and may retain the result function call, but do not receive the projected report; report retention in a generated summary is not guaranteed. The existing stored report remains available to later reflections. Old sessions and unrelated extensions' messages are not rewritten.
 
 ## Reflection perspective
 
@@ -44,7 +45,7 @@ Normal conversation context remains the primary input. When a session file and c
 
 Tools may clarify the conversation, actual work, or a possible direction. Guidance favors quick, targeted lookups: stop when the relevant uncertainty is resolved, or state what remains uncertain and finish if it cannot be resolved promptly. Avoid extended investigations, long-running checks, and background waits. This is prompt-level guidance, **not a hard wall-clock timeout**; the existing ten-call budget cannot bound a single slow tool.
 
-`reflectionPrompt` replaces the default perspective. Historical-report framing, recovery hints, quick-clarification guidance, tool budget, and XML contract remain plugin-owned. Prompt and lifecycle tests do not prove correct interpretation or complete history recovery. See the [multi-turn comparison cases](docs/reflection-examples.md) for the separate, not-yet-run real-model evaluation.
+`reflectionPrompt` replaces the default perspective. Historical-report framing, recovery hints, quick-clarification guidance, tool budget, and result function contract remain plugin-owned. Prompt and lifecycle tests do not prove correct interpretation or complete history recovery. See the [multi-turn comparison cases](docs/reflection-examples.md) for the separate, not-yet-run real-model evaluation.
 
 ## Configuration
 
@@ -68,7 +69,7 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
 
 Delivery is best-effort to current listeners only: no buffer, replay, acknowledgement, retry, or cross-process forwarding. Producers must publish pause before excluded work and a matching resume on every terminal path. While paused, active/task time and loop counters freeze across the watchdog process domain; explicit `/reflect` remains available.
 
-Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid XML attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, ordinary continuation, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
+Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid result attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, ordinary continuation, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
 
 Dynamic limit controls, history/timeline tools, public pause APIs, and pause/resume commands are intentionally removed. Config-driven semantic-hook pauses and the automatic user-takeover cycle reset are the only external counting controls.
 
