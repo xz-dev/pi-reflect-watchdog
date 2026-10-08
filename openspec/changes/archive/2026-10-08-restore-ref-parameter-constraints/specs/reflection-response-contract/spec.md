@@ -1,59 +1,11 @@
-# reflection-response-contract Specification
+## REMOVED Requirements
 
-## Purpose
+### Requirement: Result function has a fixed minimal declaration
 
-Define reflection result submission through a minimally described, fixed function declaration, with execution restricted to confirmed reflection and usage explained only by reflection prompts.
+**Reason**: The open empty-object schema advertised no fields, types, or enum, so the result contract existed only in prompt prose and native validation could not reject malformed arguments.
+**Migration**: Replaced by "Result function has a fixed constrained declaration", which keeps the fixed description and stable registration while declaring the five required string fields and the `type` enum without explanatory text. Valid submissions are unchanged.
 
-## Requirements
-
-### Requirement: Persona voice lives inside the fields
-
-The default reflection perspective SHALL direct its speaking-style guidance to the content of the five result argument fields. It SHALL NOT instruct the model to produce a separate spoken-style text response instead of calling the result function.
-
-#### Scenario: Oracle persona redirects its voice
-
-- **WHEN** the default perspective prompt is rendered
-- **THEN** its communication guidance applies to the field values (for example, the reason field)
-- **AND** it does not conflict with the function-call submission requirement
-
-### Requirement: Reask prompt states the same response shape
-
-A reask after an invalid reflection response SHALL require a call to `ref` with the same five non-empty string fields and valid result type, rather than XML or a text reply. Initial and correction attempts SHALL share at most three total attempts and one ten-lookup-call budget. Submitting a result SHALL NOT consume the lookup budget. Plugin-generated correction instructions and errors SHALL be in English.
-
-#### Scenario: Reask wording matches the initial contract
-
-- **WHEN** a correction prompt is rendered
-- **THEN** it requires a call to `ref` alone with `type`, `reason`, `done`, `current_step`, and `next_step`, with type `NO_ISSUE` or `ROUTE_CORRECTION`
-- **AND** it repeats the shared tool-call budget constraint
-
-#### Scenario: Invalid arguments are corrected
-
-- **GIVEN** a confirmed reflection submits an invalid result object
-- **WHEN** the invalid attempt settles and fewer than three attempts have been used
-- **THEN** the plugin issues a correlated correction prompt without an ordinary continuation or completion hook
-- **AND** exhausted validation ends through the existing failure cleanup path without granting a new lookup budget
-
-### Requirement: Result function has a fixed constrained declaration
-
-The plugin SHALL register `ref` with description exactly `don't use unless ask`. Its public argument schema SHALL declare exactly the five required string properties `type`, `reason`, `done`, `current_step`, and `next_step`, SHALL enumerate `type` as exactly `NO_ISSUE` and `ROUTE_CORRECTION`, SHALL require every field to be nonblank, and SHALL NOT admit additional properties. The declaration SHALL contain no parameter descriptions, titles, examples, or default values, and SHALL NOT include parameter usage instructions or additional prompt guidelines. Structural constraints are not usage instructions. The plugin SHALL NOT add, remove, or change the declaration when reflection starts or ends; execution authorization SHALL instead be checked at runtime. Neither this stable declaration nor its structural constraints SHALL be described as a guarantee of provider cache hits, provider-side strict generation, model obedience, or a sound reflection.
-
-#### Scenario: Ordinary requests see structure but no usage guidance
-
-- **WHEN** an ordinary model request includes the registered function
-- **THEN** its description is exactly `don't use unless ask`
-- **AND** its schema declares the five required string fields, the two-value `type` enum, nonblank text, and no additional properties
-- **AND** it contains no parameter description, title, example, or default, and the plugin supplies no result-submission usage guidance outside a reflection prompt
-
-#### Scenario: Invalid arguments fail the declared structure
-
-- **WHEN** tool arguments omit a field, add an unknown field, use a non-string or blank value, or use a `type` outside `NO_ISSUE` and `ROUTE_CORRECTION` after compatible normalization
-- **THEN** they fail the declared structural contract rather than relying only on prompt text to reject them
-
-#### Scenario: Reflection does not switch the tool declaration
-
-- **WHEN** the session enters reflection, retries a result, and returns to ordinary work
-- **THEN** the function declaration remains identical across those requests
-- **AND** the plugin does not toggle the active tool list for this transition
+## MODIFIED Requirements
 
 ### Requirement: Result execution requires confirmed reflection
 
@@ -129,6 +81,30 @@ Before native schema validation, compatible arguments SHALL be normalized to the
 - **GIVEN** the reflection has already used ten lookup tool calls across its attempts
 - **WHEN** it calls `ref` with valid arguments
 - **THEN** submission remains possible even though another lookup call would be blocked
+
+## ADDED Requirements
+
+### Requirement: Result function has a fixed constrained declaration
+
+The plugin SHALL register `ref` with description exactly `don't use unless ask`. Its public argument schema SHALL declare exactly the five required string properties `type`, `reason`, `done`, `current_step`, and `next_step`, SHALL enumerate `type` as exactly `NO_ISSUE` and `ROUTE_CORRECTION`, SHALL require every field to be nonblank, and SHALL NOT admit additional properties. The declaration SHALL contain no parameter descriptions, titles, examples, or default values, and SHALL NOT include parameter usage instructions or additional prompt guidelines. Structural constraints are not usage instructions. The plugin SHALL NOT add, remove, or change the declaration when reflection starts or ends; execution authorization SHALL instead be checked at runtime. Neither this stable declaration nor its structural constraints SHALL be described as a guarantee of provider cache hits, provider-side strict generation, model obedience, or a sound reflection.
+
+#### Scenario: Ordinary requests see structure but no usage guidance
+
+- **WHEN** an ordinary model request includes the registered function
+- **THEN** its description is exactly `don't use unless ask`
+- **AND** its schema declares the five required string fields, the two-value `type` enum, nonblank text, and no additional properties
+- **AND** it contains no parameter description, title, example, or default, and the plugin supplies no result-submission usage guidance outside a reflection prompt
+
+#### Scenario: Invalid arguments fail the declared structure
+
+- **WHEN** tool arguments omit a field, add an unknown field, use a non-string or blank value, or use a `type` outside `NO_ISSUE` and `ROUTE_CORRECTION` after compatible normalization
+- **THEN** they fail the declared structural contract rather than relying only on prompt text to reject them
+
+#### Scenario: Reflection does not switch the tool declaration
+
+- **WHEN** the session enters reflection, retries a result, and returns to ordinary work
+- **THEN** the function declaration remains identical across those requests
+- **AND** the plugin does not toggle the active tool list for this transition
 
 ### Requirement: Invalid owned submissions stay in the bounded correction flow
 

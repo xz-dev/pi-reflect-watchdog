@@ -411,6 +411,148 @@ theorem ordinary_result_is_rejected (state : State) (decision : ReflectionDecisi
       .error "This function is reserved for the plugin. Please try another function." := by
   simp [submitResult, resultToolAllowed, ordinary]
 
+-- The fixed declaration carries structural constraints (required fields, the
+-- result-type enum, no extra fields) but no explanatory parameter text.
+-- Structure grants no authority; the runtime gate above still decides.
+structure ResultDeclaration where
+  description : String
+  declaresRequiredFields : Bool
+  enumeratesResultType : Bool
+  rejectsExtraFields : Bool
+  explainsParameters : Bool
+  deriving Repr, DecidableEq
+
+def resultDeclaration : ResultDeclaration :=
+  { description := "don't use unless ask"
+    declaresRequiredFields := true
+    enumeratesResultType := true
+    rejectsExtraFields := true
+    explainsParameters := false }
+
+theorem result_declaration_is_constrained_without_prose :
+    resultDeclaration.description = "don't use unless ask" ∧
+      resultDeclaration.declaresRequiredFields = true ∧
+      resultDeclaration.enumeratesResultType = true ∧
+      resultDeclaration.rejectsExtraFields = true ∧
+      resultDeclaration.explainsParameters = false := by
+  decide
+
+-- An owned reflection response is projected before native dispatch. A result
+-- call that fails the plugin parser stops the whole response with no
+-- executable calls and marks one invalid attempt; a response with no calls is
+-- also invalid; otherwise calls stay executable for normal handling.
+inductive ResultArguments where
+  | valid (decision : ReflectionDecision)
+  | invalid
+  deriving Repr, DecidableEq
+
+structure OwnedResponse where
+  resultCall : Option ResultArguments
+  lookupCalls : Nat
+  deriving Repr, DecidableEq
+
+structure OwnedProjection where
+  executableCalls : Nat
+  invalidAttempt : Bool
+  resultSubmitted : Bool := false
+  deriving Repr, DecidableEq
+
+def projectOwnedResponse (response : OwnedResponse) : OwnedProjection :=
+  match response.resultCall with
+  | some .invalid => { executableCalls := 0, invalidAttempt := true }
+  | some (.valid _) =>
+      { executableCalls := response.lookupCalls + 1
+        invalidAttempt := false, resultSubmitted := true }
+  | none =>
+      { executableCalls := response.lookupCalls
+        invalidAttempt := response.lookupCalls == 0 }
+
+theorem invalid_result_never_reaches_dispatch (lookups : Nat) :
+    projectOwnedResponse { resultCall := some .invalid, lookupCalls := lookups } =
+      { executableCalls := 0, invalidAttempt := true } := by
+  rfl
+
+-- Invalid result attempts re-ask below the third attempt and fail at the limit.
+-- A result submission is accepted; lookup-only work continues within the same attempt.
+def maxResultAttempts : Nat := 3
+
+inductive AttemptSettlement where
+  | reask (nextAttempt : Nat)
+  | failed
+  | accepted
+  | continueCalls
+  deriving Repr, DecidableEq
+
+def settleAttempt (attempt : Nat) (projection : OwnedProjection) : AttemptSettlement :=
+  if projection.invalidAttempt then
+    if attempt < maxResultAttempts then .reask (attempt + 1) else .failed
+  else if projection.resultSubmitted then .accepted
+  else .continueCalls
+
+-- Count result-attempt boundaries, not provider requests: lookup-only replies
+-- can request more work within an attempt and do not submit a result.
+def attemptsUsed (attempt : Nat) : List OwnedResponse → Nat
+  | [] => 0
+  | response :: rest =>
+      match settleAttempt attempt (projectOwnedResponse response) with
+      | .reask next => 1 + attemptsUsed next rest
+      | .continueCalls => attemptsUsed attempt rest
+      | _ => 1
+
+theorem reask_advances_below_limit (attempt next : Nat) (projection : OwnedProjection)
+    (settled : settleAttempt attempt projection = .reask next) :
+    next = attempt + 1 ∧ attempt < maxResultAttempts := by
+  unfold settleAttempt at settled
+  split at settled
+  · split at settled
+    · cases settled
+      constructor
+      · rfl
+      · assumption
+    · cases settled
+  · split at settled <;> cases settled
+
+theorem attempts_bounded_from (responses : List OwnedResponse) :
+    ∀ attempt, attempt ≤ maxResultAttempts →
+      attemptsUsed attempt responses + attempt ≤ maxResultAttempts + 1 := by
+  induction responses with
+  | nil =>
+      intro attempt bound
+      simp [attemptsUsed]
+      omega
+  | cons response rest ih =>
+      intro attempt bound
+      simp only [attemptsUsed]
+      cases settled : settleAttempt attempt (projectOwnedResponse response) with
+      | reask next =>
+          obtain ⟨advanced, below⟩ := reask_advances_below_limit attempt next _ settled
+          subst advanced
+          have recursive := ih (attempt + 1) (by omega)
+          simp only
+          omega
+      | continueCalls => exact ih attempt bound
+      | failed =>
+          simp only
+          unfold maxResultAttempts at bound ⊢
+          omega
+      | accepted =>
+          simp only
+          unfold maxResultAttempts at bound ⊢
+          omega
+
+-- The abstract attempt trace cannot reach a fourth result attempt. This does
+-- not bound provider requests or prove the runtime parser or native dispatch.
+theorem no_fourth_attempt (responses : List OwnedResponse) :
+    attemptsUsed 1 responses ≤ maxResultAttempts := by
+  have bounded := attempts_bounded_from responses 1 (by decide)
+  omega
+
+-- A lookup-only reply retains normal tool execution without accepting a result.
+theorem lookup_only_continues (attempt lookups : Nat) (nonempty : lookups ≠ 0) :
+    settleAttempt attempt (projectOwnedResponse
+      { resultCall := none, lookupCalls := lookups }) = .continueCalls := by
+  simp [settleAttempt, projectOwnedResponse, nonempty]
+
 -- Branch-derived eligibility is checked before automatic dispatch. A report
 -- projection is not an ordinary turn; only successful ordinary loops advance it.
 -- The cooldown window is a bound on ordinary loops since the last completed
@@ -743,13 +885,23 @@ theorem cross_generation_synchronization_is_rejected :
       (.peerSynchronized "live-2" "child/process-1" returnedCheckpoint zeroAccepted) = changed := by
   decide
 
--- Top-level correctness combines exact agent-loop allowlist, complete
--- internal/external time and loop exclusion, floor resume, native queued dispatch/reclaim, correction,
--- and termination.
+-- Top-level correctness combines local safety laws and concrete lifecycle and
+-- replay examples. It does not prove scheduling, eventual progress, or runtime refinement.
 theorem process_is_correct :
     (∀ state confirmed, resultToolAllowed state confirmed = true ↔
       state.phase = .main ∧ state.inquiryActive = true ∧
         confirmed = true ∧ state.runKind = .reflection) ∧
+    (resultDeclaration.description = "don't use unless ask" ∧
+      resultDeclaration.declaresRequiredFields = true ∧
+      resultDeclaration.enumeratesResultType = true ∧
+      resultDeclaration.rejectsExtraFields = true ∧
+      resultDeclaration.explainsParameters = false) ∧
+    (∀ lookups, projectOwnedResponse
+      { resultCall := some .invalid, lookupCalls := lookups } =
+        { executableCalls := 0, invalidAttempt := true }) ∧
+    (∀ responses, attemptsUsed 1 responses ≤ maxResultAttempts) ∧
+    (∀ attempt lookups, lookups ≠ 0 → settleAttempt attempt (projectOwnedResponse
+      { resultCall := none, lookupCalls := lookups }) = .continueCalls) ∧
     (∀ reply, agentLoop reply = true ↔
       (reply.outcome = .stop ∨ reply.outcome = .toolUse) ∧
       reply.hasErrorMessage = false ∧ reply.isInquiryReply = false ∧
@@ -855,6 +1007,14 @@ theorem process_is_correct :
   constructor
   · exact result_tool_gate
   constructor
+  · exact result_declaration_is_constrained_without_prose
+  constructor
+  · exact invalid_result_never_reaches_dispatch
+  constructor
+  · exact no_fourth_attempt
+  constructor
+  · exact lookup_only_continues
+  constructor
   · exact success_policy_exact
   constructor
   · exact reflection_tick_never_counts
@@ -917,4 +1077,4 @@ end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "reflect lifecycle: result tool requires confirmed main inquiry; both valid verdicts resume once; agent-output loops only and inclusive cooldown; internal runs and paired external pauses excluded"
+  IO.println "reflect model: confirmed-main result gate; constrained declaration without parameter prose; invalid results expose no calls; at most three result attempts, lookup-only replies continue; completion flag is idempotent; loop/pause/shutdown laws and cooldown/replay examples; no runtime refinement or eventual-progress proof"
