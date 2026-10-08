@@ -449,6 +449,7 @@ inductive ResultArguments where
 structure OwnedResponse where
   resultCall : Option ResultArguments
   lookupCalls : Nat
+  providerError : Bool := false
   deriving Repr, DecidableEq
 
 structure OwnedProjection where
@@ -458,7 +459,8 @@ structure OwnedProjection where
   deriving Repr, DecidableEq
 
 def projectOwnedResponse (response : OwnedResponse) : OwnedProjection :=
-  match response.resultCall with
+  if response.providerError then { executableCalls := 0, invalidAttempt := false }
+  else match response.resultCall with
   | some .invalid => { executableCalls := 0, invalidAttempt := true }
   | some (.valid _) =>
       { executableCalls := response.lookupCalls + 1
@@ -470,6 +472,12 @@ def projectOwnedResponse (response : OwnedResponse) : OwnedProjection :=
 theorem invalid_result_never_reaches_dispatch (lookups : Nat) :
     projectOwnedResponse { resultCall := some .invalid, lookupCalls := lookups } =
       { executableCalls := 0, invalidAttempt := true } := by
+  rfl
+
+-- Provider errors bypass result validation, including partial invalid result calls.
+theorem provider_error_is_not_invalid (response : OwnedResponse) :
+    projectOwnedResponse { response with providerError := true } =
+      { executableCalls := 0, invalidAttempt := false } := by
   rfl
 
 -- Invalid result attempts re-ask below the third attempt and fail at the limit.
@@ -498,6 +506,27 @@ def attemptsUsed (attempt : Nat) : List OwnedResponse → Nat
       | .reask next => 1 + attemptsUsed next rest
       | .continueCalls => attemptsUsed attempt rest
       | _ => 1
+
+-- Native provider retries do not advance the plugin attempt; only a final
+-- authoritative provider-error settlement cancels the inquiry without reasking.
+theorem provider_retry_preserves_attempt (attempt : Nat) (response : OwnedResponse)
+    (rest : List OwnedResponse) :
+    attemptsUsed attempt ({ response with providerError := true } :: rest) =
+      attemptsUsed attempt rest := by
+  simp [attemptsUsed, projectOwnedResponse, settleAttempt]
+
+inductive ProviderFailureOutcome where
+  | pending
+  | cancelled
+  deriving Repr, DecidableEq
+
+def providerFailureSettlement (hostSettled : Bool) : ProviderFailureOutcome :=
+  if hostSettled then .cancelled else .pending
+
+theorem provider_failure_settlement_boundary :
+    providerFailureSettlement false = .pending ∧
+    providerFailureSettlement true = .cancelled := by
+  decide
 
 theorem reask_advances_below_limit (attempt next : Nat) (projection : OwnedProjection)
     (settled : settleAttempt attempt projection = .reask next) :
@@ -900,6 +929,11 @@ theorem process_is_correct :
       { resultCall := some .invalid, lookupCalls := lookups } =
         { executableCalls := 0, invalidAttempt := true }) ∧
     (∀ responses, attemptsUsed 1 responses ≤ maxResultAttempts) ∧
+    (∀ attempt (response : OwnedResponse) rest,
+      attemptsUsed attempt ({ response with providerError := true } :: rest) =
+        attemptsUsed attempt rest) ∧
+    (providerFailureSettlement false = .pending ∧
+      providerFailureSettlement true = .cancelled) ∧
     (∀ attempt lookups, lookups ≠ 0 → settleAttempt attempt (projectOwnedResponse
       { resultCall := none, lookupCalls := lookups }) = .continueCalls) ∧
     (∀ reply, agentLoop reply = true ↔
@@ -1013,6 +1047,10 @@ theorem process_is_correct :
   constructor
   · exact no_fourth_attempt
   constructor
+  · exact provider_retry_preserves_attempt
+  constructor
+  · exact provider_failure_settlement_boundary
+  constructor
   · exact lookup_only_continues
   constructor
   · exact success_policy_exact
@@ -1072,9 +1110,12 @@ theorem process_is_correct :
   · exact cross_generation_synchronization_is_rejected
 
 #print axioms process_is_correct
+#print axioms provider_error_is_not_invalid
+#print axioms provider_retry_preserves_attempt
+#print axioms provider_failure_settlement_boundary
 
 end PiReflectWatchdogLifecycle
 
 -- Executable summary exposes the modeled result without external effects.
 def main : IO Unit := do
-  IO.println "reflect model: confirmed-main result gate; constrained declaration without parameter prose; invalid results expose no calls; at most three result attempts, lookup-only replies continue; completion flag is idempotent; loop/pause/shutdown laws and cooldown/replay examples; no runtime refinement or eventual-progress proof"
+  IO.println "reflect model: confirmed-main result gate; constrained declaration without parameter prose; invalid results expose no calls; at most three result attempts, provider failures consume none and cancel only at terminal settlement, lookup-only replies continue; completion flag is idempotent; loop/pause/shutdown laws and cooldown/replay examples; no runtime refinement or eventual-progress proof"

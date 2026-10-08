@@ -33,6 +33,24 @@ A reask after an invalid reflection response SHALL require a call to `ref` with 
 - **THEN** the plugin issues a correlated correction prompt without an ordinary continuation or completion hook
 - **AND** exhausted validation ends through the existing failure cleanup path without granting a new lookup budget
 
+### Requirement: Provider failures stay outside result correction
+
+An assistant with `stopReason: "error"` SHALL remain a host-owned provider failure, not a missing or invalid `ref` submission. It SHALL consume no ordinary loop, cooldown loop, result attempt, or lookup budget. Its stop reason, error text, and native retry eligibility SHALL remain intact. Failure classification SHALL NOT depend on error-text matching.
+
+#### Scenario: Native retry succeeds
+
+- **GIVEN** a confirmed reflection receives repeated provider errors, including an error marked by `pi-retry`
+- **WHEN** Pi retries and receives a valid `ref` submission
+- **THEN** the submission is accepted in the same reflection attempt
+- **AND** the failures produce no correction prompt, reflection warning, result, or completion hook
+
+#### Scenario: Native retries exhaust
+
+- **GIVEN** a confirmed reflection receives only provider errors
+- **WHEN** Pi exhausts retries and the run authoritatively settles
+- **THEN** the failed inquiry is cancelled and folded without a plugin correction request, result, completion hook, or ordinary continuation
+- **AND** neither the failures nor the terminal settlement adds a loop
+
 ### Requirement: Result function has a fixed constrained declaration
 
 The plugin SHALL register `ref` with description exactly `don't use unless ask`. Its public argument schema SHALL declare exactly the five required string properties `type`, `reason`, `done`, `current_step`, and `next_step`, SHALL enumerate `type` as exactly `NO_ISSUE` and `ROUTE_CORRECTION`, SHALL require every field to be nonblank, and SHALL NOT admit additional properties. The declaration SHALL contain no parameter descriptions, titles, examples, or default values, and SHALL NOT include parameter usage instructions or additional prompt guidelines. Structural constraints are not usage instructions. The plugin SHALL NOT add, remove, or change the declaration when reflection starts or ends; execution authorization SHALL instead be checked at runtime. Neither this stable declaration nor its structural constraints SHALL be described as a guarantee of provider cache hits, provider-side strict generation, model obedience, or a sound reflection.
@@ -146,7 +164,7 @@ When an assistant response captured for the current confirmed reflection attempt
 - **GIVEN** the previous attempt submitted an invalid `type`
 - **WHEN** the correction attempt submits valid arguments
 - **THEN** the result is accepted once and finalized through the existing continuation and completion flow
-- **AND** the total provider requests equal the reflection attempts used
+- **AND** excluding host-owned provider retries, the total provider requests equal the reflection attempts used
 
 #### Scenario: Three schema-invalid attempts
 
