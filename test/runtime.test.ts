@@ -1831,6 +1831,72 @@ test("provisional reflection never captures an uncorrelated ordinary assistant",
 	await pi.emit("agent_settled", {}, ctx);
 });
 
+for (const terminal of ["success", "error"] as const) {
+	test(`reflection provider retries preserve the attempt until ${terminal} settlement`, async () => {
+		const { pi, ctx, domain } = install();
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		await pi.commands[0]?.handler("", ctx);
+		await startReflectionRun(pi, ctx);
+		const notifications = [...ctx.notifications];
+		const errorMessage =
+			"Error Code model_not_found: unknown provider for model axis/gpt-6-astra\n\n[pi-retry] provider returned error";
+		for (let attempt = 0; attempt < 4; attempt += 1) {
+			const failed = {
+				role: "assistant",
+				stopReason: "error",
+				errorMessage,
+				content: [],
+			};
+			const replacement = await pi.emit(
+				"message_end",
+				{ message: failed },
+				ctx,
+			);
+			const delivered = replacement?.message ?? failed;
+			assert.equal(delivered.stopReason, "error");
+			assert.equal(delivered.errorMessage, errorMessage);
+			await pi.emit("turn_end", { message: failed }, ctx);
+			await pi.emit("agent_end", { messages: [failed] }, ctx);
+			assert.equal(domain.rootWrites, 0);
+			assert.equal(domain.allWrites, 0);
+			assert.equal(
+				pi.messages.length,
+				1,
+				"no correction prompt during retries",
+			);
+			assert.deepEqual(ctx.notifications, notifications);
+			assert.deepEqual(hooks, []);
+			if (attempt < 3) await pi.emit("agent_start", {}, ctx);
+		}
+		if (terminal === "success") {
+			await pi.emit("agent_start", {}, ctx);
+			await completeReflectionAttempt(pi, ctx, validCorrection);
+			assert.equal(hooks.length, 1);
+			assert.equal(continuationMessages(pi).length, 1);
+		} else {
+			ctx.setIdle(true);
+			await pi.emit("agent_settled", {}, ctx);
+			assert.deepEqual(hooks, []);
+			assert.equal(continuationMessages(pi).length, 0);
+			assert.equal(pi.entries.length, 0);
+		}
+		assert.equal(lastInquiry(pi).details.attempt, 1);
+		assert.ok(lastInquiryFold(pi));
+		assert.equal(domain.rootWrites, 0);
+		assert.equal(domain.allWrites, 0);
+		assert.deepEqual(ctx.notifications, notifications);
+		const messages = pi.messages.length;
+		await pi.emit("agent_settled", {}, ctx);
+		assert.equal(
+			pi.messages.length,
+			messages,
+			"terminal cleanup is idempotent",
+		);
+		await pi.emit("session_shutdown", {}, ctx);
+	});
+}
+
 test("confirmed neutralized assistant never synthesizes aborted stopReason", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);

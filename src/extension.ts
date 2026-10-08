@@ -1396,6 +1396,12 @@ export function createWatchdogExtension(
 				runtime.internalRun.attempt !== active.attempt
 			)
 				return;
+			// Provider failures belong to Pi's retry cycle, not result validation.
+			if (
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			)
+				return;
 			if (
 				active.handle.capture(event.message) === null ||
 				event.message.role !== "assistant"
