@@ -1,4 +1,4 @@
-import { Type } from "@earendil-works/pi-ai";
+import type { Static } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -48,6 +48,8 @@ import {
 	MAX_REFLECTION_REASKS,
 	MAX_REFLECTION_TOOL_CALLS,
 	parseReflectionArguments,
+	prepareReflectionArguments,
+	REFLECTION_PARAMETERS,
 	REFLECTION_TOOL_NAME,
 	type ReflectionDecision,
 	type ReflectionThresholdSnapshot,
@@ -1179,7 +1181,11 @@ export function createWatchdogExtension(
 			name: REFLECTION_TOOL_NAME,
 			label: REFLECTION_TOOL_NAME,
 			description: "don't use unless ask",
-			parameters: Type.Object({}, { additionalProperties: true }),
+			parameters: REFLECTION_PARAMETERS,
+			prepareArguments: (args) =>
+				prepareReflectionArguments(args) as Static<
+					typeof REFLECTION_PARAMETERS
+				>,
 			async execute(_toolCallId, params) {
 				const active = runtime.activeReflection;
 				if (
@@ -1402,6 +1408,23 @@ export function createWatchdogExtension(
 				active.planned = {
 					error: `reflection must be submitted with ${REFLECTION_TOOL_NAME}`,
 				};
+			// An invalid result call must not reach native schema validation: that
+			// path would request an unbudgeted follow-up and settle as a cancel.
+			// Judge raw arguments with the plugin parser and stop the response here.
+			const invalidResult = toolCalls
+				.filter((call) => call.name === REFLECTION_TOOL_NAME)
+				.map((call) => parseReflectionArguments(call.arguments))
+				.find((validation) => !validation.valid);
+			if (invalidResult !== undefined && !invalidResult.valid) {
+				active.planned ??= { error: invalidResult.error };
+				return {
+					message: {
+						...active.handle.neutralize(event.message),
+						stopReason: "stop" as const,
+						content: [],
+					},
+				};
+			}
 			// Preserve executable calls until Pi runs them; the completed inquiry
 			// folds calls and results together out of subsequent context.
 			return {

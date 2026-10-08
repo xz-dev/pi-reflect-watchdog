@@ -50,6 +50,8 @@ export {
 	MAX_REFLECTION_TEXT_CHARACTERS,
 	MAX_REFLECTION_TOOL_CALLS,
 	parseReflectionArguments,
+	prepareReflectionArguments,
+	REFLECTION_PARAMETERS,
 	type ReflectionDecision,
 	type ReflectionPromptContext,
 	type ReflectionThresholdSnapshot,

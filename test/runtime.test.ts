@@ -662,13 +662,174 @@ async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	await correlateReflection(pi, ctx);
 }
 
+const EXPLANATORY_SCHEMA_KEYWORDS = [
+	"description",
+	"title",
+	"examples",
+	"default",
+] as const;
+
+test("result tool declares structural constraints without explanatory annotations", () => {
+	const { pi } = install();
+	const tool = pi.tools.get("ref");
+	assert.ok(tool, "result tool must be registered");
+	assert.equal(tool.description, "don't use unless ask");
+	const parameters = JSON.parse(JSON.stringify(tool.parameters));
+	assert.equal(parameters.type, "object");
+	assert.equal(parameters.additionalProperties, false);
+	const fields = ["type", "reason", "done", "current_step", "next_step"];
+	assert.deepEqual([...parameters.required].sort(), [...fields].sort());
+	assert.deepEqual(
+		Object.keys(parameters.properties).sort(),
+		[...fields].sort(),
+	);
+	assert.deepEqual(parameters.properties.type, {
+		type: "string",
+		enum: ["NO_ISSUE", "ROUTE_CORRECTION"],
+	});
+	for (const field of fields.slice(1))
+		assert.deepEqual(parameters.properties[field], {
+			type: "string",
+			minLength: 1,
+			pattern: "\\S",
+		});
+	const serialized = JSON.stringify(parameters);
+	for (const keyword of EXPLANATORY_SCHEMA_KEYWORDS)
+		assert.doesNotMatch(serialized, new RegExp(`"${keyword}":`));
+	assert.equal(tool.promptSnippet, undefined);
+	assert.equal(tool.promptGuidelines, undefined);
+	assert.equal(typeof tool.prepareArguments, "function");
+	assert.deepEqual(
+		tool.prepareArguments({
+			TYPE: " no_issue ",
+			Reason: " sound ",
+			done: "checked",
+			current_step: "verify",
+			NEXT_STEP: "continue",
+		}),
+		{
+			type: "NO_ISSUE",
+			reason: "sound",
+			done: "checked",
+			current_step: "verify",
+			next_step: "continue",
+		},
+	);
+});
+
+test("schema-invalid owned result is captured before dispatch and corrected within the attempt bound", async () => {
+	const { pi, ctx } = install();
+	const tool = pi.tools.get("ref");
+	const executed: unknown[] = [];
+	const execute = tool.execute;
+	tool.execute = (...args: unknown[]) => {
+		executed.push(args[1]);
+		return execute(...args);
+	};
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	const notificationsBefore = ctx.notifications.length;
+	await startReflectionRun(pi, ctx);
+	const { next_step: _omitted, ...missingNextStep } = validNoIssue;
+	const captured = await pi.emit(
+		"message_end",
+		{
+			message: {
+				...assistant(validNoIssue).message,
+				content: [
+					{ type: "thinking", thinking: "private" },
+					{
+						type: "toolCall",
+						id: "lookup",
+						name: "read",
+						arguments: { path: "README.md" },
+					},
+					{
+						type: "toolCall",
+						id: "reflect-result",
+						name: "ref",
+						arguments: missingNextStep,
+					},
+				],
+			},
+		},
+		ctx,
+	);
+	assert.deepEqual(captured.message.content, []);
+	assert.equal(captured.message.stopReason, "stop");
+	assert.deepEqual(
+		executed,
+		[],
+		"no call from the invalid response is dispatched",
+	);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(ctx.notifications.slice(notificationsBefore), [
+		"Reflection attempt 1/3 invalid: reflection result must contain exactly the five required fields; retrying.",
+	]);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		2,
+	);
+	assert.equal(pi.entries.length, 0);
+	assert.equal(continuationMessages(pi).length, 0);
+	assert.doesNotMatch(lastInquiry(pi).content, /checked|verify/);
+
+	await startReflectionRun(pi, ctx);
+	const corrected = await completeReflectionAttempt(pi, ctx, {
+		...validNoIssue,
+		type: "bogus" as "NO_ISSUE",
+	});
+	assert.deepEqual(corrected.message.content, []);
+	await startReflectionRun(pi, ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.deepEqual(executed, [validNoIssue]);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(
+		pi.entries.filter(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection-completed",
+		).length,
+		1,
+	);
+});
+
+test("three schema-invalid owned results end through failure cleanup", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	const notificationsBefore = ctx.notifications.length;
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		await startReflectionRun(pi, ctx);
+		const captured = await completeReflectionAttempt(pi, ctx, {
+			...validNoIssue,
+			reason: 42 as unknown as string,
+		});
+		assert.deepEqual(captured.message.content, []);
+	}
+	assert.deepEqual(ctx.notifications.slice(notificationsBefore), [
+		"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
+		"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
+		"Reflection failed: reflection field reason must be a non-empty string",
+	]);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		3,
+	);
+	assert.equal(pi.entries.length, 0);
+	assert.equal(continuationMessages(pi).length, 0);
+});
+
 test("reserved result tool reveals no usage and rejects calls outside confirmed reflection", async () => {
 	const { pi, ctx } = install();
 	const tool = pi.tools.get("ref");
 	assert.ok(tool, "result tool must be registered");
 	assert.equal(tool.description, "don't use unless ask");
-	assert.deepEqual(tool.parameters.properties, {});
-	assert.equal(tool.parameters.required, undefined);
 	assert.equal(tool.promptSnippet, undefined);
 	assert.equal(tool.promptGuidelines, undefined);
 	const declaration = JSON.stringify(tool.parameters);

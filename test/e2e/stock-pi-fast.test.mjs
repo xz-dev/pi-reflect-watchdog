@@ -264,8 +264,16 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 	});
 	const provider = await startFakeProvider({
 		responsePlan: ({ requestIndex }) => {
-			if (requestIndex === 0 || requestIndex === 2)
-				return reflectionResponse({});
+			// Ordinary schema-admissible call reaches the reserved-function error.
+			if (requestIndex === 0)
+				return reflectionResponse({
+					type: "NO_ISSUE",
+					reason: "copied from history",
+					done: "d",
+					current_step: "c",
+					next_step: "n",
+				});
+			if (requestIndex === 2) return reflectionResponse({});
 			if (requestIndex === 3)
 				return reflectionResponse({
 					type: "NO_ISSUE",
@@ -319,8 +327,7 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 	);
 	assert.ok(declaration);
 	assert.equal(declaration.function.description, "don't use unless ask");
-	assert.deepEqual(declaration.function.parameters.properties, {});
-	assert.equal(declaration.function.parameters.required, undefined);
+	assertConstrainedDeclaration(declaration.function.parameters);
 	const rejection = provider.requests[1].body.messages.find(
 		(message) => message.role === "tool",
 	);
@@ -352,9 +359,11 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 		JSON.stringify(provider.requests[3].body.messages),
 		/previous reflection response was invalid/,
 	);
+	// The ordinary request history legitimately contains its own copied call;
+	// only reflection prompt and correction text must stay folded away.
 	assert.doesNotMatch(
 		JSON.stringify(provider.requests[4].body.messages),
-		/current_step|previous reflection response was invalid/,
+		/Supply exactly these five|previous reflection response was invalid/,
 	);
 	for (const request of provider.requests)
 		assert.deepEqual(
@@ -603,6 +612,237 @@ test("packed stock Pi shows each invalid reflection retry before terminal failur
 	]);
 	await new Promise((resolve) => setTimeout(resolve, 250));
 	assert.equal(provider.requests.length, 3, "terminal failure does not retry");
+});
+
+const SCHEMA_VALID_RESULT = {
+	type: "NO_ISSUE",
+	reason: "route is sound",
+	done: "fixture checked",
+	current_step: "finish",
+	next_step: "stop",
+};
+
+function assertConstrainedDeclaration(parameters) {
+	const fields = ["type", "reason", "done", "current_step", "next_step"];
+	assert.equal(parameters.type, "object");
+	assert.equal(parameters.additionalProperties, false);
+	assert.deepEqual([...parameters.required].sort(), [...fields].sort());
+	assert.deepEqual(parameters.properties.type.enum, [
+		"NO_ISSUE",
+		"ROUTE_CORRECTION",
+	]);
+	for (const field of fields.slice(1))
+		assert.deepEqual(parameters.properties[field], {
+			type: "string",
+			minLength: 1,
+			pattern: "\\S",
+		});
+	assert.doesNotMatch(
+		JSON.stringify(parameters),
+		/"(description|title|examples|default)":/,
+	);
+}
+
+async function startSchemaFixture(t, prefix, responsePlan, prompt) {
+	assertStockPi();
+	const resources = await createTestResources(t, prefix);
+	const isolated = await createIsolatedEnvironment(resources.base);
+	const artifact = await installPackedArtifact({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+	});
+	await writeJson(path.join(isolated.agentDir, "pi-reflect-watchdog.json"), {
+		rootLoopLimit: 60,
+		allLoopLimit: 300,
+		taskMinutes: 20,
+	});
+	const tracePath = await installHookTracer({
+		base: resources.base,
+		agentDir: isolated.agentDir,
+		tracePath: path.join(resources.base, "semantic-hooks.jsonl"),
+	});
+	const provider = await startFakeProvider({ responsePlan });
+	resources.add(() => provider.close());
+	await writeJson(
+		path.join(isolated.agentDir, "models.json"),
+		modelConfig(provider.baseUrl),
+	);
+	const rpc = new RpcPi({
+		cwd: isolated.workspace,
+		env: { ...isolated.env, PI_WATCHDOG_HOOK_TRACE: tracePath },
+		launcherArgs: [
+			"--mode",
+			"rpc",
+			"--no-session",
+			"--tools",
+			"ref",
+			"--provider",
+			"watchdog-fixture",
+			"--model",
+			"watchdog-fixture",
+		],
+	});
+	resources.add(() => rpc.close());
+	await assertSingleWatchdogCommand(
+		rpc,
+		path.join(artifact.packagePath, "dist", "extension.js"),
+	);
+	const accepted = await rpc.request({ type: "prompt", message: prompt });
+	assert.equal(accepted.success, true);
+	return { provider, rpc, tracePath };
+}
+
+function reflectionWarnings(rpc) {
+	return rpc.events
+		.map(({ message }) => message)
+		.filter(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.method === "notify" &&
+				message.notifyType === "warning" &&
+				message.message.startsWith("Reflection"),
+		)
+		.map((message) => message.message);
+}
+
+test("packed stock Pi corrects a schema-invalid reflection result without a native follow-up", {
+	timeout: 45_000,
+}, async (t) => {
+	const { next_step: _omitted, ...missingNextStep } = SCHEMA_VALID_RESULT;
+	const { provider, rpc, tracePath } = await startSchemaFixture(
+		t,
+		"pi-reflect-watchdog-schema-correction-",
+		({ requestIndex }) => {
+			if (requestIndex === 0) return reflectionResponse(missingNextStep);
+			if (requestIndex === 1)
+				return reflectionResponse({ ...SCHEMA_VALID_RESULT, type: "BOGUS" });
+			if (requestIndex === 2) return reflectionResponse(SCHEMA_VALID_RESULT);
+			return { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] };
+		},
+		"/reflect exercise schema correction",
+	);
+	await waitForProviderRequests(provider, 4);
+	await waitForProviderResponse(provider.requests[3]);
+	await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[3].finishedAt,
+	);
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(
+		provider.requests.length,
+		4,
+		"three reflection attempts plus one resumed ordinary turn",
+	);
+	for (const request of provider.requests.slice(0, 3))
+		assert.doesNotMatch(
+			JSON.stringify(request.body.messages),
+			/Validation failed for tool/,
+		);
+	assert.match(
+		JSON.stringify(provider.requests[1].body.messages),
+		/previous reflection response was invalid: reflection result must contain exactly the five required fields/,
+	);
+	assert.match(
+		JSON.stringify(provider.requests[2].body.messages),
+		/previous reflection response was invalid: reflection type must be NO_ISSUE or ROUTE_CORRECTION/,
+	);
+	assert.doesNotMatch(
+		JSON.stringify(provider.requests[3].body.messages),
+		/current_step|previous reflection response was invalid|Validation failed/,
+	);
+	assert.deepEqual(reflectionWarnings(rpc), [
+		"Reflection attempt 1/3 invalid: reflection result must contain exactly the five required fields; retrying.",
+		"Reflection attempt 2/3 invalid: reflection type must be NO_ISSUE or ROUTE_CORRECTION; retrying.",
+	]);
+	assert.deepEqual(await tracedHooks(tracePath), [
+		{
+			version: 1,
+			name: "reflection-completed",
+			values: {
+				REFLECTION_TYPE: "NO_ISSUE",
+				REASON: "route is sound",
+				NEXT_STEP: "stop",
+			},
+		},
+	]);
+});
+
+test("packed stock Pi ends three schema-invalid reflection results without a fourth request", {
+	timeout: 45_000,
+}, async (t) => {
+	const { provider, rpc, tracePath } = await startSchemaFixture(
+		t,
+		"pi-reflect-watchdog-schema-exhausted-",
+		() => reflectionResponse({ ...SCHEMA_VALID_RESULT, reason: "   " }),
+		"/reflect exercise schema exhaustion",
+	);
+	await waitForProviderRequests(provider, 3);
+	await waitForProviderResponse(provider.requests[2]);
+	const deadline = performance.now() + 10_000;
+	while (reflectionWarnings(rpc).length < 3 && performance.now() < deadline)
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.deepEqual(reflectionWarnings(rpc), [
+		"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
+		"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
+		"Reflection failed: reflection field reason must be a non-empty string",
+	]);
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(provider.requests.length, 3, "no fourth request");
+	for (const request of provider.requests)
+		assert.doesNotMatch(
+			JSON.stringify(request.body.messages),
+			/Validation failed for tool/,
+		);
+	assert.deepEqual(await tracedHooks(tracePath), []);
+});
+
+test("packed stock Pi gives an ordinary malformed ref call the native error and keeps working", {
+	timeout: 45_000,
+}, async (t) => {
+	const { provider, rpc, tracePath } = await startSchemaFixture(
+		t,
+		"pi-reflect-watchdog-schema-ordinary-",
+		({ requestIndex }) =>
+			requestIndex === 0
+				? reflectionResponse({ type: "bogus" })
+				: { delay: 20, chunks: [{ content: "ordinary fixture resumed" }] },
+		"Exercise a malformed reserved call outside reflection.",
+	);
+	await waitForProviderRequests(provider, 2);
+	await waitForProviderResponse(provider.requests[1]);
+	const settled = await rpc.waitFor(
+		(message, at) =>
+			message.type === "agent_settled" && at >= provider.requests[1].finishedAt,
+	);
+	assert.ok(settled);
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(provider.requests.length, 2);
+	assertConstrainedDeclaration(
+		provider.requests[0].body.tools.find((tool) => tool.function.name === "ref")
+			.function.parameters,
+	);
+	const rejection = provider.requests[1].body.messages.find(
+		(message) => message.role === "tool",
+	);
+	assert.match(
+		providerMessageText(rejection),
+		/Validation failed for tool "ref"/,
+	);
+	assert.doesNotMatch(
+		providerMessageText(rejection),
+		/reserved for the plugin/,
+	);
+	const assistantText = rpc.events
+		.map(({ message }) => message)
+		.filter(
+			(message) =>
+				message.type === "message_end" && message.message?.role === "assistant",
+		)
+		.map((message) => providerMessageText(message.message))
+		.join("\n");
+	assert.match(assistantText, /ordinary fixture resumed/);
+	assert.deepEqual(reflectionWarnings(rpc), []);
+	assert.deepEqual(await tracedHooks(tracePath), []);
 });
 
 test("packed stock Pi completes one root-loop reflection without redispatching during cooldown", {

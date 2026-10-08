@@ -1,3 +1,4 @@
+import { Type } from "@earendil-works/pi-ai";
 import { formatDuration } from "./duration.js";
 export type ReflectionTriggerReason =
 	| "ROOT_LOOP_LIMIT"
@@ -58,6 +59,50 @@ const REQUIRED_FIELDS = [
 	"current_step",
 	"next_step",
 ] as const;
+
+const REFLECTION_TYPES = ["NO_ISSUE", "ROUTE_CORRECTION"] as const;
+const nonblankText = () => Type.String({ minLength: 1, pattern: "\\S" });
+
+/**
+ * Public `ref` parameters: structural constraints only, no explanatory text.
+ * The serialized size limit and case-folded duplicate names stay runtime checks.
+ */
+export const REFLECTION_PARAMETERS = Type.Object(
+	{
+		type: Type.String({ enum: [...REFLECTION_TYPES] }),
+		reason: nonblankText(),
+		done: nonblankText(),
+		current_step: nonblankText(),
+		next_step: nonblankText(),
+	},
+	{ additionalProperties: false },
+);
+
+/**
+ * Normalize compatible raw arguments to the declared form before native schema
+ * validation: lowercase names, trimmed strings, uppercase recognized type.
+ * Never fills, drops, coerces, or repairs; non-objects and case-folded name
+ * collisions pass through unchanged so they still fail.
+ */
+export function prepareReflectionArguments(raw: unknown): unknown {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+	const entries = Object.entries(raw);
+	const names = entries.map(([key]) => key.toLowerCase());
+	if (new Set(names).size !== entries.length) return raw;
+	const prepared: Record<string, unknown> = Object.fromEntries(
+		entries.map(([key, value]) => [
+			key.toLowerCase(),
+			typeof value === "string" ? value.trim() : value,
+		]),
+	);
+	const type = prepared.type;
+	if (typeof type === "string") {
+		const upper = type.toUpperCase();
+		if ((REFLECTION_TYPES as readonly string[]).includes(upper))
+			prepared.type = upper;
+	}
+	return prepared;
+}
 
 export function parseReflectionArguments(input: unknown): ReflectionValidation {
 	if (typeof input !== "object" || input === null || Array.isArray(input))

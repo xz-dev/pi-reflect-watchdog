@@ -1,12 +1,165 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { validateToolArguments } from "@earendil-works/pi-ai";
+import { Compile } from "typebox/compile";
 import {
 	buildReflectionPrompt,
 	buildReflectionReaskPrompt,
 	DEFAULT_REFLECTION_PROMPT,
 	MAX_REFLECTION_TEXT_CHARACTERS,
 	parseReflectionArguments,
+	prepareReflectionArguments,
+	REFLECTION_PARAMETERS,
 } from "../src/index.js";
+
+const declared = Compile(REFLECTION_PARAMETERS);
+
+function schemaAccepts(args: unknown): boolean {
+	return declared.Check(prepareReflectionArguments(args));
+}
+
+function nativeAccepts(args: unknown): boolean {
+	try {
+		validateToolArguments(
+			{ name: "ref", description: "", parameters: REFLECTION_PARAMETERS },
+			{
+				type: "toolCall",
+				id: "parity",
+				name: "ref",
+				arguments: prepareReflectionArguments(args) as Parameters<
+					typeof validateToolArguments
+				>[1]["arguments"],
+			},
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const parityValid = {
+	type: "NO_ISSUE",
+	reason: "sound",
+	done: "checked",
+	current_step: "verify",
+	next_step: "continue",
+};
+
+test("argument preparation normalizes only compatible inputs", () => {
+	assert.deepEqual(
+		prepareReflectionArguments({
+			TYPE: " route_correction ",
+			Reason: "  a & b <notes>  ",
+			DONE: "done",
+			Current_Step: "now",
+			next_step: "next ",
+		}),
+		{
+			type: "ROUTE_CORRECTION",
+			reason: "a & b <notes>",
+			done: "done",
+			current_step: "now",
+			next_step: "next",
+		},
+	);
+	const passthrough: unknown[] = [
+		null,
+		[],
+		"text",
+		42,
+		{ ...parityValid, REASON: "duplicate" },
+	];
+	for (const raw of passthrough)
+		assert.equal(prepareReflectionArguments(raw), raw);
+	assert.deepEqual(
+		prepareReflectionArguments({ ...parityValid, Extra: " kept ", reason: 42 }),
+		{ ...parityValid, extra: "kept", reason: 42 },
+		"unknown fields stay present and non-strings are not coerced",
+	);
+	assert.deepEqual(
+		prepareReflectionArguments({ ...parityValid, type: " bogus " }),
+		{ ...parityValid, type: "bogus" },
+		"an unrecognized type is trimmed but not repaired",
+	);
+	assert.deepEqual(
+		prepareReflectionArguments({ type: "no_issue" }),
+		{ type: "NO_ISSUE" },
+		"missing fields are not filled",
+	);
+});
+
+test("argument preparation preserves prototype-named extra fields", () => {
+	for (const name of ["__proto__", "__PROTO__", "constructor"]) {
+		const raw = { ...parityValid, [name]: " kept " };
+		const prepared = prepareReflectionArguments(raw);
+		assert.deepEqual(prepared, {
+			...parityValid,
+			[name.toLowerCase()]: "kept",
+		});
+		assert.equal(schemaAccepts(raw), false);
+		assert.equal(parseReflectionArguments(raw).valid, false);
+	}
+	const collision = { ...parityValid, ["__proto__"]: "a", __PROTO__: "b" };
+	assert.equal(prepareReflectionArguments(collision), collision);
+});
+
+test("declared schema validity of prepared arguments matches the plugin parser", () => {
+	const cases: unknown[] = [
+		parityValid,
+		{
+			TYPE: "no_issue",
+			Reason: " sound ",
+			done: "d",
+			current_step: "c",
+			NEXT_STEP: "n",
+		},
+		{ ...parityValid, type: "route_correction" },
+		{},
+		{ type: "NO_ISSUE" },
+		{ ...parityValid, reason: " " },
+		{ ...parityValid, reason: "\u00a0\u2003" },
+		{ ...parityValid, reason: "" },
+		{ ...parityValid, reason: 42 },
+		{ ...parityValid, reason: true },
+		{ ...parityValid, reason: null },
+		{ ...parityValid, type: "UNKNOWN" },
+		{ ...parityValid, extra: "unexpected" },
+	];
+	for (const raw of cases)
+		assert.equal(
+			schemaAccepts(raw),
+			parseReflectionArguments(raw).valid,
+			JSON.stringify(raw),
+		);
+	for (const raw of cases.filter((args) => {
+		const reason = (args as { reason?: unknown }).reason;
+		return (
+			reason !== null &&
+			typeof reason !== "number" &&
+			typeof reason !== "boolean"
+		);
+	}))
+		assert.equal(nativeAccepts(raw), schemaAccepts(raw), JSON.stringify(raw));
+	// Host behavior, not the declared contract: Pi converts null/number/boolean
+	// primitives before checking. Owned submissions are judged by the
+	// plugin parser before dispatch, so this only reaches ordinary calls, which
+	// still meet the reserved-function rejection.
+	for (const reason of [42, true, null])
+		assert.equal(nativeAccepts({ ...parityValid, reason }), true);
+	// Runtime-only rules: both still reject, the schema cannot express them.
+	assert.equal(
+		parseReflectionArguments({ ...parityValid, REASON: "duplicate" }).valid,
+		false,
+	);
+	assert.equal(
+		parseReflectionArguments({
+			...parityValid,
+			reason: "x".repeat(MAX_REFLECTION_TEXT_CHARACTERS),
+		}).valid,
+		false,
+	);
+	assert.equal(schemaAccepts({ ...parityValid, REASON: "duplicate" }), false);
+});
 
 test("default perspective questions interpretation across contextual exchanges", () => {
 	assert.match(DEFAULT_REFLECTION_PROMPT, /third-party perspective/);
