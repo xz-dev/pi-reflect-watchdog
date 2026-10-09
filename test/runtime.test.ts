@@ -3096,7 +3096,8 @@ test("reflection tool budget and history hint stay shared across result attempts
 		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
 	assert.deepEqual(await pi.emit("tool_call", {}, ctx), {
 		block: true,
-		reason: "Reflection tool-call budget exhausted.",
+		reason:
+			"Reflection tool-call budget exhausted. If reflection is complete, call ref alone to submit your result and end reflection.",
 	});
 	await completeReflectionAttempt(pi, ctx, validNoIssue);
 	assert.equal(

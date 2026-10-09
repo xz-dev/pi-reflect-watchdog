@@ -1380,7 +1380,7 @@ export function createWatchdogExtension(
 			if (active.toolCalls >= MAX_REFLECTION_TOOL_CALLS)
 				return {
 					block: true,
-					reason: "Reflection tool-call budget exhausted.",
+					reason: `Reflection tool-call budget exhausted. If reflection is complete, call ${REFLECTION_TOOL_NAME} alone to submit your result and end reflection.`,
 				};
 			active.toolCalls += 1;
 		});
