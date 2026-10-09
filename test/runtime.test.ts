@@ -23,6 +23,7 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
+import { deriveBranchAccounting } from "../src/branch-accounting.js";
 import type { WatchdogConfig } from "../src/config.js";
 import {
 	createWatchdogExtension,
@@ -33,13 +34,21 @@ import {
 	createObservableAgentHub,
 	type ObservableAgentHub,
 } from "../src/hub.js";
-import type {
-	ReflectDomainCoordinator,
-	ReflectDomainCounters,
+import {
+	createReflectDomainCoordinator,
+	type ReflectBranchDomainCoordinator,
+	type ReflectBranchSource,
+	type ReflectDomainCounters,
+	type ReflectFreshCompletion,
 } from "../src/process-domain.js";
+
 import { DEFAULT_REFLECTION_PROMPT } from "../src/prompts.js";
 
 class Pi {
+	currentCtx: any;
+	entrySequence = 0;
+	capturedMessage: any;
+	confirmed = false;
 	readonly tools = new Map<string, any>();
 	readonly handlers = new Map<string, (event: any, ctx: any) => any>();
 	readonly bus = new Map<string, Set<(data: unknown) => void>>();
@@ -99,12 +108,40 @@ class Pi {
 
 	appendEntry(customType: string, data: unknown) {
 		this.entries.push({ customType, data });
+		if (this.currentCtx)
+			this.currentCtx.setBranch([
+				...this.currentCtx.sessionManager.getBranch(),
+				{
+					type: "custom",
+					id: `fixture-custom-${++this.entrySequence}`,
+					customType,
+					data,
+				},
+			]);
 		this.actions.push(`entry:${customType}`);
 	}
 
 	async emit(name: string, event: any, ctx: any) {
+		this.currentCtx = ctx;
+		if (
+			name === "message_start" &&
+			String(event.message.customType).endsWith(":inquiry")
+		)
+			this.confirmed = true;
+		if (name === "agent_settled") this.confirmed = false;
+		if (name === "turn_end" && event.messageEntryId === undefined) {
+			if (this.confirmed && this.capturedMessage)
+				event.message = this.capturedMessage;
+			event.messageEntryId = `fixture-turn-${++this.entrySequence}`;
+			event.toolResultEntryIds = [];
+			ctx.setBranch([
+				...ctx.sessionManager.getBranch(),
+				branchMessage(event.message, event.messageEntryId),
+			]);
+		}
 		const result = await this.handlers.get(name)?.(event, ctx);
 		if (name === "message_end") {
+			this.capturedMessage = result?.message ?? event.message;
 			for (const block of (result?.message ?? event.message).content ?? []) {
 				if (block.type !== "toolCall" || !this.tools.has(block.name)) continue;
 				const blocked = await this.emit(
@@ -130,15 +167,28 @@ function counter(value = 0n) {
 	return { value };
 }
 
-class FakeDomain implements ReflectDomainCoordinator {
+class FakeDomain implements ReflectBranchDomainCoordinator {
 	readonly rootProcess = true;
-	paused = false;
 	readonly activityWrites: boolean[] = [];
 	rootWrites = 0;
 	allWrites = 0;
 	resetWrites = 0;
 	private revision = 1n;
 	private readonly attachments = new Map<object, boolean>();
+	private readonly sources = new Map<object, ReflectBranchSource>();
+	private readonly seen = new Set<string>();
+	private readonly completionListeners = new Set<
+		(event: ReflectFreshCompletion) => void
+	>();
+	private readonly baselines = new Map<
+		object,
+		{
+			fullAfterEntryId: string | null;
+			reminderAfterEntryId: string | null;
+			full: bigint;
+			reminder: bigint;
+		}
+	>();
 	private readonly listeners = new Set<
 		(counters: ReflectDomainCounters) => void
 	>();
@@ -146,18 +196,25 @@ class FakeDomain implements ReflectDomainCoordinator {
 
 	async attach(
 		instance: object,
-		options: { getBusy: () => boolean; onFatal: (error: Error) => void },
+		options: {
+			getBusy: () => boolean;
+			source: ReflectBranchSource;
+			onFatal: (error: Error) => void;
+		},
 	) {
+		this.sources.set(instance, options.source);
+		this.baselines.set(instance, {
+			fullAfterEntryId: options.source.getLeafId(),
+			reminderAfterEntryId: options.source.getLeafId(),
+			full: 0n,
+			reminder: 0n,
+		});
 		this.attachments.set(instance, options.getBusy());
 		this.refreshBusy();
 	}
 
 	async detach(instance: object) {
 		this.attachments.delete(instance);
-		if (this.attachments.size === 0) {
-			this.paused = false;
-			this.value = { ...this.value, paused: false };
-		}
 		this.refreshBusy();
 	}
 
@@ -167,27 +224,80 @@ class FakeDomain implements ReflectDomainCoordinator {
 		this.refreshBusy();
 	}
 
-	async recordRootLoop() {
-		if (this.paused) return this.value;
-		this.rootWrites += 1;
+	async refreshBranch(instance: object) {
+		const source = this.sources.get(instance);
+		const base = this.baselines.get(instance);
+		if (!source || !base) return this.value;
+		const view = deriveBranchAccounting(source.getBranch(), {
+			boundaryPolicy: source.isMain() ? "recorded" : "baselines",
+			cooldownLoops: 0,
+			...base,
+		});
+		const full = view.activeLoops - base.full;
+		const reminder = view.reminderLoops - base.reminder;
+		base.full = view.activeLoops;
+		base.reminder = view.reminderLoops;
+		if (full === 0n && reminder === 0n) return this.value;
+		if (source.isMain()) this.rootWrites += Number(full);
+		else this.allWrites += Number(full);
 		this.value = this.next({
-			activeLoops: this.value.activeLoops.value + 1n,
-			rootLoops: this.value.rootLoops.value + 1n,
-			allLoops: this.value.allLoops.value + 1n,
+			activeLoops: this.value.activeLoops.value + full,
+			rootLoops: this.value.rootLoops.value + (source.isMain() ? reminder : 0n),
+			allLoops: this.value.allLoops.value + reminder,
 		});
 		this.publish();
 		return this.value;
 	}
-
-	async recordAllLoop() {
-		if (this.paused) return this.value;
-		this.allWrites += 1;
-		this.value = this.next({
-			activeLoops: this.value.activeLoops.value + 1n,
-			allLoops: this.value.allLoops.value + 1n,
+	async rebaseBranch(
+		instance: object,
+		options: {
+			adoptHistory?: boolean;
+			fullAfterEntryId?: string | null;
+			reminderAfterEntryId?: string | null;
+		} = {},
+	) {
+		const source = this.sources.get(instance);
+		if (source)
+			this.baselines.set(instance, {
+				fullAfterEntryId: options.adoptHistory
+					? (options.fullAfterEntryId ?? null)
+					: source.getLeafId(),
+				reminderAfterEntryId: options.adoptHistory
+					? (options.reminderAfterEntryId ?? null)
+					: source.getLeafId(),
+				full: 0n,
+				reminder: 0n,
+			});
+		return this.refreshBranch(instance);
+	}
+	async completeTurn(instance: object, messageEntryId: string) {
+		await this.refreshBranch(instance);
+		const source = this.sources.get(instance);
+		const base = this.baselines.get(instance);
+		if (!source || !base || this.seen.has(messageEntryId)) return this.value;
+		const view = deriveBranchAccounting(source.getBranch(), {
+			boundaryPolicy: source.isMain() ? "recorded" : "baselines",
+			cooldownLoops: 0,
+			...base,
 		});
-		this.publish();
+		if (!view.reminder.entryIds.includes(messageEntryId)) return this.value;
+		this.seen.add(messageEntryId);
+		for (const listener of this.completionListeners)
+			listener({
+				attachmentInstance: instance,
+				contributorId: "fixture",
+				attachmentId: "fixture",
+				scope: "0",
+				messageEntryId,
+				snapshotSeq: this.revision,
+				accountingGeneration: this.revision,
+				counters: this.value,
+			});
 		return this.value;
+	}
+	subscribeCompletions(listener: (event: ReflectFreshCompletion) => void) {
+		this.completionListeners.add(listener);
+		return () => this.completionListeners.delete(listener);
 	}
 
 	counters() {
@@ -203,12 +313,22 @@ class FakeDomain implements ReflectDomainCoordinator {
 
 	async resetReminderCycle() {
 		this.resetWrites += 1;
+		for (const [instance, base] of this.baselines) {
+			base.reminderAfterEntryId =
+				this.sources.get(instance)?.getLeafId() ?? null;
+			base.reminder = 0n;
+		}
 		this.value = this.next({ taskMs: 0n, rootLoops: 0n, allLoops: 0n });
 		this.publish();
 		return this.value;
 	}
 
 	async resetCycleOnUserTakeover() {
+		for (const [instance, base] of this.baselines) {
+			base.fullAfterEntryId = base.reminderAfterEntryId =
+				this.sources.get(instance)?.getLeafId() ?? null;
+			base.full = base.reminder = 0n;
+		}
 		this.value = this.next({
 			activeMs: 0n,
 			activeLoops: 0n,
@@ -220,11 +340,18 @@ class FakeDomain implements ReflectDomainCoordinator {
 		return this.value;
 	}
 
-	async setPaused(paused: boolean) {
-		this.paused = paused;
-		this.value = { ...this.value, paused };
-		this.publish();
-		return this.value;
+	remoteCompletion() {
+		this.setCounters({ allLoops: this.value.allLoops.value + 1n });
+		for (const listener of this.completionListeners)
+			listener({
+				contributorId: "remote",
+				attachmentId: "remote",
+				scope: "0",
+				messageEntryId: `remote-${this.revision}`,
+				snapshotSeq: this.revision,
+				accountingGeneration: this.revision,
+				counters: this.value,
+			});
 	}
 
 	setRemoteBusy(value: boolean) {
@@ -290,7 +417,6 @@ class FakeDomain implements ReflectDomainCoordinator {
 			domainEpoch: "domain",
 			revision: this.revision,
 			generation: this.revision,
-			paused: this.paused,
 			anyBusy: false,
 			localBusy: false,
 			otherBusy: false,
@@ -371,14 +497,13 @@ const config: WatchdogConfig = {
 	taskMinutes: 20,
 	idleResetGapSeconds: 60,
 	reflectionPrompt: DEFAULT_REFLECTION_PROMPT,
-	hookPauses: [],
 	cancelShortcut: "alt+x",
 };
 
 function install(
 	options: {
 		hub?: ObservableAgentHub;
-		domain?: FakeDomain;
+		domain?: ReflectBranchDomainCoordinator;
 		ctx?: ReturnType<typeof context>;
 		limits?: Partial<typeof config>;
 	} = {},
@@ -396,7 +521,7 @@ function install(
 			}),
 		},
 	})(pi as any);
-	return { pi, ctx, domain };
+	return { pi, ctx, domain: domain as FakeDomain };
 }
 
 function publishHook(pi: Pi, name: string) {
@@ -1025,172 +1150,16 @@ test("automatic Reflect is consumed during cooldown while manual Reflect bypasse
 	);
 });
 
-test("paired semantic hooks nest independently, overlap, and keep manual reflect available", async () => {
-	const { pi, ctx, domain } = install({
-		limits: {
-			rootLoopLimit: 1,
-			hookPauses: [
-				{ pause: "inquiry-started", resume: "inquiry-finished" },
-				{ pause: "inquiry-started", resume: "review-finished" },
-			],
-		},
-	});
+test("legacy pause hooks neither subscribe nor alter accounting or hold", async () => {
+	const { pi, ctx, domain } = install({ limits: { rootLoopLimit: 1 } });
 	await pi.emit("session_start", {}, ctx);
-	publishHook(pi, "inquiry-finished");
-	publishHook(pi, "inquiry-started");
-	publishHook(pi, "inquiry-started");
-	await flushAsync();
-	assert.equal(domain.paused, true);
+	assert.equal(pi.bus.get("pi:semantic-hook:v1")?.size ?? 0, 0);
+	publishHook(pi, "work-paused");
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 0);
-	assert.equal(lastInquiry(pi), undefined);
-
-	await pi.commands[0]?.handler("manual during pause", ctx);
-	assert.match(
-		lastInquiry(pi)?.content ?? "",
-		/USER_REQUEST/,
-		"busy manual reflection submits immediately while paused",
-	);
-	const manualCount = pi.messages.length;
-	publishHook(pi, "inquiry-finished");
-	publishHook(pi, "review-finished");
-	await flushAsync();
-	assert.equal(domain.paused, true, "one nested depth remains");
-	publishHook(pi, "inquiry-finished");
-	publishHook(pi, "review-finished");
-	await flushAsync();
-	assert.equal(domain.paused, false);
-	assert.equal(pi.messages.length, manualCount);
-});
-
-test("paused lifecycle observations do not reopen process-domain activity", async () => {
-	const { pi, ctx, domain } = install({
-		limits: {
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	await pi.emit("session_start", {}, ctx);
-	publishHook(pi, "work-paused");
-	await flushAsync();
-	const writesBefore = domain.activityWrites.length;
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(domain.activityWrites.length, writesBefore);
-	publishHook(pi, "work-resumed");
-	await flushAsync();
-	assert.equal(domain.paused, false);
-});
-
-test("observer lifecycle is gated by authoritative domain pause", async () => {
-	const hub = createObservableAgentHub();
-	const domain = new FakeDomain();
-	const root = install({
-		hub,
-		domain,
-		ctx: context("root", { hasUI: true }),
-		limits: {
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	const child = install({
-		hub,
-		domain,
-		ctx: context("child", { hasUI: false }),
-		limits: {
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	await root.pi.emit("session_start", {}, root.ctx);
-	await child.pi.emit("session_start", {}, child.ctx);
-	publishHook(root.pi, "work-paused");
-	await flushAsync();
-	const writesBefore = domain.activityWrites.length;
-	child.ctx.setIdle(false);
-	await child.pi.emit("agent_start", {}, child.ctx);
-	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
-	child.ctx.setIdle(true);
-	await child.pi.emit("agent_settled", {}, child.ctx);
-	assert.equal(domain.activityWrites.length, writesBefore);
-	assert.equal(domain.allWrites, 0);
-	publishHook(root.pi, "work-resumed");
-	await flushAsync();
-	child.ctx.setIdle(false);
-	await child.pi.emit("agent_start", {}, child.ctx);
-	assert.equal(domain.activityWrites.at(-1), true);
-});
-
-test("resume re-evaluates frozen threshold and shutdown unsubscribes and resumes", async () => {
-	const { pi, ctx, domain } = install({
-		limits: {
-			rootLoopLimit: 1,
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	await pi.emit("session_start", {}, ctx);
-	publishHook(pi, "work-paused");
-	await flushAsync();
-	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 0);
-	assert.equal(lastInquiry(pi), undefined);
-	pi.events.emit("pi:semantic-hook:v1", { version: 9, name: "work-resumed" });
-	assert.equal(domain.paused, true);
-	publishHook(pi, "work-resumed");
-	await flushAsync();
-	assert.equal(domain.paused, false);
-	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
-
-	publishHook(pi, "work-paused");
-	await flushAsync();
-	assert.equal(domain.paused, true);
-	await pi.emit("session_shutdown", {}, ctx);
-	await flushAsync();
-	assert.equal(domain.paused, false);
-	publishHook(pi, "work-paused");
-	await flushAsync();
-	assert.equal(domain.paused, false);
-});
-
-test("observer shutdown preserves owner pause until final domain detach", async () => {
-	const hub = createObservableAgentHub();
-	const domain = new FakeDomain();
-	const root = install({
-		hub,
-		domain,
-		ctx: context("root", { hasUI: true }),
-		limits: {
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	const child = install({
-		hub,
-		domain,
-		ctx: context("child", { hasUI: false }),
-		limits: {
-			hookPauses: [{ pause: "work-paused", resume: "work-resumed" }],
-		},
-	});
-	await root.pi.emit("session_start", {}, root.ctx);
-	await child.pi.emit("session_start", {}, child.ctx);
-	publishHook(root.pi, "work-paused");
-	await flushAsync();
-	assert.equal(domain.paused, true);
-	await child.pi.emit("session_shutdown", {}, child.ctx);
-	await flushAsync();
-	assert.equal(domain.paused, true, "observer cannot resume the owner pause");
-	await root.pi.emit("session_shutdown", {}, root.ctx);
-	await flushAsync();
-	assert.equal(
-		domain.paused,
-		false,
-		"final detach destroys paused domain state",
-	);
+	assert.equal(domain.rootWrites, 1);
+	assert.ok(lastInquiry(pi));
 });
 
 test("minimal core exposes /reflect, /cancel-reflect and one reserved tool", async () => {
@@ -1215,7 +1184,7 @@ test("ordinary user message resets the full cycle without touching reflection-ow
 		rootLoops: 4n,
 		allLoops: 5n,
 	});
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
 	assert.equal(domain.counters().activeMs.value, 0n);
 	assert.equal(domain.counters().activeLoops.value, 0n);
 	assert.equal(domain.counters().taskMs.value, 0n);
@@ -1250,7 +1219,7 @@ test("takeover discards stale automatic intent while preserving the manual queue
 		String(message.customType ?? "").endsWith(":inquiry"),
 	).length;
 	assert.equal(runtimeQueuedState(pi, ctx), true);
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
 	assert.equal(domain.counters().rootLoops.value, 0n);
 	assert.equal(
 		pi.messages.filter(({ message }) =>
@@ -1338,7 +1307,7 @@ test("terminal abort resets while non-abort and missing boundary preserve counte
 	assert.equal(domain.counters().allLoops.value, 1n);
 });
 
-test("abort reset runs after reflection persistence and continuation", async () => {
+test("abort cancels a staged reflection result before persistence or continuation", async () => {
 	const { pi, ctx, domain } = install({
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
@@ -1365,18 +1334,472 @@ test("abort reset runs after reflection persistence and continuation", async () 
 	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(
-		pi.entries.some(
-			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
-		),
-		"reflection result persistence is preserved",
+	// A main-run abort cancels the staged result before it can act: no
+	// durable reflection entries, no ordinary continuation, and the cancelled
+	// inquiry's controls are withheld from later model-visible context.
+	assert.equal(
+		pi.entries.filter(
+			(entry) =>
+				entry.customType === "pi-reflect-watchdog:reflection" ||
+				entry.customType === "pi-reflect-watchdog:reflection-completed",
+		).length,
+		0,
+		"an aborted staged result leaves no durable reflection entries",
 	);
-	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(continuationMessages(pi).length, 0);
 	assert.equal(domain.counters().rootLoops.value, 0n);
 	assert.equal(domain.counters().allLoops.value, 0n);
 	assert.deepEqual(
 		pi.actions.filter((action) => action === "continuation").length,
+		0,
+	);
+	const cancelled = await pi.emit(
+		"context",
+		{
+			messages: [lastInquiryFold(pi), lastInquiry(pi)]
+				.filter((message) => message !== undefined)
+				.map((message) => ({ role: "custom", ...message, timestamp: 1 })),
+		},
+		ctx,
+	);
+	assert.deepEqual(
+		cancelled.messages,
+		[],
+		"cancelled correlated controls stay out of model context",
+	);
+});
+
+async function abortSettledRun(
+	pi: Pi,
+	ctx: ReturnType<typeof context>,
+	branch: any[],
+	capturedMessage: any,
+) {
+	ctx.setBranch([
+		...branch,
+		branchMessage({ ...capturedMessage, stopReason: "aborted" }, "abort-tail"),
+	]);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+}
+
+test("post-abort hold blocks dispatch until explicit input or /reflect releases it", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const branch: any[] = [ordinaryLoop("before")];
+	ctx.setBranch(branch);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	await abortSettledRun(pi, ctx, branch, captured.message);
+	const requestsAtAbort = pi.messages.length;
+
+	// Counters observed during the hold must not retain work for release.
+	domain.setCounters({ rootLoops: 5n, allLoops: 5n });
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(pi.messages.length, requestsAtAbort, "hold blocks dispatch");
+
+	// A user-role message alone does not release the hold (extension wakes).
+	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.length,
+		requestsAtAbort,
+		"role-only user message keeps the hold",
+	);
+
+	// Explicit rpc input releases it and resets the cycle.
+	await pi.emit("input", { type: "input", source: "rpc", text: "resume" }, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+});
+
+test("extension-sourced input and repeated settlement cannot release the hold", async () => {
+	const { pi, ctx } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const branch: any[] = [ordinaryLoop("before")];
+	ctx.setBranch(branch);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	await abortSettledRun(pi, ctx, branch, captured.message);
+	const requestsAtAbort = pi.messages.length;
+
+	await pi.emit(
+		"input",
+		{ type: "input", source: "extension", text: "plugin wake" },
+		ctx,
+	);
+	await pi.emit("agent_settled", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.length,
+		requestsAtAbort,
+		"extension input and repeated settlement keep the hold",
+	);
+
+	await pi.emit(
+		"input",
+		{ type: "input", source: "interactive", text: "real user" },
+		ctx,
+	);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	// rootLoopLimit is 1: one ordinary loop in the fresh cycle crosses it, so
+	// a released hold would produce exactly one new inquiry; a still-held
+	// cycle produces none. Either way nothing before release dispatched.
+	const inquiryCount = pi.messages.length - requestsAtAbort;
+	assert.ok(
+		inquiryCount === 0 || inquiryCount === 1,
+		`unexpected inquiry count after release: ${inquiryCount}`,
+	);
+});
+
+test("extension input before abort settlement cannot bypass the hold", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	await pi.emit("input", { source: "extension", text: "callback" }, ctx);
+	await abortSettledRun(pi, ctx, [], assistant(validNoIssue).message);
+	const count = pi.messages.length;
+	domain.setCounters({ rootLoops: 5n, allLoops: 5n });
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.length,
+		count,
+		"extension input must not count as explicit re-entry",
+	);
+});
+
+test("abort inhibition and re-entry reset precede synchronous counter notifications", async () => {
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	const reset = domain.resetCycleOnUserTakeover.bind(domain);
+	const inquiriesAtReset: number[] = [];
+	domain.resetCycleOnUserTakeover = async () => {
+		// Reentrant observers can see the old snapshot before reset is published.
+		domain.setCounters({ rootLoops: 5n, allLoops: 5n });
+		inquiriesAtReset.push(
+			pi.messages.filter(({ message }) =>
+				String(message.customType).endsWith(":inquiry"),
+			).length,
+		);
+		return reset();
+	};
+	await abortSettledRun(pi, ctx, [], assistant(validNoIssue).message);
+	assert.deepEqual(
+		inquiriesAtReset,
+		[1],
+		"abort must hold before reset notifications",
+	);
+	await pi.emit("input", { source: "rpc", text: "resume" }, ctx);
+	assert.deepEqual(
+		inquiriesAtReset,
+		[1, 1],
+		"re-entry must reset while still held",
+	);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType).endsWith(":inquiry"),
+		).length,
+		2,
+	);
+});
+
+test("explicit input submitted during abort settlement is not re-held", async () => {
+	const { pi, ctx } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const branch: any[] = [ordinaryLoop("before")];
+	ctx.setBranch(branch);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	ctx.setBranch([
+		...branch,
+		branchMessage(
+			{ ...captured.message, stopReason: "aborted" },
+			"abort-tail-input",
+		),
+	]);
+	ctx.setIdle(true);
+	// The user submits while the aborted run is still settling.
+	await pi.emit("input", { type: "input", source: "rpc", text: "quick" }, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	// rootLoopLimit is 1: the first ordinary loop of the fresh cycle crosses it,
+	// so a cycle NOT re-held by the older settlement dispatches exactly one new
+	// inquiry (2 total). A wrongly installed hold would leave it at 1 forever.
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
+		2,
+		"the older settlement did not re-hold the user's new cycle",
+	);
+});
+
+test("new /reflect during abort settlement cancels old requests and survives old settlement", async () => {
+	const { pi, ctx, domain } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("old approach", ctx);
+	await startReflectionRun(pi, ctx);
+	await pi.commands[0]?.handler("discard waiting", ctx);
+	ctx.setBranch([
+		branchMessage(assistant(validNoIssue).message, "abort-manual"),
+	]);
+	ctx.setBranch([
+		branchMessage(
+			{ ...assistant(validNoIssue).message, stopReason: "aborted" },
+			"abort-manual",
+		),
+	]);
+	ctx.setIdle(true);
+	await pi.commands[0]?.handler("new approach", ctx);
+	const fresh = lastInquiry(pi);
+	assert.match(fresh.content, /new approach/);
+	assert.doesNotMatch(fresh.content, /old approach|discard waiting/);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(lastInquiry(pi), fresh);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	await startReflectionRun(pi, ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType).endsWith(":inquiry"),
+		).length,
+		2,
+	);
+});
+
+test("aborted correction attempt neither reasks nor warns", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	const invalid = { ...validNoIssue, reason: "   " };
+	// The owned response is aborted mid-correction instead of settling clean.
+	const abortedAssistant = {
+		...assistant(invalid).message,
+		stopReason: "aborted",
+		content: [
+			{
+				type: "toolCall",
+				id: "ref-aborted",
+				name: "ref",
+				arguments: JSON.stringify(invalid),
+			},
+		],
+	};
+	const rewritten = await pi.emit(
+		"message_end",
+		{ message: abortedAssistant },
+		ctx,
+	);
+	assert.equal(rewritten?.message.stopReason, "aborted");
+	assert.deepEqual(rewritten?.message.content, []);
+	const branch: any[] = [
+		branchMessage(abortedAssistant, "correction-abort-tail"),
+	];
+	ctx.setBranch(branch);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.deepEqual(
+		ctx.notifications.filter(
+			(text) =>
+				text.startsWith("Reflection attempt") ||
+				text.startsWith("Reflection failed"),
+		),
+		[],
+		"an aborted attempt issues no retry warning",
+	);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message.customType ?? "").endsWith(":inquiry"),
+		).length,
 		1,
+		"no correction reask follows the abort",
+	);
+});
+
+test("late correlated result and tool calls preserve a fresh confirmed inquiry and its budgets", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("old", ctx);
+	await startReflectionRun(pi, ctx);
+	const oldReply = assistant(validNoIssue);
+	oldReply.message.content = [
+		{
+			type: "toolCall",
+			id: "old-result",
+			name: "ref",
+			arguments: validNoIssue,
+		},
+	];
+	const captured = await pi.emit("message_end", oldReply, ctx);
+	await abortSettledRun(pi, ctx, [], captured.message);
+	// Stock Pi completes old settlement before running deferred /reflect.
+	await pi.emit("agent_settled", {}, ctx);
+	await pi.commands[0]?.handler("fresh", ctx);
+	await startReflectionRun(pi, ctx);
+	const freshPrompt = lastInquiry(pi);
+	const requests = pi.messages.length;
+	await pi.handlers.get("message_end")?.({ message: captured.message }, ctx);
+	await assert.rejects(
+		() => pi.tools.get("ref").execute("old-result", validNoIssue),
+		/reserved for the plugin/,
+	);
+	assert.equal(
+		(
+			await pi.emit(
+				"tool_call",
+				{ toolCallId: "old-result", toolName: "read", input: {} },
+				ctx,
+			)
+		)?.block,
+		true,
+	);
+	await pi.emit(
+		"tool_result",
+		{
+			toolCallId: "old-result",
+			toolName: "ref",
+			input: validNoIssue,
+			content: [],
+			isError: false,
+		},
+		ctx,
+	);
+	assert.equal(lastInquiry(pi), freshPrompt);
+	assert.equal(
+		pi.messages.length,
+		requests,
+		"old callbacks cannot send a retry or replace fresh authority",
+	);
+	for (let index = 0; index < 10; index++)
+		assert.equal(
+			(
+				await pi.emit(
+					"tool_call",
+					{ toolCallId: `fresh-${index}`, toolName: "read", input: {} },
+					ctx,
+				)
+			)?.block,
+			undefined,
+		);
+	assert.equal(
+		(
+			await pi.emit(
+				"tool_call",
+				{ toolCallId: "fresh-11", toolName: "read", input: {} },
+				ctx,
+			)
+		)?.block,
+		true,
+	);
+	await completeReflectionAttempt(pi, ctx, validCorrection);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(
+		pi.entries.filter(
+			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
+		).length,
+		1,
+	);
+	assert.deepEqual(
+		ctx.notifications.filter((value) => value.startsWith("Reflection attempt")),
+		[],
+	);
+});
+
+test("late result call from a cancelled inquiry stays reserved with no active inquiry", async () => {
+	const { pi, ctx } = install({
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const branch: any[] = [ordinaryLoop("before")];
+	ctx.setBranch(branch);
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await correlateReflection(pi, ctx);
+	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	await abortSettledRun(pi, ctx, branch, captured.message);
+
+	// The stale ref call arrives after the hold; it must be reserved-rejected.
+	let rejection: unknown;
+	try {
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{
+							type: "toolCall",
+							id: "stale-ref",
+							name: "ref",
+							arguments: JSON.stringify(validNoIssue),
+						},
+					],
+				},
+			},
+			ctx,
+		);
+	} catch (error) {
+		rejection = error;
+	}
+	assert.match(
+		String(rejection),
+		/This function is reserved for the plugin\. Please try another function\./,
+	);
+	assert.equal(
+		pi.entries.filter((entry) =>
+			entry.customType.startsWith("pi-reflect-watchdog:reflection"),
+		).length,
+		0,
+		"a cancelled inquiry's late submission records nothing",
+	);
+});
+
+test("cancel-reflect keeps withdrawal-only behavior after abort cancellation", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	const cancel = pi.commands.find(
+		(command) => command.name === "cancel-reflect",
+	);
+	assert.ok(cancel);
+	cancel.handler("", ctx);
+	assert.match(
+		ctx.notifications.at(-1) ?? "",
+		/No queued reflection to cancel\./,
 	);
 });
 
@@ -1395,7 +1818,7 @@ test("authoritative domain loops trigger the ask from ordinary work", async () =
 		/ROOT_LOOP_LIMIT/,
 		"threshold reflection steers the current ordinary run",
 	);
-	await pi.emit("message_start", { message: { role: "user" } }, ctx);
+	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
 	await correlateReflection(pi, ctx);
 	await pi.emit("message_end", assistant(validNoIssue), ctx);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
@@ -1498,7 +1921,7 @@ test("cross-process child threshold queues reflection while the child stays busy
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
 	domain.setRemoteBusy(true);
-	await domain.recordAllLoop();
+	domain.remoteCompletion();
 	assert.match(lastInquiry(pi)?.content ?? "", /ALL_LOOP_LIMIT/);
 });
 
@@ -1510,7 +1933,7 @@ test("native Pi steering queue accepts reflection despite an existing pending me
 	ctx.setIdle(false);
 	ctx.setPendingMessages(true);
 	await pi.emit("agent_start", {}, ctx);
-	await domain.recordAllLoop();
+	domain.remoteCompletion();
 	const inquiry = lastInquiry(pi);
 	assert.match(inquiry?.content ?? "", /ALL_LOOP_LIMIT/);
 	assert.deepEqual(pi.messages[pi.messages.length - 1]?.options, {
@@ -1553,10 +1976,11 @@ test("valid final reflections publish exact payloads once after durable entries"
 		assert.deepEqual(hooks, [
 			{ version: 1, name: "reflection-completed", values: expected },
 		]);
-		assert.deepEqual(pi.actions.slice(-3), [
+		assert.deepEqual(pi.actions.slice(-4), [
 			"entry:pi-reflect-watchdog:reflection",
 			"entry:pi-reflect-watchdog:reflection-completed",
 			"hook:reflection-completed",
+			"continuation",
 		]);
 		assert.equal(domain.counters().activeMs.value, 0n);
 		assert.equal(domain.counters().taskMs.value, 0n);
@@ -1652,8 +2076,8 @@ test("incomplete persistence never publishes completion", async () => {
 			);
 			assert.equal(
 				continuationMessages(pi).length,
-				1,
-				"scheduling still precedes persistence without an extra wake",
+				0,
+				"failed persistence cannot authorize a continuation",
 			);
 			assert.deepEqual(hooks, []);
 		}
@@ -1758,12 +2182,12 @@ test("throwing completion listener cannot change result, UI, counters, or later 
 	);
 });
 
-test("provisional reflection, valid response, and its turn_end add no activity or loops", async () => {
+test("inquiry activity is officially busy while confirmed replies add no ordinary loops", async () => {
 	const { pi, ctx, domain } = install();
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await startReflectionRun(pi, ctx);
-	assert.equal(domain.activityWrites.includes(true), false);
+	assert.equal(domain.activityWrites.includes(true), true);
 	const replacement = await pi.emit(
 		"message_end",
 		assistant(validNoIssue),
@@ -2201,6 +2625,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 			const writesBefore = domain.rootWrites;
 			assert.equal(writesBefore, origin === "automatic" ? 2 : 0);
 			ctx.setBranch([
+				...ctx.sessionManager.getBranch(),
 				branchMessage(captured.message, "source"),
 				...pi.entries.map((entry, index) => ({
 					type: "custom",
@@ -2247,11 +2672,16 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				).length,
 				1,
 			);
-			assert.equal(pi.entries.length, 2);
+			assert.equal(
+				pi.entries.filter((entry) =>
+					entry.customType.startsWith("pi-reflect-watchdog:reflection"),
+				).length,
+				2,
+			);
 			assert.equal(hooks.length, 1);
 		});
 
-test("native wake can reenter context before result persistence with internal state released", async () => {
+test("native wake reenters only after durable completion with internal state released", async () => {
 	for (const origin of ["automatic", "manual"] as const) {
 		const { pi, ctx } = install({
 			limits: { rootLoopLimit: 1, allLoopLimit: 100 },
@@ -2272,9 +2702,11 @@ test("native wake can reenter context before result persistence with internal st
 			sendMessage(message, options);
 			if (message.customType !== "pi-reflect-watchdog:continuation") return;
 			assert.equal(
-				pi.entries.length,
-				0,
-				"the context hook cannot depend on a later result entry",
+				pi.entries.filter((entry) =>
+					entry.customType.startsWith("pi-reflect-watchdog:reflection"),
+				).length,
+				2,
+				"wake requires both durable entries first",
 			);
 			const projected = pi.handlers.get("context")?.(
 				{
@@ -2310,7 +2742,12 @@ test("native wake can reenter context before result persistence with internal st
 		ctx.setIdle(true);
 		await pi.emit("agent_settled", {}, ctx);
 		assert.equal(reentered, true);
-		assert.equal(pi.entries.length, 2);
+		assert.equal(
+			pi.entries.filter((entry) =>
+				entry.customType.startsWith("pi-reflect-watchdog:reflection"),
+			).length,
+			2,
+		);
 	}
 });
 
@@ -3026,10 +3463,10 @@ test("queued second reflection dispatches after completed evidence is visible", 
 	assert.equal(hooks.length, 1);
 	assert.deepEqual(pi.actions.slice(-6), [
 		"fold",
-		"continuation",
 		"entry:pi-reflect-watchdog:reflection",
 		"entry:pi-reflect-watchdog:reflection-completed",
 		"hook:reflection-completed",
+		"continuation",
 		"inquiry",
 	]);
 });
@@ -3164,7 +3601,7 @@ test("busy manual reflection submits one native steer and completes after consum
 	assert.equal(continuationMessages(pi).length, 1);
 });
 
-test("unconsumed manual inquiry settles into a cancelled fold without results", async () => {
+test("ordinary settlement cannot cancel an unconsumed native inquiry", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
@@ -3174,9 +3611,10 @@ test("unconsumed manual inquiry settles into a cancelled fold without results", 
 	assert.ok(lastInquiry(pi), "busy invocation submits immediately");
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(
+	assert.equal(
 		lastInquiryFold(pi),
-		"an inquiry that settles without consumption folds itself away",
+		undefined,
+		"native queued inquiry remains outstanding until consumption or true abort",
 	);
 	assert.equal(
 		pi.entries.some(
@@ -3362,3 +3800,514 @@ test("queued manual reflection is discarded on session shutdown", async () => {
 		"no further inquiry after the session is torn down; only the outstanding one remains",
 	);
 });
+
+function liveDomain(now: () => number = () => 0) {
+	return createReflectDomainCoordinator({
+		now,
+		open: async () => ({
+			nodeId: "host",
+			role: "host",
+			transport: "tcp-loopback",
+			endpoint: "tcp://127.0.0.1:1",
+			declaration: {
+				version: 1,
+				domainId: "live-runtime",
+				hostNodeId: "host",
+				capability: "fixture",
+				endpoint: "tcp://127.0.0.1:1",
+			},
+			peers: () => [],
+			send: async () => {},
+			broadcast: async () => {},
+			reportLifecycle: async () => {},
+			subscribe: () => () => {},
+			subscribeEvents: () => () => {},
+			close: async () => {},
+		}),
+	});
+}
+
+for (const mainBusy of [false, true])
+	test(`real B-to-runtime fresh child completion steers ${mainBusy ? "busy" : "idle"} main; repair never sends`, async () => {
+		const hub = createObservableAgentHub();
+		const domain = liveDomain();
+		const main = install({
+			hub,
+			domain,
+			ctx: context("live-main"),
+			limits: { allLoopLimit: 1, rootLoopLimit: 60 },
+		});
+		const child = install({
+			hub,
+			domain,
+			ctx: context("live-child", { hasUI: false }),
+		});
+		await main.pi.emit("session_start", {}, main.ctx);
+		await child.pi.emit("session_start", {}, child.ctx);
+		main.ctx.setIdle(!mainBusy);
+		await main.pi.emit("agent_start", {}, main.ctx);
+		main.pi.sendMessage(
+			{ customType: "unrelated", content: "earlier steering" },
+			{ deliverAs: "steer", triggerTurn: true },
+		);
+		child.ctx.setIdle(false);
+		await child.pi.emit("agent_start", {}, child.ctx);
+		child.ctx.setBranch([ordinaryLoop("child-fresh")]);
+		// Ordinary public observations can count before the whole tool batch ends.
+		await child.pi.emit("session_compact", {}, child.ctx);
+		assert.equal(domain.counters()?.allLoops.value, 1n);
+		assert.equal(lastInquiry(main.pi), undefined);
+		await main.pi.emit("agent_settled", {}, main.ctx);
+		assert.equal(lastInquiry(main.pi), undefined);
+		const event = {
+			message: child.ctx.sessionManager.getBranch()[0].message,
+			messageEntryId: "child-fresh",
+			toolResultEntryIds: [],
+		};
+		await child.pi.emit("turn_end", event, child.ctx);
+		assert.match(lastInquiry(main.pi)?.content ?? "", /all=1\/1/);
+		assert.equal(lastInquiry(child.pi), undefined);
+		assert.deepEqual(
+			main.pi.messages.map((item) => item.message.customType),
+			["unrelated", "pi-reflect-watchdog:inquiry"],
+		);
+		assert.deepEqual(main.pi.messages[1].options, {
+			deliverAs: "steer",
+			triggerTurn: true,
+		});
+		await child.pi.emit("turn_end", event, child.ctx);
+		await main.pi.emit("agent_settled", {}, main.ctx);
+		assert.equal(
+			main.pi.messages.length,
+			2,
+			"duplicate and settlement do not replay decision or cancel provisional inquiry",
+		);
+		assert.equal(domain.counters()?.rootLoops.value, 0n);
+		await child.pi.emit("session_shutdown", {}, child.ctx);
+		await main.pi.emit("session_shutdown", {}, main.ctx);
+	});
+
+test("real held child completion remains counted; withdrawal/synthetic input/navigation cannot release; explicit input resets before release", async () => {
+	let now = 0;
+	const domain = liveDomain(() => now),
+		hub = createObservableAgentHub();
+	const main = install({
+		hub,
+		domain,
+		ctx: context("held-main"),
+		limits: { allLoopLimit: 1 },
+	});
+	const child = install({
+		hub,
+		domain,
+		ctx: context("held-child", { hasUI: false }),
+	});
+	await main.pi.emit("session_start", {}, main.ctx);
+	await child.pi.emit("session_start", {}, child.ctx);
+	main.ctx.setIdle(false);
+	await main.pi.emit("agent_start", {}, main.ctx);
+	main.ctx.setBranch([ordinaryLoop("main-abort", "aborted")]);
+	main.ctx.setIdle(true);
+	await main.pi.emit("agent_settled", {}, main.ctx);
+	child.ctx.setIdle(false);
+	await child.pi.emit("agent_start", {}, child.ctx);
+	now = 2500;
+	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	assert.equal(domain.counters()?.allLoops.value, 1n);
+	assert.equal(domain.counters()?.activeMs.value, 2500n);
+	assert.equal(lastInquiry(main.pi), undefined);
+	await main.pi.commands
+		.find((command) => command.name === "cancel-reflect")
+		?.handler("", main.ctx);
+	await main.pi.emit(
+		"input",
+		{ source: "extension", text: "callback", images: [] },
+		main.ctx,
+	);
+	await main.pi.emit("message_start", { message: { role: "user" } }, main.ctx);
+	publishHook(main.pi, "work-resumed");
+	await main.pi.emit(
+		"session_tree",
+		{ oldLeafId: "old", newLeafId: "new" },
+		main.ctx,
+	);
+	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	assert.equal(lastInquiry(main.pi), undefined);
+	const resetObservations: bigint[] = [];
+	const unsubscribe = domain.subscribe((counters) =>
+		resetObservations.push(counters.allLoops.value),
+	);
+	const input = {
+		source: "rpc",
+		text: "fresh",
+		images: [{ type: "image", data: "image", mimeType: "image/png" }],
+	};
+	const before = JSON.stringify(input);
+	await main.pi.emit("input", input, main.ctx);
+	assert.equal(JSON.stringify(input), before, "input text/images untouched");
+	assert.equal(domain.counters()?.allLoops.value, 0n);
+	assert.equal(domain.counters()?.activeMs.value, 0n);
+	assert.equal(lastInquiry(main.pi), undefined, "reset/release is not trigger");
+	assert.equal(resetObservations.at(-1), 0n);
+	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	assert.ok(
+		lastInquiry(main.pi),
+		"fresh post-reentry child completion wakes main",
+	);
+	unsubscribe();
+	await child.pi.emit("session_shutdown", {}, child.ctx);
+	await main.pi.emit("session_shutdown", {}, main.ctx);
+});
+
+test("real final main turn uses fresh OR snapshot, finalized tools, reserved authority and no deferred outstanding decision", async () => {
+	let now = 0;
+	const domain = liveDomain(() => now);
+	const { pi, ctx } = install({
+		domain,
+		limits: { rootLoopLimit: 1, allLoopLimit: 1, taskMinutes: 1 },
+	});
+	await pi.emit("session_start", {}, ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	for (let index = 1; index <= 60; index++) {
+		now = index * 1000;
+		await pi.emit("session_compact", {}, ctx);
+	}
+	assert.equal(lastInquiry(pi), undefined, "clock observations never send");
+	const reply = ordinaryLoop("final-tool").message;
+	ctx.setBranch([branchMessage(reply, "final-tool")]);
+	await pi.emit(
+		"turn_end",
+		{
+			message: reply,
+			messageEntryId: "final-tool",
+			toolResultEntryIds: ["not-persisted"],
+		},
+		ctx,
+	);
+	assert.equal(
+		lastInquiry(pi),
+		undefined,
+		"missing finalized result cannot authorize boundary",
+	);
+	ctx.setBranch([
+		...ctx.sessionManager.getBranch(),
+		branchMessage(
+			{ role: "toolResult", toolCallId: "t", content: [] },
+			"persisted-tool",
+		),
+	]);
+	let reentered = false;
+	const reset = domain.resetReminderCycle.bind(domain);
+	domain.resetReminderCycle = async () => {
+		if (!reentered) {
+			reentered = true;
+			ctx.setBranch([
+				...ctx.sessionManager.getBranch(),
+				ordinaryLoop("simultaneous"),
+			]);
+			await pi.handlers.get("turn_end")?.(
+				{
+					message: ordinaryLoop("simultaneous").message,
+					messageEntryId: "simultaneous",
+					toolResultEntryIds: [],
+				},
+				ctx,
+			);
+		}
+		return reset();
+	};
+	await pi.emit(
+		"turn_end",
+		{
+			message: reply,
+			messageEntryId: "final-tool",
+			toolResultEntryIds: ["persisted-tool"],
+		},
+		ctx,
+	);
+	await flushAsync();
+	assert.match(
+		lastInquiry(pi)?.content ?? "",
+		/ROOT_LOOP_LIMIT, ALL_LOOP_LIMIT, TASK_TIME_LIMIT/,
+	);
+	assert.equal(
+		pi.messages.filter((item) => item.message.customType.endsWith(":inquiry"))
+			.length,
+		1,
+	);
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await startReflectionRun(pi, ctx);
+	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	assert.equal(continuationMessages(pi).length, 1);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(
+		pi.messages.filter((item) => item.message.customType.endsWith(":inquiry"))
+			.length,
+		1,
+		"missed outstanding completion is never replayed",
+	);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("real scope replacement resets clocks/rebuilds branch; append, compaction, cancelled navigation do not", async () => {
+	let now = 0;
+	const domain = liveDomain(() => now);
+	const { pi, ctx } = install({ domain, limits: { rootLoopLimit: 100 } });
+	ctx.setBranch([ordinaryLoop("historical")]);
+	await pi.emit("session_start", {}, ctx);
+	assert.equal(domain.counters()?.rootLoops.value, 1n);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	now = 3200;
+	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	assert.equal(domain.counters()?.activeMs.value, 3200n);
+	await pi.emit("session_compact", {}, ctx);
+	await pi.emit("session_before_tree", {}, ctx);
+	assert.equal(domain.counters()?.activeMs.value, 3200n);
+	ctx.setBranch([ordinaryLoop("selected")]);
+	await pi.emit(
+		"session_tree",
+		{ oldLeafId: "old", newLeafId: "selected" },
+		ctx,
+	);
+	assert.equal(domain.counters()?.activeMs.value, 0n);
+	assert.equal(domain.counters()?.rootLoops.value, 1n);
+	for (const reason of ["new", "fork", "resume", "reload"]) {
+		const next = context(`replacement-${reason}`);
+		next.setBranch(reason === "new" ? [] : [ordinaryLoop(`branch-${reason}`)]);
+		await pi.emit("session_start", { reason }, next);
+		assert.equal(domain.counters()?.activeMs.value, 0n);
+		assert.equal(
+			domain.counters()?.rootLoops.value,
+			reason === "new" ? 0n : 1n,
+		);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		assert.equal(
+			domain.counters()?.rootLoops.value,
+			reason === "new" ? 0n : 1n,
+			"old session callback fenced",
+		);
+	}
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("one-second display cadence stays scheduled across publications; inquiry busy clocks count without loops", async () => {
+	const timers: Array<{
+		callback: () => void;
+		delay: number;
+		cancelled: boolean;
+	}> = [];
+	let now = 0;
+	const domain = liveDomain(() => now),
+		pi = new Pi(),
+		ctx = context("cadence");
+	createWatchdogExtension({
+		hub: createObservableAgentHub(),
+		processDomain: domain,
+		services: {
+			loadConfig: async () => ({ config, diagnostics: [] }),
+			scheduleTimer: (_role, callback, delay) => {
+				const timer = { callback, delay, cancelled: false };
+				timers.push(timer);
+				return timer as any;
+			},
+			clearTimeout: (timer) => {
+				(timer as any).cancelled = true;
+			},
+		},
+	})(pi as any);
+	await pi.emit("session_start", {}, ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await startReflectionRun(pi, ctx);
+	assert.equal(timers.length, 1);
+	assert.equal(timers[0].delay, 1000);
+	now = 600;
+	await pi.emit("session_compact", {}, ctx);
+	assert.equal(timers.length, 1);
+	assert.equal(
+		timers[0].cancelled,
+		false,
+		"publications cannot postpone deadline",
+	);
+	now = 1000;
+	timers[0].callback();
+	await flushAsync();
+	assert.equal(domain.counters()?.activeMs.value, 1000n);
+	assert.equal(domain.counters()?.rootLoops.value, 0n);
+	assert.match(ctx.statuses.at(-1) ?? "", /active 1s\/0 loops/);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(timers.at(-1)?.cancelled, true);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+for (const inquiry of [false, true])
+	for (const outcomeAtMessageEnd of [false, true])
+		for (const busyChild of [false, true])
+			test(`abort idle settlement freezes official clocks (${inquiry ? "inquiry" : "ordinary"}, ${outcomeAtMessageEnd ? "message outcome" : "branch outcome"}, ${busyChild ? "busy child" : "all idle"})`, async () => {
+				let now = 0;
+				const domain = liveDomain(() => now);
+				const hub = createObservableAgentHub();
+				const main = install({ hub, domain, limits: { allLoopLimit: 1 } });
+				const child = install({
+					hub,
+					domain,
+					ctx: context("abort-clock-child", { hasUI: false }),
+				});
+				await main.pi.emit("session_start", {}, main.ctx);
+				await child.pi.emit("session_start", {}, child.ctx);
+				const hooks = captureReflectionHooks(main.pi);
+				if (inquiry) {
+					await main.pi.commands[0]?.handler("cancel clock inquiry", main.ctx);
+					await startReflectionRun(main.pi, main.ctx);
+				} else {
+					main.ctx.setIdle(false);
+					await main.pi.emit("agent_start", {}, main.ctx);
+				}
+				if (busyChild) {
+					child.ctx.setIdle(false);
+					await child.pi.emit("agent_start", {}, child.ctx);
+				}
+				now = 500;
+				if (outcomeAtMessageEnd)
+					await main.pi.emit(
+						"message_end",
+						{
+							message: {
+								...assistant("partial").message,
+								stopReason: "aborted",
+							},
+						},
+						main.ctx,
+					);
+				main.ctx.setBranch([
+					...main.ctx.sessionManager.getBranch(),
+					ordinaryLoop("clock-abort", "aborted"),
+				]);
+				main.ctx.setIdle(true);
+				await main.pi.emit("agent_settled", {}, main.ctx);
+				await flushAsync();
+				assert.equal(domain.counters()?.anyBusy, busyChild);
+				now = 3500;
+				await child.pi.emit("session_compact", {}, child.ctx);
+				await flushAsync();
+				assert.equal(domain.counters()?.activeMs.value, busyChild ? 3000n : 0n);
+				assert.equal(domain.counters()?.taskMs.value, busyChild ? 3000n : 0n);
+				if (busyChild) {
+					await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+					child.ctx.setIdle(true);
+					await child.pi.emit("agent_settled", {}, child.ctx);
+				}
+				await flushAsync();
+				assert.equal(domain.counters()?.anyBusy, false);
+				const frozen = domain.counters();
+				now = 6500;
+				await child.pi.emit("session_compact", {}, child.ctx);
+				await flushAsync();
+				assert.equal(domain.counters()?.anyBusy, false);
+				assert.equal(domain.counters()?.activeMs.value, frozen?.activeMs.value);
+				assert.equal(domain.counters()?.taskMs.value, frozen?.taskMs.value);
+				assert.equal(continuationMessages(main.pi).length, 0);
+				assert.equal(
+					main.pi.messages.filter(({ message }) =>
+						message.customType.endsWith(":inquiry"),
+					).length,
+					inquiry ? 1 : 0,
+				);
+				assert.deepEqual(hooks, []);
+				assert.equal(
+					main.pi.entries.some(({ customType }) =>
+						/:reflection(?:-completed)?$/.test(customType),
+					),
+					false,
+				);
+				await child.pi.emit("session_shutdown", {}, child.ctx);
+				await main.pi.emit("session_shutdown", {}, main.ctx);
+			});
+
+for (const modern of [false, true])
+	test(`selected ${modern ? "recorded" : "legacy"} history keeps startup windows through navigation/resume/fork/reload`, async () => {
+		let now = 0;
+		const domain = liveDomain(() => now);
+		const { pi, ctx } = install({ domain, limits: { rootLoopLimit: 100 } });
+		const history = [
+			ordinaryLoop("old"),
+			branchMessage(
+				{ role: "user", content: [{ type: "text", text: "new cycle" }] },
+				"user",
+			),
+			...(modern
+				? [
+						{
+							type: "custom",
+							id: "full",
+							customType: "pi-reflect-watchdog:accounting-boundary",
+							data: { version: 1, window: "full" },
+						},
+					]
+				: []),
+			ordinaryLoop("before-reflection"),
+			...completedReflect("historical"),
+			...(modern
+				? [
+						{
+							type: "custom",
+							id: "reminder",
+							customType: "pi-reflect-watchdog:accounting-boundary",
+							data: { version: 1, window: "reminder" },
+						},
+						branchMessage(
+							{
+								role: "user",
+								content: [{ type: "text", text: "synthetic role only" }],
+							},
+							"synthetic",
+						),
+					]
+				: []),
+			ordinaryLoop("fresh"),
+		];
+		ctx.setBranch(history);
+		await pi.emit("session_start", {}, ctx);
+		assert.equal(domain.counters()?.activeLoops.value, 2n);
+		assert.equal(domain.counters()?.rootLoops.value, 1n);
+		const expected = deriveBranchAccounting(ctx.sessionManager.getBranch(), {
+			boundaryPolicy: "legacy",
+			cooldownLoops: reflectCooldownLoops(100),
+		});
+		assert.equal(expected.cooldown.skipAutomatic, true);
+		ctx.setIdle(false);
+		await pi.emit("agent_start", {}, ctx);
+		now = 1500;
+		await pi.emit("session_compact", {}, ctx);
+		assert.equal(domain.counters()?.activeMs.value, 1500n);
+		ctx.setBranch([ordinaryLoop("away")]);
+		await pi.emit(
+			"session_tree",
+			{ oldLeafId: "fresh", newLeafId: "away" },
+			ctx,
+		);
+		ctx.setBranch(history);
+		await pi.emit(
+			"session_tree",
+			{ oldLeafId: "away", newLeafId: "fresh" },
+			ctx,
+		);
+		for (const reason of ["tree", "resume", "fork", "reload"]) {
+			const selected = reason === "tree" ? ctx : context(`history-${reason}`);
+			selected.setBranch(history);
+			if (reason !== "tree")
+				await pi.emit("session_start", { reason }, selected);
+			assert.equal(domain.counters()?.activeMs.value, 0n);
+			assert.equal(domain.counters()?.taskMs.value, 0n);
+			assert.equal(domain.counters()?.activeLoops.value, expected.activeLoops);
+			assert.equal(domain.counters()?.rootLoops.value, expected.reminderLoops);
+			assert.equal(
+				lastInquiry(pi),
+				undefined,
+				"adoption never authorizes reflection",
+			);
+		}
+		await pi.emit("session_shutdown", {}, ctx);
+	});

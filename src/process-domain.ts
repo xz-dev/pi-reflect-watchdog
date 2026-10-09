@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	isProcessDomainOpenError,
 	type openProcessDomain,
@@ -8,6 +9,10 @@ import {
 	type ProcessDomainNode,
 	type ProcessDomainOpenErrorCode,
 } from "pi-extension-utils/process-domain";
+import {
+	type BranchAccounting,
+	deriveBranchAccounting,
+} from "./branch-accounting.js";
 import {
 	type AcceptedLoopDelta,
 	type CheckpointLedgerEntry,
@@ -21,10 +26,12 @@ import {
 
 export const FATAL_EXIT_CODE = 78;
 
-const CHECKPOINT_CHANNEL = "pi-reflect-watchdog.checkpoint.v3";
-const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v3";
-const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v3";
-const PRIVATE_PROTOCOL_VERSION = 3;
+const CHECKPOINT_CHANNEL = "pi-reflect-watchdog.checkpoint.v4";
+const COUNTERS_CHANNEL = "pi-reflect-watchdog.counters.v4";
+const COMPLETION_CHANNEL = "pi-reflect-watchdog.completion.v4";
+const LEAVE_CHANNEL = "pi-reflect-watchdog.leave.v4";
+const PRIVATE_PROTOCOL_VERSION = 4;
+const MAX_REPLAY_ATTACHMENTS = 1024;
 const ACTIVE_TICK_MS = 1_000;
 const IDLE_RESET_GAP_MS = 60_000;
 
@@ -86,7 +93,6 @@ export interface ReflectDomainCounters {
 	readonly domainEpoch: string;
 	readonly revision: bigint;
 	readonly generation: bigint;
-	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
 	readonly otherBusy: boolean;
@@ -99,7 +105,26 @@ export interface ReflectDomainCounters {
 	readonly allLoops: ReflectCounterValue;
 }
 
+interface CompletionIdentity {
+	readonly attachmentId: string;
+	readonly scope: string;
+	readonly entryId: string;
+	readonly position: string;
+}
+interface CompletionWire extends CompletionIdentity {
+	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
+	readonly incarnation: string;
+	readonly contributorId: string;
+	readonly accountingGeneration: string;
+	readonly seq: string;
+}
 interface CheckpointWire {
+	readonly scopes: readonly {
+		readonly attachmentId: string;
+		readonly scope: string;
+	}[];
+	readonly activeLoops: string;
+	readonly completion: CompletionIdentity | null;
 	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
 	readonly incarnation: string;
 	readonly contributorId: string;
@@ -121,12 +146,12 @@ interface CheckpointAckWire {
 }
 
 interface CountersWire {
+	readonly fullGeneration: string;
 	readonly version: typeof PRIVATE_PROTOCOL_VERSION;
 	readonly revision: string;
 	readonly generation: string;
 	readonly accountingGeneration: string;
 	readonly domainEpoch: string;
-	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly localBusy: boolean;
 	readonly otherBusy: boolean;
@@ -145,7 +170,56 @@ interface LeaveWire {
 	readonly contributorId: string;
 }
 
+export interface ReflectBranchSource {
+	readonly getBranch: () => readonly SessionEntry[];
+	readonly getLeafId: () => string | null;
+	/** Only current main may adopt history or contribute root loops. */
+	readonly isMain: () => boolean;
+	readonly boundaryPolicy: "recorded" | "legacy";
+	/** Current main records implicit long-idle resets before observers see them. */
+	readonly recordFullBoundary?: () => void;
+}
+export interface ReflectFreshCompletion {
+	/** Present only for an in-process producer; allows C to reject replaced attachment scope. */
+	readonly attachmentInstance?: object;
+	readonly contributorId: string;
+	readonly attachmentId: string;
+	readonly scope: string;
+	readonly messageEntryId: string;
+	readonly snapshotSeq: bigint;
+	readonly accountingGeneration: bigint;
+	readonly counters: ReflectDomainCounters;
+}
+export interface ReflectBranchDomainCoordinator
+	extends ReflectDomainCoordinator {
+	refreshBranch(instance: object): Promise<ReflectDomainCounters | undefined>;
+	/** Navigation/initial main adoption only; never creates a completion. */
+	rebaseBranch(
+		instance: object,
+		options?: {
+			readonly adoptHistory?: boolean;
+			readonly fullAfterEntryId?: string | null;
+			readonly reminderAfterEntryId?: string | null;
+		},
+	): Promise<ReflectDomainCounters | undefined>;
+	/** Real public turn_end only, after persisted assistant and whole tool batch. */
+	completeTurn(
+		instance: object,
+		messageEntryId: string,
+	): Promise<ReflectDomainCounters | undefined>;
+	subscribeCompletions(
+		listener: (completion: ReflectFreshCompletion) => void,
+	): () => void;
+}
 interface Attachment {
+	readonly source: ReflectBranchSource;
+	scope: bigint;
+	fullAfterEntryId: string | null;
+	reminderAfterEntryId: string | null;
+	fullIds: readonly string[];
+	reminderIds: readonly string[];
+	completedPosition: number;
+
 	readonly contributorId: string;
 	busy: boolean;
 	readonly getBusy: () => boolean;
@@ -153,6 +227,8 @@ interface Attachment {
 }
 
 interface PeerSession {
+	readonly completion: CompletionIdentity | null;
+	completedSeq: bigint;
 	readonly nodeId: string;
 	readonly incarnation: string;
 	readonly contributorId: string;
@@ -163,6 +239,8 @@ interface PeerSession {
 }
 
 interface ReplayRegistryEntry {
+	readonly scopes: Map<string, bigint>;
+	readonly completions: Map<string, { scope: bigint; position: bigint }>;
 	readonly replayKey: string;
 	readonly ack: CheckpointAckWire;
 }
@@ -175,55 +253,28 @@ interface HostPublication {
 interface ParsedCounterMessage {
 	readonly counters: ReflectDomainCounters;
 	readonly accountingGeneration: bigint;
+	readonly fullGeneration: bigint;
 	readonly checkpointAck: CheckpointAckWire | undefined;
 }
 
 export interface ReflectDomainCoordinator {
 	readonly rootProcess: boolean;
-	readonly paused: boolean;
 	attach(
 		instance: object,
 		options: {
-			/** Queried at attach, after every client reconnect, and when pause ends. */
+			/** Queried at attach and after every client reconnect. */
 			readonly getBusy: () => boolean;
+			readonly source: ReflectBranchSource;
 			readonly onFatal: (error: Error) => void;
 		},
 	): Promise<void>;
 	detach(instance: object): Promise<void>;
 	setBusy(instance: object, busy: boolean): Promise<void>;
-	recordRootLoop(): Promise<ReflectDomainCounters>;
-	recordAllLoop(): Promise<ReflectDomainCounters>;
 	counters(): ReflectDomainCounters | undefined;
 	subscribe(listener: (counters: ReflectDomainCounters) => void): () => void;
 	setIdleResetGapSeconds(seconds: number): void;
 	resetReminderCycle(): Promise<ReflectDomainCounters | undefined>;
 	resetCycleOnUserTakeover(): Promise<ReflectDomainCounters | undefined>;
-}
-
-type ReflectDomainPauseControl = (
-	paused: boolean,
-) => Promise<ReflectDomainCounters | undefined>;
-
-type ReflectDomainPauseBridge = ReflectDomainCoordinator & {
-	setPaused: ReflectDomainPauseControl;
-};
-
-const PAUSE_CONTROLS = new WeakMap<
-	ReflectDomainCoordinator,
-	ReflectDomainPauseControl
->();
-
-/** @internal Watchdog-owned control; intentionally absent from the package root API. */
-export function setReflectDomainPausedForWatchdog(
-	coordinator: ReflectDomainCoordinator,
-	paused: boolean,
-): Promise<ReflectDomainCounters | undefined> {
-	const control = PAUSE_CONTROLS.get(coordinator);
-	if (control !== undefined) return control(paused);
-	const injected = coordinator as Partial<ReflectDomainPauseBridge>;
-	return typeof injected.setPaused === "function"
-		? injected.setPaused(paused)
-		: Promise.resolve(undefined);
 }
 
 export interface ReflectDomainClock {
@@ -256,7 +307,6 @@ function zeroCounters(domainEpoch = "pending"): ReflectDomainCounters {
 		domainEpoch,
 		revision: 0n,
 		generation: 0n,
-		paused: false,
 		anyBusy: false,
 		localBusy: false,
 		otherBusy: false,
@@ -278,7 +328,6 @@ function sameCounters(
 		left.domainEpoch === right.domainEpoch &&
 		left.revision === right.revision &&
 		left.generation === right.generation &&
-		left.paused === right.paused &&
 		left.anyBusy === right.anyBusy &&
 		left.localBusy === right.localBusy &&
 		left.otherBusy === right.otherBusy &&
@@ -303,9 +352,43 @@ function validCounterValue(value: unknown): value is string {
 	return typeof value === "string" && /^\d+$/.test(value);
 }
 
+function parseCompletionIdentity(value: unknown): CompletionIdentity | null {
+	if (typeof value !== "object" || value === null) return null;
+	const wire = value as Partial<CompletionIdentity>;
+	return validId(wire.attachmentId) &&
+		validCounterValue(wire.scope) &&
+		typeof wire.entryId === "string" &&
+		wire.entryId.length > 0 &&
+		wire.entryId.length <= 1024 &&
+		validPositive(wire.position)
+		? {
+				attachmentId: wire.attachmentId,
+				scope: wire.scope,
+				entryId: wire.entryId,
+				position: wire.position,
+			}
+		: null;
+}
 function parseCheckpoint(value: unknown): CheckpointWire | null {
 	if (typeof value !== "object" || value === null) return null;
 	const wire = value as Partial<CheckpointWire>;
+	if (
+		!Array.isArray(wire.scopes) ||
+		wire.scopes.length > MAX_REPLAY_ATTACHMENTS
+	)
+		return null;
+	const scopeIds = new Set<string>();
+	for (const entry of wire.scopes) {
+		if (
+			typeof entry !== "object" ||
+			entry === null ||
+			!validId(entry.attachmentId) ||
+			!validCounterValue(entry.scope) ||
+			scopeIds.has(entry.attachmentId)
+		)
+			return null;
+		scopeIds.add(entry.attachmentId);
+	}
 	if (
 		wire.version !== PRIVATE_PROTOCOL_VERSION ||
 		!validId(wire.incarnation) ||
@@ -315,10 +398,19 @@ function parseCheckpoint(value: unknown): CheckpointWire | null {
 		typeof wire.busy !== "boolean" ||
 		!validCounterValue(wire.rootLoops) ||
 		!validCounterValue(wire.allLoops) ||
+		!validCounterValue(wire.activeLoops) ||
+		(wire.completion !== null &&
+			parseCompletionIdentity(wire.completion) === null) ||
 		(wire.resumeReceipt !== null && !validId(wire.resumeReceipt))
 	)
 		return null;
-	if (BigInt(wire.rootLoops) > BigInt(wire.allLoops)) return null;
+	if (
+		BigInt(wire.rootLoops) !== 0n ||
+		BigInt(wire.activeLoops) < BigInt(wire.allLoops) ||
+		(wire.completion !== null &&
+			BigInt(wire.completion?.position ?? "0") > BigInt(wire.activeLoops))
+	)
+		return null;
 	return wire as CheckpointWire;
 }
 
@@ -369,8 +461,8 @@ function parseCounters(
 		!validPositive(wire.revision) ||
 		!validPositive(wire.generation) ||
 		!validCounterValue(wire.accountingGeneration) ||
+		!validCounterValue(wire.fullGeneration) ||
 		!validId(wire.domainEpoch) ||
-		typeof wire.paused !== "boolean" ||
 		typeof wire.anyBusy !== "boolean" ||
 		typeof wire.localBusy !== "boolean" ||
 		typeof wire.otherBusy !== "boolean" ||
@@ -389,7 +481,6 @@ function parseCounters(
 			domainEpoch: wire.domainEpoch,
 			revision: BigInt(wire.revision),
 			generation: snapshotGeneration,
-			paused: wire.paused,
 			anyBusy: wire.anyBusy,
 			localBusy: wire.localBusy,
 			otherBusy: wire.otherBusy,
@@ -406,13 +497,14 @@ function parseCounters(
 			allLoops: counter(BigInt(wire.allLoops)),
 		},
 		accountingGeneration: BigInt(wire.accountingGeneration),
+		fullGeneration: BigInt(wire.fullGeneration),
 		checkpointAck: checkpointAcks.find((ack) => ack.nodeId === nodeId),
 	};
 }
 
 export function createReflectDomainCoordinator(
 	options: ReflectDomainOptions = {},
-): ReflectDomainCoordinator {
+): ReflectBranchDomainCoordinator {
 	const open = options.open ?? openSharedProcessDomain;
 	const env = options.env ?? process.env;
 	const clock = options.clock ?? {
@@ -422,12 +514,16 @@ export function createReflectDomainCoordinator(
 			clearTimeout(handle),
 	};
 	const activeTickMs = options.activeTickMs ?? ACTIVE_TICK_MS;
-	const now = options.now ?? Date.now;
+	const now =
+		options.now ?? (() => Number(process.hrtime.bigint() / 1_000_000n));
 	let idleResetGapMs = options.idleResetGapMs ?? IDLE_RESET_GAP_MS;
 	const processIncarnation = id();
 	const receiptSecret = randomBytes(32);
 	const attachments = new Map<object, Attachment>();
 	const listeners = new Set<(counters: ReflectDomainCounters) => void>();
+	const completionListeners = new Set<
+		(completion: ReflectFreshCompletion) => void
+	>();
 	const peerSessions = new Map<string, PeerSession>();
 	const controlPeers = new Set<string>();
 	const replayRegistry = new Map<string, ReplayRegistryEntry>();
@@ -441,19 +537,21 @@ export function createReflectDomainCoordinator(
 	let snapshotGeneration = 0n;
 	let acceptedHostRevision = 0n;
 	let acceptedHostEpoch: string | undefined;
-	let clientPaused = false;
 	let clientAccountingGeneration = 0n;
+	let fullGeneration = 0n;
+	let clientFullGeneration = 0n;
+	let localActiveLoops = 0n;
 	let clientContributorId = id();
 	let clientResumeReceipt: string | null = null;
 	let localCheckpointSeq = 0n;
 	let requiredCheckpointSeq = 0n;
-	let localRootLoops = 0n;
 	let localAllLoops = 0n;
 	let tick: ReturnType<typeof setTimeout> | undefined;
 	let unsubscribeEvents: (() => void) | undefined;
 	let unsubscribeCheckpoint: (() => void) | undefined;
 	let unsubscribeCounters: (() => void) | undefined;
 	let unsubscribeLeave: (() => void) | undefined;
+	let unsubscribeCompletion: (() => void) | undefined;
 	let writeTail = Promise.resolve();
 	let lifecycleTail = Promise.resolve();
 
@@ -526,9 +624,67 @@ export function createReflectDomainCoordinator(
 			: undefined;
 	};
 
+	const rebaseAttachment = (
+		attachment: Attachment,
+		window: "full" | "reminder",
+		adoptHistory = false,
+	): void => {
+		const leaf = attachment.source.getLeafId();
+		attachment.scope += 1n;
+		if (window === "full") {
+			attachment.fullAfterEntryId = adoptHistory ? null : leaf;
+			attachment.fullIds = [];
+		}
+		attachment.reminderAfterEntryId = adoptHistory ? null : leaf;
+		attachment.reminderIds = [];
+		// Already counted replies may still be executing tools: reset fences them.
+		attachment.completedPosition =
+			window === "full" ? 0 : attachment.fullIds.length;
+	};
+	const fenceAttachments = (window: "full" | "reminder"): void => {
+		for (const attachment of attachments.values())
+			rebaseAttachment(attachment, window);
+	};
+	let recordingBoundary = false;
+	const recordImplicitBoundary = (): void => {
+		recordingBoundary = true;
+		try {
+			for (const attachment of attachments.values())
+				if (attachment.source.isMain())
+					attachment.source.recordFullBoundary?.();
+		} catch (error) {
+			const fatal = new ReflectDomainFatalError(
+				"DOMAIN_UNRECOVERABLE",
+				"failed to record implicit accounting boundary",
+				{ cause: error },
+			);
+			reportError(fatal);
+			throw fatal;
+		} finally {
+			recordingBoundary = false;
+		}
+	};
 	const reduce = (event: Parameters<typeof reduceCollectionState>[1]): void => {
-		if (collectionState !== undefined)
-			collectionState = reduceCollectionState(collectionState, event);
+		if (collectionState === undefined) return;
+		const previous = collectionState.accounting.generation;
+		collectionState = reduceCollectionState(collectionState, event);
+		if (previous !== collectionState.accounting.generation) {
+			const window = event.type === "reminder-accepted" ? "reminder" : "full";
+			if (window === "full") fullGeneration += 1n;
+			// Claim generation before external recording; fence even if recording fails.
+			try {
+				if (window === "full" && event.type !== "cycle-reset")
+					recordImplicitBoundary();
+			} finally {
+				fenceAttachments(window);
+			}
+			for (const [key, session] of peerSessions)
+				peerSessions.set(key, {
+					...session,
+					accountingGeneration: collectionState.accounting.generation,
+					completion: null,
+				});
+		}
 	};
 
 	const localAndOtherBusy = (): {
@@ -548,21 +704,18 @@ export function createReflectDomainCoordinator(
 	const projectHostCounters = (): ReflectDomainCounters => {
 		if (node === undefined || collectionState === undefined)
 			return zeroCounters();
-		const snapshot = snapshotCollectionState(collectionState, now());
+		const snapshot = snapshotCollectionState(collectionState);
 		const busy = localAndOtherBusy();
 		const domainEpoch = node.declaration.domainId;
 		return {
 			domainEpoch,
 			revision: snapshotRevision,
 			generation: snapshotGeneration,
-			paused: snapshot.paused,
 			anyBusy: snapshot.anyBusy,
 			localBusy: busy.localBusy,
 			otherBusy: busy.otherBusy,
 			endLoopTimeMs:
-				!snapshot.paused &&
-				!snapshot.anyBusy &&
-				collectionState.accounting.idleSinceMs !== null
+				!snapshot.anyBusy && collectionState.accounting.idleSinceMs !== null
 					? BigInt(collectionState.accounting.idleSinceMs)
 					: null,
 			fence: { domainEpoch, generation: snapshotGeneration },
@@ -578,9 +731,7 @@ export function createReflectDomainCoordinator(
 		const acks: CheckpointAckWire[] = [];
 		for (const nodeId of controlPeers) {
 			const session = peerSessions.get(nodeId);
-			// The session anchor is preferred; after a pause (which clears live
-			// sessions) the retained registry receipt must still surface so a
-			// rejoining client recovers its ACK from the control snapshot.
+			// Retained receipts let reconnecting clients recover their checkpoint ACK.
 			if (session !== undefined) {
 				const entry = replayRegistry.get(session.replayKey);
 				if (entry !== undefined) acks.push(entry.ack);
@@ -605,19 +756,25 @@ export function createReflectDomainCoordinator(
 	};
 
 	const captureHostPublication = (): HostPublication | undefined => {
-		if (!rootProcess || node === undefined || collectionState === undefined)
+		if (
+			recordingBoundary ||
+			!rootProcess ||
+			node === undefined ||
+			collectionState === undefined
+		)
 			return undefined;
+		// Publishing is proof of life even when a duplicate admitted no loop delta.
+		reduce({ type: "tick", atMs: now() });
 		snapshotRevision += 1n;
 		snapshotGeneration += 1n;
 		const counters = projectHostCounters();
-		notify(counters);
 		const wire: CountersWire = Object.freeze({
 			version: PRIVATE_PROTOCOL_VERSION,
 			revision: counters.revision.toString(),
 			generation: counters.generation.toString(),
 			accountingGeneration: collectionState.accounting.generation.toString(),
+			fullGeneration: fullGeneration.toString(),
 			domainEpoch: counters.domainEpoch,
-			paused: counters.paused,
 			anyBusy: counters.anyBusy,
 			localBusy: counters.localBusy,
 			otherBusy: counters.otherBusy,
@@ -629,10 +786,13 @@ export function createReflectDomainCoordinator(
 			allLoops: counters.allLoops.value.toString(),
 			checkpointAcks: checkpointAcks(),
 		});
-		return Object.freeze({
+		const publication = Object.freeze({
 			wire,
 			targets: Object.freeze(Array.from(controlPeers)),
 		});
+		// Observers may synchronously reset or accept another checkpoint.
+		notify(counters);
+		return publication;
 	};
 
 	const sendHostPublication = async (
@@ -698,12 +858,9 @@ export function createReflectDomainCoordinator(
 				!snapshotCollectionState(collectionState, now()).anyBusy
 			)
 				return;
-			// Host heartbeat: drive the phase machine and the sleep freeze so a
-			// suspended interval is never counted as active (Lean: heartbeat).
-			collectionState = reduceCollectionState(collectionState, {
-				type: "tick",
-				atMs: now(),
-			});
+			for (const attachment of attachments.values()) observeBranch(attachment);
+			// Cadence and publication observations share elapsed settlement/gap rules.
+			reduce({ type: "tick", atMs: now() });
 			void publishHost().catch(() => {});
 			scheduleTick();
 		}, activeTickMs);
@@ -737,13 +894,18 @@ export function createReflectDomainCoordinator(
 			if (resumeReceipt !== null) return null;
 			return {
 				delta: {
+					active: checkpoint.activeLoops ?? checkpoint.allLoops,
 					root: checkpoint.rootLoops,
 					all: checkpoint.allLoops,
 				},
 				receipt: expectedReceipt,
 			};
 		}
-		if (registered.ack.resumeReceipt !== expectedReceipt) return null;
+		if (
+			registered.ack.resumeReceipt !== expectedReceipt ||
+			checkpoint.seq <= BigInt(registered.ack.seq)
+		)
+			return null;
 		if (previous !== undefined) {
 			const delta = checkpointLoopDelta(previous, checkpoint);
 			return delta === null ? null : { delta, receipt: expectedReceipt };
@@ -761,41 +923,55 @@ export function createReflectDomainCoordinator(
 			.peers()
 			.find((candidate) => candidate.nodeId === message.senderId);
 		if (peer?.status !== "online") return;
-		const resumeReceipt =
-			replayRegistry.get(replayKeyFor(message.senderId, wire.incarnation))?.ack
-				.resumeReceipt ??
-			receiptFor(replayKeyFor(message.senderId, wire.incarnation));
+		// Transport timestamps are not in this owner's monotonic clock domain.
+		const atMs = now();
 		const checkpoint: PeerCheckpoint = {
 			generation: BigInt(wire.accountingGeneration),
 			seq: BigInt(wire.seq),
 			busy: wire.busy,
+			activeLoops: BigInt(wire.activeLoops),
 			rootLoops: BigInt(wire.rootLoops),
 			allLoops: BigInt(wire.allLoops),
 		};
 		const replayKey = replayKeyFor(message.senderId, wire.incarnation);
 		const current = peerSessions.get(message.senderId);
+		const scopes =
+			replayRegistry.get(replayKey)?.scopes ?? new Map<string, bigint>();
+		if (
+			scopes.size +
+				wire.scopes.filter((entry) => !scopes.has(entry.attachmentId)).length >
+			MAX_REPLAY_ATTACHMENTS
+		)
+			return;
+		if (
+			wire.scopes.some(
+				(entry) => BigInt(entry.scope) < (scopes.get(entry.attachmentId) ?? 0n),
+			) ||
+			(wire.completion !== null &&
+				!wire.scopes.some(
+					(entry) =>
+						entry.attachmentId === wire.completion?.attachmentId &&
+						entry.scope === wire.completion.scope,
+				))
+		)
+			return;
 		const refreshControl = (): void => {
 			// Control-plane synchronization without accounting admission: the
-			// rejected contributor learns the current generation and receives
-			// its authoritative checkpoint ACK directly, without entering the
-			// shared control snapshot targets.
+			// Rejected payloads receive only authoritative accepted receipts, never an ACK for rejected coordinates.
 			const publication = captureHostPublication();
 			if (publication === undefined) return;
+			const registered = replayRegistry.get(replayKey);
 			const counters: CountersWire =
-				publication.targets.length === 0
+				registered === undefined ||
+				publication.wire.checkpointAcks.some(
+					(ack) => ack.nodeId === message.senderId,
+				)
 					? publication.wire
 					: Object.freeze({
 							...publication.wire,
 							checkpointAcks: Object.freeze([
 								...publication.wire.checkpointAcks,
-								Object.freeze({
-									nodeId: message.senderId,
-									incarnation: wire.incarnation,
-									contributorId: wire.contributorId,
-									accountingGeneration: wire.accountingGeneration,
-									seq: wire.seq,
-									resumeReceipt,
-								}),
+								registered.ack,
 							]),
 						});
 			void queueTransport(async () => {
@@ -827,7 +1003,7 @@ export function createReflectDomainCoordinator(
 				refreshControl();
 				return;
 			}
-			const previous = retainedLedger(replayKey, message.receivedAt);
+			const previous = retainedLedger(replayKey, atMs);
 			if (previous === undefined) {
 				refreshControl();
 				return;
@@ -842,7 +1018,7 @@ export function createReflectDomainCoordinator(
 				contributorId: wire.contributorId,
 				checkpoint,
 				acceptedLoopDelta: delta,
-				atMs: message.receivedAt,
+				atMs,
 			});
 			receipt = current.resumeReceipt;
 		} else {
@@ -857,7 +1033,7 @@ export function createReflectDomainCoordinator(
 				replayKey,
 				checkpoint,
 				wire.resumeReceipt,
-				message.receivedAt,
+				atMs,
 			);
 			if (classified === null) {
 				refreshControl();
@@ -867,7 +1043,7 @@ export function createReflectDomainCoordinator(
 				reduce({
 					type: "peer-offline",
 					contributorId: current.contributorId,
-					atMs: message.receivedAt,
+					atMs,
 				});
 			next = reduceCollectionState(collectionState, {
 				type: "peer-synchronized",
@@ -875,11 +1051,28 @@ export function createReflectDomainCoordinator(
 				replayKey,
 				acceptedLoopDelta: classified.delta,
 				checkpoint,
-				atMs: message.receivedAt,
+				atMs,
 			});
 			receipt = classified.receipt;
 		}
 		if (next === collectionState) {
+			refreshControl();
+			return;
+		}
+		if (next.accounting.generation !== checkpoint.generation) {
+			collectionState = next;
+			fullGeneration += 1n;
+			try {
+				recordImplicitBoundary();
+			} finally {
+				fenceAttachments("full");
+			}
+			for (const [key, session] of peerSessions)
+				peerSessions.set(key, {
+					...session,
+					accountingGeneration: next.accounting.generation,
+					completion: null,
+				});
 			refreshControl();
 			return;
 		}
@@ -893,7 +1086,17 @@ export function createReflectDomainCoordinator(
 			seq: checkpoint.seq.toString(),
 			resumeReceipt: receipt,
 		});
-		replayRegistry.set(replayKey, Object.freeze({ replayKey, ack }));
+		for (const entry of wire.scopes)
+			scopes.set(entry.attachmentId, BigInt(entry.scope));
+		replayRegistry.set(
+			replayKey,
+			Object.freeze({
+				scopes,
+				replayKey,
+				ack,
+				completions: replayRegistry.get(replayKey)?.completions ?? new Map(),
+			}),
+		);
 		peerSessions.set(message.senderId, {
 			nodeId: message.senderId,
 			incarnation: wire.incarnation,
@@ -901,6 +1104,8 @@ export function createReflectDomainCoordinator(
 			replayKey,
 			accountingGeneration: checkpoint.generation,
 			seq: checkpoint.seq,
+			completion: wire.completion,
+			completedSeq: current?.completedSeq ?? 0n,
 			resumeReceipt: receipt,
 		});
 		void publishHost()
@@ -908,28 +1113,151 @@ export function createReflectDomainCoordinator(
 			.catch(() => {});
 	};
 
-	const queueCheckpoint = (): Promise<void> => {
-		if (node === undefined || rootProcess || clientPaused)
-			return Promise.resolve();
+	const deliverCompletion = (
+		identity: CompletionIdentity,
+		contributorId: string,
+		seq: bigint,
+		generation: bigint,
+		attachmentInstance?: object,
+	): void => {
+		const counters = countersValue;
+		if (attachmentInstance !== undefined) {
+			const attachment = attachments.get(attachmentInstance);
+			if (
+				attachment === undefined ||
+				attachment.scope.toString() !== identity.scope ||
+				!attachment.fullIds.includes(identity.entryId)
+			)
+				return;
+		}
+		if (
+			recordingBoundary ||
+			!rootProcess ||
+			collectionState?.accounting.generation !== generation ||
+			counters === undefined
+		)
+			return;
+		const completion: ReflectFreshCompletion = Object.freeze({
+			contributorId,
+			attachmentId: identity.attachmentId,
+			scope: identity.scope,
+			messageEntryId: identity.entryId,
+			snapshotSeq: seq,
+			accountingGeneration: generation,
+			counters,
+			attachmentInstance,
+		});
+		for (const listener of Array.from(completionListeners)) {
+			if (collectionState?.accounting.generation !== generation) break;
+			try {
+				listener(completion);
+			} catch {
+				/* Observers cannot corrupt accounting. */
+			}
+		}
+	};
+	const applyHostCompletion = (message: ProcessDomainDataMessage): void => {
+		const identity = parseCompletionIdentity(message.value);
+		if (
+			identity === null ||
+			typeof message.value !== "object" ||
+			message.value === null ||
+			node === undefined
+		)
+			return;
+		const wire = message.value as Partial<CompletionWire>;
+		const session = peerSessions.get(message.senderId);
+		if (
+			wire.version !== PRIVATE_PROTOCOL_VERSION ||
+			!validPositive(wire.seq) ||
+			!validCounterValue(wire.accountingGeneration) ||
+			session === undefined ||
+			node.peers().find((peer) => peer.nodeId === message.senderId)?.status !==
+				"online" ||
+			wire.incarnation !== session.incarnation ||
+			wire.contributorId !== session.contributorId ||
+			BigInt(wire.accountingGeneration) !==
+				collectionState?.accounting.generation ||
+			BigInt(wire.seq) !== session.seq ||
+			session.completedSeq >= BigInt(wire.seq) ||
+			session.completion === null ||
+			JSON.stringify(identity) !== JSON.stringify(session.completion)
+		)
+			return;
+		const completed = replayRegistry.get(session.replayKey)?.completions;
+		if (completed === undefined) return;
+		const previous = completed.get(identity.attachmentId);
+		const scope = BigInt(identity.scope);
+		const position = BigInt(identity.position);
+		if (
+			previous !== undefined &&
+			(scope < previous.scope ||
+				(scope === previous.scope && position <= previous.position))
+		)
+			return;
+		// ponytail: lifetime scope/entry high-water capped at 1024 attachment identities per peer; excess snapshots fail closed.
+		if (previous === undefined && completed.size >= MAX_REPLAY_ATTACHMENTS)
+			return;
+		completed.set(identity.attachmentId, { scope, position });
+		session.completedSeq = BigInt(wire.seq);
+		const generation = BigInt(wire.accountingGeneration);
+		// Fresh settled counts visible before callback; observers may reset here.
+		void publishHost().catch(() => {});
+		if (peerSessions.get(message.senderId) !== session) return;
+		deliverCompletion(identity, session.contributorId, session.seq, generation);
+	};
+	const queueCheckpoint = (
+		completion: CompletionIdentity | null = null,
+	): Promise<void> => {
+		if (
+			completion !== null &&
+			node?.peers().find((peer) => peer.nodeId === node?.declaration.hostNodeId)
+				?.status !== "online"
+		)
+			completion = null;
+		if (node === undefined || rootProcess) return Promise.resolve();
 		const seq = ++localCheckpointSeq;
 		requiredCheckpointSeq = seq;
 		clearClientCounters();
 		const target = node.declaration.hostNodeId;
 		const wire: CheckpointWire = {
+			scopes: Array.from(attachments.values(), (attachment) => ({
+				attachmentId: attachment.contributorId,
+				scope: attachment.scope.toString(),
+			})),
 			version: PRIVATE_PROTOCOL_VERSION,
 			incarnation: processIncarnation,
 			contributorId: clientContributorId,
 			accountingGeneration: clientAccountingGeneration.toString(),
 			seq: seq.toString(),
 			busy: desiredActivity(),
-			rootLoops: localRootLoops.toString(),
+			rootLoops: "0",
 			allLoops: localAllLoops.toString(),
+			activeLoops: localActiveLoops.toString(),
+			completion,
 			resumeReceipt: clientResumeReceipt,
 		};
 		return queueTransport(async () => {
-			if (node === undefined || rootProcess || clientPaused) return;
+			if (node === undefined || rootProcess) return;
 			try {
 				await node.send(target, CHECKPOINT_CHANNEL, wire);
+				if (
+					completion !== null &&
+					clientAccountingGeneration === BigInt(wire.accountingGeneration) &&
+					clientContributorId === wire.contributorId &&
+					node.peers().find((peer) => peer.nodeId === target)?.status ===
+						"online"
+				) {
+					const fresh: CompletionWire = {
+						...completion,
+						version: PRIVATE_PROTOCOL_VERSION,
+						incarnation: wire.incarnation,
+						contributorId: wire.contributorId,
+						accountingGeneration: wire.accountingGeneration,
+						seq: wire.seq,
+					};
+					await node.send(target, COMPLETION_CHANNEL, fresh);
+				}
 			} catch (error) {
 				if (isTransientTransportError(error)) {
 					clearClientCounters();
@@ -963,18 +1291,18 @@ export function createReflectDomainCoordinator(
 			clientResumeReceipt = ack.resumeReceipt;
 		const generationChanged =
 			parsed.accountingGeneration !== clientAccountingGeneration;
-		const wasPaused = clientPaused;
 		clientAccountingGeneration = parsed.accountingGeneration;
-		clientPaused = parsed.counters.paused;
 		if (generationChanged) {
+			fenceAttachments(
+				parsed.fullGeneration !== clientFullGeneration ? "full" : "reminder",
+			);
+			if (parsed.fullGeneration !== clientFullGeneration) localActiveLoops = 0n;
+			localAllLoops = 0n;
+			clientFullGeneration = parsed.fullGeneration;
 			clientContributorId = id();
 			requiredCheckpointSeq = 0n;
 		}
-		if (clientPaused) {
-			notify(parsed.counters);
-			return;
-		}
-		if (generationChanged || wasPaused) {
+		if (generationChanged) {
 			for (const attachment of attachments.values())
 				attachment.busy = attachment.getBusy();
 			clearClientCounters();
@@ -998,7 +1326,7 @@ export function createReflectDomainCoordinator(
 		if (!rootProcess) {
 			if (event.peer.nodeId !== node.declaration.hostNodeId) return;
 			clearClientCounters();
-			if (event.peer.status === "offline" || clientPaused) return;
+			if (event.peer.status === "offline") return;
 			for (const attachment of attachments.values())
 				attachment.busy = attachment.getBusy();
 			clientContributorId = id();
@@ -1091,6 +1419,10 @@ export function createReflectDomainCoordinator(
 					CHECKPOINT_CHANNEL,
 					applyHostCheckpoint,
 				);
+				unsubscribeCompletion = opened.subscribe(
+					COMPLETION_CHANNEL,
+					applyHostCompletion,
+				);
 				unsubscribeLeave = opened.subscribe(LEAVE_CHANNEL, (message) => {
 					const leave = parseLeave(message.value);
 					const session = peerSessions.get(message.senderId);
@@ -1101,7 +1433,7 @@ export function createReflectDomainCoordinator(
 						session.contributorId !== leave.contributorId
 					)
 						return;
-					removePeerSession(message.senderId, message.receivedAt);
+					removePeerSession(message.senderId);
 					void publishHost()
 						.then(updateHostTimers)
 						.catch(() => {});
@@ -1133,10 +1465,12 @@ export function createReflectDomainCoordinator(
 			unsubscribeCheckpoint?.();
 			unsubscribeCounters?.();
 			unsubscribeLeave?.();
+			unsubscribeCompletion?.();
 			unsubscribeEvents = undefined;
 			unsubscribeCheckpoint = undefined;
 			unsubscribeCounters = undefined;
 			unsubscribeLeave = undefined;
+			unsubscribeCompletion = undefined;
 			const failedNode = node;
 			node = undefined;
 			rootProcess = false;
@@ -1153,10 +1487,12 @@ export function createReflectDomainCoordinator(
 		unsubscribeCheckpoint?.();
 		unsubscribeCounters?.();
 		unsubscribeLeave?.();
+		unsubscribeCompletion?.();
 		unsubscribeEvents = undefined;
 		unsubscribeCheckpoint = undefined;
 		unsubscribeCounters = undefined;
 		unsubscribeLeave = undefined;
+		unsubscribeCompletion = undefined;
 		if (tick !== undefined) clock.clearTimeout(tick);
 		tick = undefined;
 		const closing = node;
@@ -1169,34 +1505,104 @@ export function createReflectDomainCoordinator(
 		snapshotGeneration = 0n;
 		acceptedHostRevision = 0n;
 		acceptedHostEpoch = undefined;
-		clientPaused = false;
 		clientAccountingGeneration = 0n;
 		clientContributorId = id();
 		clientResumeReceipt = null;
 		localCheckpointSeq = 0n;
 		requiredCheckpointSeq = 0n;
-		localRootLoops = 0n;
 		localAllLoops = 0n;
+		localActiveLoops = 0n;
+		fullGeneration = 0n;
+		clientFullGeneration = 0n;
 		peerSessions.clear();
 		controlPeers.clear();
 		replayRegistry.clear();
 		await closing?.close();
 	};
 
-	const coordinator: ReflectDomainCoordinator = {
+	const prefix = (
+		previous: readonly string[],
+		next: readonly string[],
+	): boolean => previous.every((entry, index) => next[index] === entry);
+	const observeBranch = (
+		attachment: Attachment,
+	): BranchAccounting | undefined => {
+		if (recordingBoundary) return undefined;
+		const source = attachment.source;
+		const view = deriveBranchAccounting(source.getBranch(), {
+			cooldownLoops: 0,
+			boundaryPolicy:
+				rootProcess && source.isMain() ? source.boundaryPolicy : "baselines",
+			fullAfterEntryId: attachment.fullAfterEntryId,
+			reminderAfterEntryId: attachment.reminderAfterEntryId,
+		});
+		if (
+			!view.baselineFound ||
+			!prefix(attachment.fullIds, view.full.entryIds) ||
+			!prefix(attachment.reminderIds, view.reminder.entryIds)
+		) {
+			rebaseAttachment(attachment, "full");
+			if (rootProcess && source.isMain())
+				reduce({
+					type: "main-snapshot",
+					generation: collectionState?.accounting.generation ?? 0n,
+					activeLoops: 0n,
+					reminderLoops: 0n,
+					atMs: now(),
+				});
+			return undefined;
+		}
+		const active = BigInt(
+			view.full.entryIds.length - attachment.fullIds.length,
+		);
+		const reminder = BigInt(
+			view.reminder.entryIds.length - attachment.reminderIds.length,
+		);
+		attachment.fullIds = view.full.entryIds;
+		attachment.reminderIds = view.reminder.entryIds;
+		if (rootProcess) {
+			if (source.isMain())
+				reduce({
+					type: "main-snapshot",
+					generation: collectionState?.accounting.generation ?? 0n,
+					activeLoops: view.activeLoops,
+					reminderLoops: view.reminderLoops,
+					atMs: now(),
+				});
+			else
+				reduce({
+					type: "child-loops",
+					generation: collectionState?.accounting.generation ?? 0n,
+					active,
+					reminder,
+					atMs: now(),
+				});
+		} else {
+			localActiveLoops += active;
+			localAllLoops += reminder;
+		}
+		return view;
+	};
+	const publishBranch = (
+		completion: CompletionIdentity | null = null,
+	): Promise<void> =>
+		rootProcess ? publishHost() : queueCheckpoint(completion);
+	const coordinator: ReflectBranchDomainCoordinator = {
 		get rootProcess() {
 			return rootProcess;
-		},
-		get paused() {
-			return rootProcess
-				? (collectionState?.accounting.paused ?? false)
-				: clientPaused;
 		},
 		attach(instance, attachOptions) {
 			return queueLifecycle(async () => {
 				if (attachments.has(instance)) return;
 				const attachment: Attachment = {
 					contributorId: `attachment-${++nextAttachmentId}`,
+					source: attachOptions.source,
+					scope: 0n,
+					fullAfterEntryId: attachOptions.source.getLeafId(),
+					reminderAfterEntryId: attachOptions.source.getLeafId(),
+					fullIds: [],
+					reminderIds: [],
+					completedPosition: 0,
 					busy: attachOptions.getBusy(),
 					getBusy: attachOptions.getBusy,
 					onFatal: attachOptions.onFatal,
@@ -1267,31 +1673,74 @@ export function createReflectDomainCoordinator(
 				});
 				await publishHost();
 				updateHostTimers();
-			} else if (!clientPaused) await queueCheckpoint();
+			} else await queueCheckpoint();
 		},
-		async recordRootLoop() {
-			if (this.paused) return countersValue ?? zeroCounters();
-			if (!rootProcess) {
-				localRootLoops += 1n;
-				localAllLoops += 1n;
-				await queueCheckpoint();
-				return countersValue ?? zeroCounters();
-			}
-			reduce({ type: "local-loop", scope: "root", atMs: now() });
-			await publishHost();
-			updateHostTimers();
-			return countersValue ?? projectHostCounters();
+		async refreshBranch(instance) {
+			const attachment = attachments.get(instance);
+			if (attachment === undefined) return countersValue;
+			observeBranch(attachment);
+			await publishBranch();
+			return countersValue;
 		},
-		async recordAllLoop() {
-			if (this.paused) return countersValue ?? zeroCounters();
-			if (!rootProcess) {
-				localAllLoops += 1n;
-				await queueCheckpoint();
-				return countersValue ?? zeroCounters();
+		async rebaseBranch(instance, rebaseOptions = {}) {
+			const attachment = attachments.get(instance);
+			if (attachment === undefined) return countersValue;
+			const main = rootProcess && attachment.source.isMain();
+			if (rebaseOptions.adoptHistory && !main)
+				throw new Error("Only current main may adopt branch history");
+			rebaseAttachment(attachment, "full", rebaseOptions.adoptHistory);
+			if (rebaseOptions.adoptHistory) {
+				attachment.fullAfterEntryId = rebaseOptions.fullAfterEntryId ?? null;
+				attachment.reminderAfterEntryId =
+					rebaseOptions.reminderAfterEntryId ?? attachment.fullAfterEntryId;
 			}
-			reduce({ type: "local-loop", scope: "all", atMs: now() });
-			await publishHost();
-			return countersValue ?? projectHostCounters();
+			observeBranch(attachment);
+			attachment.completedPosition = attachment.fullIds.length;
+			await publishBranch();
+			return countersValue;
+		},
+		async completeTurn(instance, messageEntryId) {
+			const attachment = attachments.get(instance);
+			if (attachment === undefined) return countersValue;
+			const observedScope = attachment.scope;
+			const view = observeBranch(attachment);
+			const position = view?.full.entryIds.indexOf(messageEntryId) ?? -1;
+			if (
+				view === undefined ||
+				attachment.scope !== observedScope ||
+				position < 0 ||
+				!view.reminder.entryIds.includes(messageEntryId) ||
+				position + 1 <= attachment.completedPosition
+			) {
+				await publishBranch();
+				return countersValue;
+			}
+			attachment.completedPosition = position + 1;
+			const generation = rootProcess
+				? (collectionState?.accounting.generation ?? 0n)
+				: clientAccountingGeneration;
+			const completion: CompletionIdentity = {
+				attachmentId: attachment.contributorId,
+				scope: attachment.scope.toString(),
+				entryId: messageEntryId,
+				position: String(position + 1),
+			};
+			// Capture count update now, not after queued transport awaits.
+			const publication = publishBranch(rootProcess ? null : completion);
+			if (rootProcess)
+				deliverCompletion(
+					completion,
+					attachment.contributorId,
+					++localCheckpointSeq,
+					generation,
+					instance,
+				);
+			await publication;
+			return countersValue;
+		},
+		subscribeCompletions(listener) {
+			completionListeners.add(listener);
+			return () => completionListeners.delete(listener);
 		},
 		counters() {
 			return countersValue;
@@ -1321,40 +1770,15 @@ export function createReflectDomainCoordinator(
 			return countersValue;
 		},
 	};
-	PAUSE_CONTROLS.set(coordinator, (nextPaused) =>
-		queueLifecycle(async () => {
-			if (
-				!rootProcess ||
-				collectionState === undefined ||
-				collectionState.accounting.paused === nextPaused
-			)
-				return countersValue;
-			reduce({ type: "pause-changed", paused: nextPaused, atMs: now() });
-			peerSessions.clear();
-			if (tick !== undefined) clock.clearTimeout(tick);
-			tick = undefined;
-			if (!nextPaused)
-				for (const attachment of attachments.values()) {
-					attachment.busy = attachment.getBusy();
-					reduce({
-						type: "local-activity",
-						contributorId: attachment.contributorId,
-						busy: attachment.busy,
-						atMs: now(),
-					});
-				}
-			await publishHost();
-			updateHostTimers();
-			return countersValue;
-		}),
-	);
 	return coordinator;
 }
 
-const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v3");
-type SharedHost = typeof globalThis & { [SHARED]?: ReflectDomainCoordinator };
+const SHARED = Symbol.for("pi-reflect-watchdog:process-domain:v4");
+type SharedHost = typeof globalThis & {
+	[SHARED]?: ReflectBranchDomainCoordinator;
+};
 
-export function getReflectDomainCoordinator(): ReflectDomainCoordinator {
+export function getReflectDomainCoordinator(): ReflectBranchDomainCoordinator {
 	const host = globalThis as SharedHost;
 	host[SHARED] ??= createReflectDomainCoordinator();
 	return host[SHARED];

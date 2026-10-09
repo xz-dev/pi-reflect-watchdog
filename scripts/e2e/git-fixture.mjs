@@ -12,6 +12,7 @@ export const MASTER_FIXTURE_ALLOWLIST = [
 	"package-lock.json",
 	"package.json",
 	"src/activity-types.ts",
+	"src/branch-accounting.ts",
 	"src/config-loader.ts",
 	"src/config.ts",
 	"src/collection-state.ts",

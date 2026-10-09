@@ -3,7 +3,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	MessageEndEvent,
-	MessageStartEvent,
 	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -15,16 +14,16 @@ import {
 	type InquiryAttemptHandle,
 	type InquiryRuntime,
 } from "pi-extension-utils/pi-inquiry";
+import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import {
-	publishSemanticHook,
-	type SemanticHookV1,
-	subscribeSemanticHooks,
-} from "pi-extension-utils/semantic-hook";
-import {
-	BUILT_IN_CONFIG,
-	type HookPausePair,
-	type WatchdogConfig,
-} from "./config.js";
+	ACCOUNTING_BOUNDARY_ENTRY,
+	deriveBranchAccounting,
+	isAgentLoopMessage,
+	REFLECTION_COMPLETED_ENTRY,
+	REFLECTION_INQUIRY_NAMESPACE,
+	reflectCooldownState,
+} from "./branch-accounting.js";
+import { BUILT_IN_CONFIG, type WatchdogConfig } from "./config.js";
 import { type LoadedConfig, loadRuntimeConfig } from "./config-loader.js";
 import { formatDuration } from "./duration.js";
 import { createFatalExitAdapter, type FatalExitAdapter } from "./fatal-exit.js";
@@ -38,9 +37,8 @@ import {
 import {
 	getReflectDomainCoordinator,
 	isReflectDomainFatalError,
-	type ReflectDomainCoordinator,
+	type ReflectBranchDomainCoordinator,
 	type ReflectDomainCounters,
-	setReflectDomainPausedForWatchdog,
 } from "./process-domain.js";
 import {
 	buildReflectionPrompt,
@@ -62,12 +60,15 @@ import {
 	type WidgetState,
 } from "./widget.js";
 
+export {
+	isAgentLoopMessage,
+	reflectCooldownState,
+} from "./branch-accounting.js";
+
 const STATUS_KEY = "pi-reflect-watchdog";
 const REFLECT_COMMAND = "reflect";
 const CANCEL_REFLECT_COMMAND = "cancel-reflect";
-const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
-const REFLECTION_COMPLETED_ENTRY = "pi-reflect-watchdog:reflection-completed";
 const REFLECTION_COMPLETED_HOOK = "reflection-completed";
 const REFLECTION_CONTINUATION = "pi-reflect-watchdog:continuation";
 const REFLECTION_CONTINUATION_CONTENT = "[assistant]\ncontinue";
@@ -75,7 +76,6 @@ const SEMANTIC_HOOK_TEXT_LIMIT = 4096;
 const REFLECT_COOLDOWN_MIN_LOOPS = 10;
 const REFLECT_COOLDOWN_MAX_LOOPS = 30;
 const ACTIVE_TICK_MS = 1_000;
-const RPC_STATUS_TICK_MS = 30_000;
 
 type Timer = ReturnType<typeof setTimeout>;
 type TimerRole = "tui-refresh" | "rpc-status";
@@ -99,7 +99,7 @@ export interface RuntimeServices {
 	setTimeout(callback: () => void, delay: number): Timer;
 	clearTimeout(timer: Timer): void;
 	loadConfig(cwd: string, trusted: boolean): Promise<LoadedConfig>;
-	processDomain: ReflectDomainCoordinator;
+	processDomain: ReflectBranchDomainCoordinator;
 	fatalExit: FatalExitAdapter;
 	scheduleTimer?(role: TimerRole, callback: () => void, delay: number): Timer;
 }
@@ -124,8 +124,10 @@ interface PendingReflection {
 interface ActiveReflection extends PendingReflection {
 	attempt: number;
 	toolCalls: number;
+	readonly toolCallIds: Set<string>;
 	readonly inquiry: InquiryRuntime;
 	handle: InquiryAttemptHandle;
+	responseObserved: boolean;
 	planned?: ReflectionDecision | { readonly error: string };
 }
 
@@ -149,7 +151,7 @@ interface ReflectionContinuationDetails {
 interface Runtime {
 	readonly pi: ExtensionAPI;
 	readonly hub: ObservableAgentHub;
-	readonly processDomain: ReflectDomainCoordinator;
+	readonly processDomain: ReflectBranchDomainCoordinator;
 	readonly attachmentInstance: object;
 	attachment: HubAttachment | null;
 	claim: HubMainClaim | null;
@@ -161,22 +163,33 @@ interface Runtime {
 	domainFatal: boolean;
 	localBusy: boolean;
 	latestCounters?: ReflectDomainCounters;
-	latched: Set<Exclude<ReflectionTriggerReason, "USER_REQUEST">>;
-	pendingAutomatic?: PendingReflection;
+	sessionId: string | null;
+	scopeRevision: number;
 	manualQueue: PendingReflection[];
 	activeReflection?: ActiveReflection;
 	internalRun: InternalRun;
 	abortBoundaryLeafId?: string | null;
+	abortSettlementPending: boolean;
 	reflectionSequence: number;
 	ticker?: Timer;
 	widgetTui: { requestRender(): void } | null;
 	widgetRegistered: boolean;
 	unsubscribeHub?: () => void;
 	unsubscribeDomain?: () => void;
-	unsubscribeSemanticHooks?: () => void;
-	hookPauseDepths: number[];
-	externallyPaused: boolean;
-	pauseTail: Promise<void>;
+	unsubscribeCompletions?: () => void;
+	/** Inquiry ids cancelled by a confirmed abort; exactly-correlated plugin
+	 * controls (inquiry prompts and folds) are withheld from model-visible
+	 * context. Physical native-queue removal is not claimed. */
+	abortedInquiryIds: Set<string>;
+	abortedToolCallIds: Set<string>;
+	/** Post-abort eligibility hold: only new explicit user input (interactive or
+	 * user-client rpc) or a fresh user-invoked /reflect may release it. */
+	abortedHold: boolean;
+	/** Monotonic event clock for explicit user input; fences a late settlement
+	 * from re-holding a cycle the user already re-entered. */
+	explicitInputClock: number;
+	/** Explicit-input clock at run start; later input survives old cancellation. */
+	boundaryInputClock: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -356,98 +369,63 @@ function continuationProjection<T extends object>(messages: T[]): T[] {
 			});
 }
 
-function reflectionContext<T extends object>(messages: T[]): T[] {
-	return foldInquiryContext(
+function reflectionContext<T extends object>(
+	messages: T[],
+	abortedInquiryIds: ReadonlySet<string> = new Set(),
+): T[] {
+	const folded = foldInquiryContext(
 		continuationProjection(messages),
 		REFLECTION_INQUIRY_NAMESPACE,
 	);
-}
-
-function externalPauseActive(runtime: Runtime): boolean {
-	return runtime.hookPauseDepths.some((depth) => depth > 0);
-}
-
-function matchingPairIndexes(
-	pairs: readonly HookPausePair[],
-	envelope: SemanticHookV1,
-	kind: "pause" | "resume",
-): number[] {
-	const matches: number[] = [];
-	for (let index = 0; index < pairs.length; index += 1)
-		if (pairs[index]?.[kind] === envelope.name) matches.push(index);
-	return matches;
-}
-
-function queueExternalPauseTransition(
-	runtime: Runtime,
-	services: RuntimeServices,
-	paused: boolean,
-	force = false,
-): void {
-	if (!owns(runtime) || (!force && runtime.externallyPaused === paused)) return;
-	runtime.externallyPaused = paused;
-	if (paused && runtime.ticker !== undefined) {
-		services.clearTimeout(runtime.ticker);
-		runtime.ticker = undefined;
+	if (abortedInquiryIds.size === 0) return folded;
+	const cancelledToolIds = new Set<string>();
+	for (const message of messages) {
+		if (!isRecord(message) || message.role !== "assistant") continue;
+		const correlation = inquiryCorrelation(record(message.details)?.piInquiry);
+		if (
+			correlation === null ||
+			!abortedInquiryIds.has(correlation.inquiryId) ||
+			!Array.isArray(message.content)
+		)
+			continue;
+		for (const block of message.content)
+			if (
+				isRecord(block) &&
+				block.type === "toolCall" &&
+				typeof block.id === "string"
+			)
+				cancelledToolIds.add(block.id);
 	}
-	runtime.pauseTail = runtime.pauseTail
-		.catch(() => {})
-		.then(async () => {
-			if (runtime.stopped || !owns(runtime)) return;
-			const counters = await setReflectDomainPausedForWatchdog(
-				runtime.processDomain,
-				paused,
+	const retained = folded.filter((message) => {
+		if (
+			isRecord(message) &&
+			message.role === "toolResult" &&
+			typeof message.toolCallId === "string" &&
+			cancelledToolIds.has(message.toolCallId)
+		)
+			return false;
+		if (isRecord(message) && message.role === "assistant") {
+			const correlation = inquiryCorrelation(
+				record(message.details)?.piInquiry,
 			);
-			if (counters !== undefined) runtime.latestCounters = counters;
-			if (paused !== runtime.externallyPaused) {
-				const corrected = await setReflectDomainPausedForWatchdog(
-					runtime.processDomain,
-					runtime.externallyPaused,
-				);
-				if (corrected !== undefined) runtime.latestCounters = corrected;
-			}
-		})
-		.catch((error) => {
-			if (runtime.stopped || runtime.ctx === null) return;
-			const message = error instanceof Error ? error.message : String(error);
-			runtime.ctx.ui.notify(
-				`pi-reflect-watchdog hook pause failed: ${message.slice(0, 160)}`,
-				"warning",
-			);
-		})
-		.finally(() => {
-			if (runtime.stopped) return;
-			latchAutomaticReflection(runtime);
-			refreshWidget(runtime);
-			scheduleRefresh(runtime, services);
-			maybeDispatch(runtime);
-		});
-}
-
-function handlePauseHook(
-	runtime: Runtime,
-	services: RuntimeServices,
-	envelope: SemanticHookV1,
-): void {
-	const pairs = runtime.config.hookPauses;
-	let changed = false;
-	for (const index of matchingPairIndexes(pairs, envelope, "pause")) {
-		const current = runtime.hookPauseDepths[index] ?? 0;
-		runtime.hookPauseDepths[index] =
-			current >= Number.MAX_SAFE_INTEGER
-				? Number.MAX_SAFE_INTEGER
-				: current + 1;
-		changed = true;
-	}
-	for (const index of matchingPairIndexes(pairs, envelope, "resume")) {
-		const current = runtime.hookPauseDepths[index] ?? 0;
-		if (current > 0) {
-			runtime.hookPauseDepths[index] = current - 1;
-			changed = true;
+			if (correlation !== null && abortedInquiryIds.has(correlation.inquiryId))
+				return false;
 		}
-	}
-	if (!changed) return;
-	queueExternalPauseTransition(runtime, services, externalPauseActive(runtime));
+		// Withhold only this plugin's exact owned control messages: the inquiry
+		// prompt and fold custom types with a matching namespace correlation.
+		// Unrelated custom messages sharing no plugin customType stay visible.
+		if (!isRecord(message) || message.role !== "custom") return true;
+		if (
+			message.customType !== `${REFLECTION_INQUIRY_NAMESPACE}:inquiry` &&
+			message.customType !== `${REFLECTION_INQUIRY_NAMESPACE}:inquiry-fold`
+		)
+			return true;
+		const correlation = inquiryCorrelation(message.details);
+		return (
+			correlation === null || !abortedInquiryIds.has(correlation.inquiryId)
+		);
+	});
+	return retained.length === folded.length ? folded : retained;
 }
 
 function scheduleTimer(
@@ -495,25 +473,6 @@ function record(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
-}
-
-function watchdogInquiryKey(value: unknown): string | undefined {
-	const inquiry = record(record(value)?.piInquiry ?? value);
-	return inquiry?.version === 1 &&
-		inquiry.namespace === REFLECTION_INQUIRY_NAMESPACE &&
-		typeof inquiry.inquiryId === "string" &&
-		inquiry.inquiryId.length > 0 &&
-		typeof inquiry.attempt === "number" &&
-		Number.isSafeInteger(inquiry.attempt) &&
-		inquiry.attempt > 0
-		? `${inquiry.inquiryId}:${inquiry.attempt}`
-		: undefined;
-}
-
-function watchdogInquiryAssistant(entry: SessionEntry): string | undefined {
-	if (entry.type !== "message" || entry.message.role !== "assistant")
-		return undefined;
-	return watchdogInquiryKey(record(record(entry.message)?.details)?.piInquiry);
 }
 
 function parseReflectionResult(value: unknown): ReflectionResult | undefined {
@@ -639,56 +598,12 @@ function publishReflectionCompleted(
 	} catch {}
 }
 
-function completedWatchdogReflection(entry: SessionEntry): string | undefined {
-	if (
-		entry.type !== "custom" ||
-		entry.customType !== REFLECTION_COMPLETED_ENTRY
-	)
-		return undefined;
-	return watchdogInquiryKey(entry.data);
-}
-
 export function reflectCooldownLoops(rootLoopLimit: number): number {
 	if (!Number.isFinite(rootLoopLimit)) return REFLECT_COOLDOWN_MAX_LOOPS;
 	return Math.min(
 		REFLECT_COOLDOWN_MAX_LOOPS,
 		Math.max(REFLECT_COOLDOWN_MIN_LOOPS, Math.floor(rootLoopLimit / 3)),
 	);
-}
-
-export function reflectCooldownState(
-	entries: readonly SessionEntry[],
-	cooldownLoops: number,
-): {
-	readonly skipAutomatic: boolean;
-	readonly remainingLoops: number;
-} {
-	let loopsSinceReflect = 0;
-	const ordinaryAssistant = (entry: SessionEntry): boolean =>
-		entry.type === "message" && isAgentLoopMessage(entry.message);
-	for (let index = entries.length - 1; index >= 0; index -= 1) {
-		const entry = entries[index];
-		if (entry === undefined) continue;
-		const completedInquiry = completedWatchdogReflection(entry);
-		if (completedInquiry !== undefined) {
-			for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
-				const assistant = entries[candidate];
-				if (
-					assistant !== undefined &&
-					watchdogInquiryAssistant(assistant) === completedInquiry
-				)
-					return {
-						skipAutomatic:
-							cooldownLoops > 0 && loopsSinceReflect <= cooldownLoops,
-						remainingLoops: Math.max(0, cooldownLoops - loopsSinceReflect),
-					};
-			}
-			continue;
-		}
-		if (!ordinaryAssistant(entry)) continue;
-		loopsSinceReflect += 1;
-	}
-	return { skipAutomatic: false, remainingLoops: 0 };
 }
 
 function currentCooldown(runtime: Runtime) {
@@ -698,8 +613,10 @@ function currentCooldown(runtime: Runtime) {
 	);
 }
 
-function thresholdSnapshot(runtime: Runtime): ReflectionThresholdSnapshot {
-	const counters = currentCounters(runtime);
+function thresholdSnapshot(
+	runtime: Runtime,
+	counters = currentCounters(runtime),
+): ReflectionThresholdSnapshot {
 	return {
 		activeMs: safeNumber(counters?.activeMs.value),
 		activeLoops: safeNumber(counters?.activeLoops.value),
@@ -712,39 +629,41 @@ function thresholdSnapshot(runtime: Runtime): ReflectionThresholdSnapshot {
 	};
 }
 
-function crossedReasons(
+function considerFreshCompletion(
 	runtime: Runtime,
-): Exclude<ReflectionTriggerReason, "USER_REQUEST">[] {
-	const snapshot = thresholdSnapshot(runtime);
-	const reasons: Exclude<ReflectionTriggerReason, "USER_REQUEST">[] = [];
-	if (snapshot.rootLoops >= runtime.config.rootLoopLimit)
-		reasons.push("ROOT_LOOP_LIMIT");
-	if (snapshot.allLoops >= runtime.config.allLoopLimit)
-		reasons.push("ALL_LOOP_LIMIT");
-	if (snapshot.taskMs >= runtime.config.taskMinutes * 60_000)
-		reasons.push("TASK_TIME_LIMIT");
-	return reasons.filter((reason) => !runtime.latched.has(reason));
-}
-
-function latchAutomaticReflection(runtime: Runtime): void {
-	if (!owns(runtime) || !runtime.configReady || runtime.externallyPaused)
+	counters: ReflectDomainCounters,
+): void {
+	if (!owns(runtime) || !runtime.configReady || !safeToDispatch(runtime))
 		return;
-	const reasons = crossedReasons(runtime);
+	const thresholds = thresholdSnapshot(runtime, counters);
+	const reasons: Exclude<ReflectionTriggerReason, "USER_REQUEST">[] = [];
+	if (thresholds.rootLoops >= runtime.config.rootLoopLimit)
+		reasons.push("ROOT_LOOP_LIMIT");
+	if (thresholds.allLoops >= runtime.config.allLoopLimit)
+		reasons.push("ALL_LOOP_LIMIT");
+	if (thresholds.taskMs >= runtime.config.taskMinutes * 60_000)
+		reasons.push("TASK_TIME_LIMIT");
 	if (reasons.length === 0) return;
-	for (const reason of reasons) runtime.latched.add(reason);
-	if (runtime.pendingAutomatic !== undefined) {
-		for (const reason of reasons)
-			if (!runtime.pendingAutomatic.reasons.includes(reason))
-				runtime.pendingAutomatic.reasons.push(reason);
+	const skip = currentCooldown(runtime).skipAutomatic;
+	if (!skip)
+		reserveReflection(runtime, {
+			id: ++runtime.reflectionSequence,
+			reasons,
+			thresholds,
+			timestamp: localTimestamp(),
+		});
+	// Reserve first: append/reset can synchronously notify another completion.
+	runtime.pi.appendEntry(ACCOUNTING_BOUNDARY_ENTRY, {
+		version: 1,
+		window: "reminder",
+	});
+	void runtime.processDomain.resetReminderCycle().catch(() => {});
+	if (skip) {
+		if (runtime.ctx?.mode === "tui")
+			runtime.ctx.ui.notify("Reflect skipped during cooldown.", "info");
 		return;
 	}
-	runtime.reflectionSequence += 1;
-	runtime.pendingAutomatic = {
-		id: runtime.reflectionSequence,
-		reasons: [...reasons],
-		thresholds: thresholdSnapshot(runtime),
-		timestamp: localTimestamp(),
-	};
+	submitReflection(runtime);
 }
 
 function statusState(runtime: Runtime): WidgetState {
@@ -809,27 +728,30 @@ function clearWidget(runtime: Runtime): void {
 }
 
 function scheduleRefresh(runtime: Runtime, services: RuntimeServices): void {
-	if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
-	runtime.ticker = undefined;
 	if (
 		!owns(runtime) ||
-		runtime.externallyPaused ||
 		runtime.ctx === null ||
 		!currentCounters(runtime)?.anyBusy
-	)
+	) {
+		if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
+		runtime.ticker = undefined;
 		return;
-	const role: TimerRole =
-		runtime.ctx.mode === "tui" ? "tui-refresh" : "rpc-status";
-	const delay = role === "tui-refresh" ? ACTIVE_TICK_MS : RPC_STATUS_TICK_MS;
+	}
+	if (runtime.ticker !== undefined) return;
+	const revision = runtime.scopeRevision;
 	runtime.ticker = scheduleTimer(
 		services,
-		role,
+		runtime.ctx.mode === "tui" ? "tui-refresh" : "rpc-status",
 		() => {
 			runtime.ticker = undefined;
+			if (runtime.stopped || runtime.scopeRevision !== revision) return;
+			void runtime.processDomain
+				.refreshBranch(runtime.attachmentInstance)
+				.catch(() => {});
 			refreshWidget(runtime);
 			scheduleRefresh(runtime, services);
 		},
-		delay,
+		ACTIVE_TICK_MS,
 	);
 	runtime.ticker.unref?.();
 }
@@ -838,19 +760,61 @@ function safeToDispatch(runtime: Runtime): boolean {
 	return (
 		owns(runtime) &&
 		runtime.ctx !== null &&
+		!runtime.abortedHold &&
 		runtime.activeReflection === undefined
 	);
 }
 
+/** Keep dispatch inhibited throughout cancellation and counter publication. */
+function establishAbortedHold(runtime: Runtime): void {
+	runtime.abortedHold = true;
+}
+
+function cancelAbortedRun(
+	runtime: Runtime,
+	boundary = runtime.abortBoundaryLeafId,
+	confirmedOutcome = false,
+): boolean {
+	if (
+		!owns(runtime) ||
+		boundary === undefined ||
+		runtime.ctx === null ||
+		(!confirmedOutcome &&
+			!isAbortedTerminalTakeover(
+				runtime.ctx.sessionManager.getBranch(),
+				boundary,
+			))
+	)
+		return false;
+	runtime.abortBoundaryLeafId = undefined;
+	establishAbortedHold(runtime);
+	const active = runtime.activeReflection;
+	runtime.activeReflection = undefined;
+	runtime.internalRun = { kind: "none" };
+	runtime.manualQueue = [];
+	if (active !== undefined) {
+		for (const id of active.toolCallIds) runtime.abortedToolCallIds.add(id);
+		runtime.abortedInquiryIds.add(active.handle.correlation.inquiryId);
+		const fold = active.handle.cancel();
+		if (fold !== null)
+			runtime.pi.sendMessage(fold, { deliverAs: "steer", triggerTurn: false });
+	}
+	resetCycleForUserTakeover(runtime);
+	if (runtime.explicitInputClock > runtime.boundaryInputClock)
+		runtime.abortedHold = false;
+	refreshWidget(runtime);
+	return true;
+}
+
 function sendActiveReflection(runtime: Runtime, prompt: string): void {
 	const active = runtime.activeReflection;
-	if (active === undefined || !owns(runtime)) return;
+	if (active === undefined || !owns(runtime) || runtime.abortedHold) return;
 	active.handle = active.inquiry.attempt(active.attempt);
 	if (!active.handle.markSent()) return;
 	active.inquiry.send(runtime.pi, prompt, active.attempt);
 }
 
-function beginReflection(runtime: Runtime, pending: PendingReflection): void {
+function reserveReflection(runtime: Runtime, pending: PendingReflection): void {
 	const inquiry = createInquiryRuntime(REFLECTION_INQUIRY_NAMESPACE, {
 		inquiryId: `reflection-${pending.id}`,
 	});
@@ -858,10 +822,17 @@ function beginReflection(runtime: Runtime, pending: PendingReflection): void {
 		...pending,
 		attempt: 1,
 		toolCalls: 0,
+		toolCallIds: new Set(),
+		responseObserved: false,
 		inquiry,
 		handle: inquiry.attempt(1),
 	};
 	runtime.internalRun = { kind: "provisional", attempt: 1 };
+}
+
+function submitReflection(runtime: Runtime): void {
+	const pending = runtime.activeReflection;
+	if (pending === undefined || !owns(runtime) || runtime.abortedHold) return;
 	const previous = latestReflection(runtime);
 	sendActiveReflection(
 		runtime,
@@ -891,22 +862,11 @@ function maybeDispatch(runtime: Runtime): void {
 		// busy ordinary run (or a settle -> new run race) cannot delay the
 		// request, so it never re-enters a plugin-side waiting state here.
 		runtime.manualQueue.shift();
-		beginReflection(runtime, manual);
+		reserveReflection(runtime, manual);
+		submitReflection(runtime);
 		refreshWidget(runtime);
 		return;
 	}
-	if (runtime.externallyPaused) return;
-	const automatic = runtime.pendingAutomatic;
-	if (automatic === undefined) return;
-	runtime.pendingAutomatic = undefined;
-	runtime.latched.clear();
-	void runtime.processDomain.resetReminderCycle().catch(() => {});
-	if (currentCooldown(runtime).skipAutomatic) {
-		if (runtime.ctx?.mode === "tui")
-			runtime.ctx.ui.notify("Reflect skipped during cooldown.", "info");
-		return;
-	}
-	beginReflection(runtime, automatic);
 }
 
 type ManualQueueOutcome = "ignored" | "coalesced" | "queued" | "dispatched";
@@ -916,6 +876,15 @@ function queueManualReflection(
 	supplement?: string,
 ): ManualQueueOutcome {
 	if (!owns(runtime)) return "ignored";
+	// Commands can run once the aborted host run is idle but before our settlement.
+	if (runtime.ctx?.isIdle() && cancelAbortedRun(runtime))
+		runtime.abortSettlementPending = true;
+	// A fresh user-invoked /reflect is explicit re-entry: release any abort
+	// hold and reset the cycle before dispatch under the existing manual rules.
+	if (runtime.abortedHold) {
+		resetCycleForUserTakeover(runtime);
+		runtime.abortedHold = false;
+	}
 	if (runtime.manualQueue.length > 0) return "coalesced";
 	runtime.reflectionSequence += 1;
 	const pending: PendingReflection = {
@@ -949,7 +918,7 @@ function cancelQueuedReflection(runtime: Runtime): void {
 }
 
 // Queue dispatch is deliberately caller-owned so completed evidence can be
-// appended before a latched reflection is reconsidered.
+// appended before a waiting manual reflection is submitted.
 function finishReflection(
 	runtime: Runtime,
 	decision?: ReflectionDecision,
@@ -959,7 +928,6 @@ function finishReflection(
 	if (active === undefined) return;
 	runtime.activeReflection = undefined;
 	runtime.internalRun = { kind: "none" };
-	if (runtime.ctx !== null) observe(runtime, runtime.ctx);
 	if (decision !== undefined && report !== undefined) {
 		runtime.pi.sendMessage(
 			{
@@ -978,6 +946,7 @@ function finishReflection(
 			{ deliverAs: "steer", triggerTurn: true },
 		);
 	}
+	if (runtime.ctx !== null) observe(runtime, runtime.ctx);
 	if (decision?.type === "NO_ISSUE" && runtime.ctx?.mode === "tui") {
 		runtime.ctx.ui.notify(`Reflect watchdog: ${decision.reason}`, "info");
 	}
@@ -990,10 +959,12 @@ function observe(runtime: Runtime, ctx: ExtensionContext): void {
 	const ordinaryBusy = runtime.localBusy && !internal;
 	if (ordinaryBusy) runtime.hub.markBusy(runtime.attachment);
 	else runtime.hub.markIdle(runtime.attachment);
-	if (!runtime.externallyPaused && !runtime.processDomain.paused)
-		void runtime.processDomain
-			.setBusy(runtime.attachmentInstance, ordinaryBusy)
-			.catch(() => {});
+	void runtime.processDomain
+		.setBusy(runtime.attachmentInstance, runtime.localBusy)
+		.catch(() => {});
+	void runtime.processDomain
+		.refreshBranch(runtime.attachmentInstance)
+		.catch(() => {});
 	refreshWidget(runtime);
 }
 
@@ -1001,7 +972,8 @@ function commandIsCurrent(runtime: Runtime, ctx: ExtensionContext): boolean {
 	return (
 		owns(runtime) &&
 		runtime.ctx !== null &&
-		runtime.ctx.sessionManager === ctx.sessionManager
+		runtime.ctx.sessionManager === ctx.sessionManager &&
+		runtime.sessionId === ctx.sessionManager.getSessionId()
 	);
 }
 
@@ -1011,39 +983,16 @@ function commandIsCurrent(runtime: Runtime, ctx: ExtensionContext): boolean {
  * plugin-rewritten replies (errorMessage), any plugin inquiry reply
  * (details.piInquiry), and empty/thinking-only replies never count.
  */
-export function isAgentLoopMessage(message: unknown): boolean {
-	const value = record(message);
-	if (value?.role !== "assistant") return false;
-	if (value.stopReason !== "stop" && value.stopReason !== "toolUse")
-		return false;
-	if (value.errorMessage) return false;
-	if (record(value.details)?.piInquiry !== undefined) return false;
-	return (
-		Array.isArray(value.content) &&
-		value.content.some((item) => {
-			const block = record(item);
-			return (
-				block?.type === "toolCall" ||
-				(block?.type === "text" &&
-					typeof block.text === "string" &&
-					block.text.trim().length > 0)
-			);
-		})
-	);
-}
-
 function isSuccessfulTurn(event: TurnEndEvent): boolean {
 	return isAgentLoopMessage(event.message);
 }
 
-function isUserTakeoverMessageStart(event: MessageStartEvent): boolean {
-	return event.message.role === "user";
-}
-
 function resetCycleForUserTakeover(runtime: Runtime): void {
 	if (!owns(runtime)) return;
-	runtime.latched.clear();
-	runtime.pendingAutomatic = undefined;
+	runtime.pi.appendEntry(ACCOUNTING_BOUNDARY_ENTRY, {
+		version: 1,
+		window: "full",
+	});
 	void runtime.processDomain.resetCycleOnUserTakeover().catch(() => {});
 }
 
@@ -1075,21 +1024,20 @@ function syncOwnership(runtime: Runtime, services: RuntimeServices): void {
 	const nextClaim = runtime.hub.mainClaimFor(runtime.attachment);
 	if (runtime.claim !== null && !runtime.hub.isCurrentMain(runtime.claim)) {
 		clearWidget(runtime);
+		const active = runtime.activeReflection;
+		if (active !== undefined) {
+			runtime.abortedInquiryIds.add(active.handle.correlation.inquiryId);
+			for (const id of active.toolCallIds) runtime.abortedToolCallIds.add(id);
+			active.handle.cancel();
+		}
+		runtime.manualQueue = [];
 		runtime.activeReflection = undefined;
 		runtime.internalRun = { kind: "none" };
 	}
 	runtime.claim = nextClaim;
 	if (!owns(runtime)) return;
-	const configuredPause = externalPauseActive(runtime);
-	if (
-		runtime.processDomain.paused !== configuredPause ||
-		runtime.externallyPaused !== configuredPause
-	)
-		queueExternalPauseTransition(runtime, services, configuredPause, true);
-	latchAutomaticReflection(runtime);
 	refreshWidget(runtime);
 	scheduleRefresh(runtime, services);
-	maybeDispatch(runtime);
 }
 
 function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
@@ -1100,10 +1048,7 @@ function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
 	clearWidget(runtime);
 	runtime.unsubscribeHub?.();
 	runtime.unsubscribeDomain?.();
-	runtime.unsubscribeSemanticHooks?.();
-	runtime.unsubscribeSemanticHooks = undefined;
-	runtime.hookPauseDepths = [];
-	runtime.externallyPaused = false;
+	runtime.unsubscribeCompletions?.();
 	const attachment = runtime.attachment;
 	if (attachment !== null) runtime.hub.detach(attachment);
 	runtime.attachment = null;
@@ -1112,7 +1057,6 @@ function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
 	runtime.activeReflection = undefined;
 	runtime.abortBoundaryLeafId = undefined;
 	runtime.manualQueue = [];
-	runtime.pendingAutomatic = undefined;
 	if (runtime.domainAttached) {
 		runtime.domainAttached = false;
 		void runtime.processDomain
@@ -1123,7 +1067,7 @@ function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
 
 export interface WatchdogExtensionOptions {
 	readonly hub?: ObservableAgentHub;
-	readonly processDomain?: ReflectDomainCoordinator;
+	readonly processDomain?: ReflectBranchDomainCoordinator;
 	readonly services?: Partial<RuntimeServices>;
 }
 
@@ -1166,16 +1110,80 @@ export function createWatchdogExtension(
 			domainAttached: false,
 			domainFatal: false,
 			localBusy: false,
-			latched: new Set(),
+			sessionId: null,
+			scopeRevision: 0,
 			manualQueue: [],
 			internalRun: { kind: "none" },
 			reflectionSequence: 0,
+			abortSettlementPending: false,
 			widgetTui: null,
 			widgetRegistered: false,
-			hookPauseDepths: [],
-			externallyPaused: false,
-			pauseTail: Promise.resolve(),
+			abortedInquiryIds: new Set(),
+			abortedToolCallIds: new Set(),
+			abortedHold: false,
+			explicitInputClock: 0,
+			boundaryInputClock: 0,
 		};
+
+		const scopeIsCurrent = (ctx: ExtensionContext): boolean =>
+			!runtime.stopped &&
+			runtime.ctx !== null &&
+			runtime.sessionId === ctx.sessionManager.getSessionId() &&
+			runtime.ctx.sessionManager === ctx.sessionManager;
+		const rebaseSelectedHistory = (history: readonly SessionEntry[]) => {
+			if (!owns(runtime))
+				return runtime.processDomain.rebaseBranch(runtime.attachmentInstance);
+			// Historical fallback is deliberate at adoption, never during live scans.
+			const historical = deriveBranchAccounting(history, {
+				boundaryPolicy: "legacy",
+				cooldownLoops: reflectCooldownLoops(runtime.config.rootLoopLimit),
+			});
+			return runtime.processDomain.rebaseBranch(runtime.attachmentInstance, {
+				adoptHistory: true,
+				fullAfterEntryId: historical.full.afterEntryId,
+				reminderAfterEntryId: historical.reminder.afterEntryId,
+			});
+		};
+		const replaceScope = async (ctx: ExtensionContext): Promise<void> => {
+			runtime.configReady = false;
+			runtime.scopeRevision += 1;
+			if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
+			runtime.ticker = undefined;
+			const active = runtime.activeReflection;
+			runtime.activeReflection = undefined;
+			if (active !== undefined) {
+				runtime.abortedInquiryIds.add(active.handle.correlation.inquiryId);
+				for (const id of active.toolCallIds) runtime.abortedToolCallIds.add(id);
+				active.handle.cancel();
+			}
+			runtime.internalRun = { kind: "none" };
+			runtime.manualQueue = [];
+			runtime.abortBoundaryLeafId = undefined;
+			runtime.abortSettlementPending = false;
+			runtime.ctx = ctx;
+			runtime.sessionId = ctx.sessionManager.getSessionId();
+			const revision = runtime.scopeRevision;
+			if (owns(runtime)) await runtime.processDomain.resetCycleOnUserTakeover();
+			if (runtime.stopped || revision !== runtime.scopeRevision) return;
+			await rebaseSelectedHistory(ctx.sessionManager.getBranch());
+			if (runtime.stopped || revision !== runtime.scopeRevision) return;
+			runtime.configReady = true;
+			observe(runtime, ctx);
+			scheduleRefresh(runtime, services);
+		};
+		pi.on("session_tree", async (event, ctx) => {
+			if (!scopeIsCurrent(ctx) || event.newLeafId === event.oldLeafId) return;
+			await replaceScope(ctx);
+		});
+		pi.on("session_before_compact", (_event, ctx) => {
+			if (scopeIsCurrent(ctx)) observe(runtime, ctx);
+		});
+		pi.on("session_compact_failed", (_event, ctx) => {
+			if (scopeIsCurrent(ctx)) observe(runtime, ctx);
+		});
+		pi.on("session_compact", (_event, ctx) => {
+			if (scopeIsCurrent(ctx)) observe(runtime, ctx);
+		});
 
 		pi.registerTool({
 			name: REFLECTION_TOOL_NAME,
@@ -1186,10 +1194,11 @@ export function createWatchdogExtension(
 				prepareReflectionArguments(args) as Static<
 					typeof REFLECTION_PARAMETERS
 				>,
-			async execute(_toolCallId, params) {
+			async execute(toolCallId, params) {
 				const active = runtime.activeReflection;
 				if (
 					!owns(runtime) ||
+					runtime.abortedToolCallIds.has(toolCallId) ||
 					active === undefined ||
 					runtime.internalRun.kind !== "confirmed" ||
 					runtime.internalRun.attempt !== active.attempt
@@ -1220,7 +1229,7 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("context", (event) => ({
-			messages: reflectionContext(event.messages),
+			messages: reflectionContext(event.messages, runtime.abortedInquiryIds),
 		}));
 
 		pi.registerMessageRenderer<ReflectionContinuationDetails>(
@@ -1266,17 +1275,31 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("session_start", async (_event, ctx) => {
-			if (runtime.ctx !== null || runtime.stopped) return;
+			if (runtime.stopped) return;
+			if (runtime.ctx !== null) {
+				await replaceScope(ctx);
+				return;
+			}
 			runtime.ctx = ctx;
+			runtime.sessionId = ctx.sessionManager.getSessionId();
+			const initialHistory = [...ctx.sessionManager.getBranch()];
 			runtime.localBusy = probePiAgentState(ctx).busy;
 			try {
 				await runtime.processDomain.attach(runtime.attachmentInstance, {
 					getBusy: () => {
 						if (runtime.ctx === null) return false;
-						return (
-							probePiAgentState(runtime.ctx).busy &&
-							runtime.internalRun.kind === "none"
-						);
+						return probePiAgentState(runtime.ctx).busy;
+					},
+					source: {
+						getBranch: () => runtime.ctx?.sessionManager.getBranch() ?? [],
+						getLeafId: () => runtime.ctx?.sessionManager.getLeafId() ?? null,
+						isMain: () => owns(runtime),
+						boundaryPolicy: "recorded",
+						recordFullBoundary: () =>
+							pi.appendEntry(ACCOUNTING_BOUNDARY_ENTRY, {
+								version: 1,
+								window: "full",
+							}),
 					},
 					onFatal: (error) => {
 						if (!isReflectDomainFatalError(error)) return;
@@ -1307,27 +1330,18 @@ export function createWatchdogExtension(
 			runtime.unsubscribeDomain = runtime.processDomain.subscribe(
 				(counters) => {
 					runtime.latestCounters = counters;
-					latchAutomaticReflection(runtime);
 					refreshWidget(runtime);
 					scheduleRefresh(runtime, services);
-					maybeDispatch(runtime);
 				},
 			);
 			const loaded = await services.loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			if (runtime.stopped || runtime.ctx !== ctx) return;
 			runtime.config = loaded.config;
-			runtime.hookPauseDepths = loaded.config.hookPauses.map(() => 0);
-			if (runtime.config.hookPauses.length > 0) {
-				runtime.unsubscribeSemanticHooks = subscribeSemanticHooks(
-					pi.events,
-					(envelope) => handlePauseHook(runtime, services, envelope),
-					(reason) =>
-						ctx.ui.notify(
-							`pi-reflect-watchdog ignored invalid semantic hook: ${reason.slice(0, 160)}`,
-							"warning",
-						),
-				);
-			}
+			runtime.unsubscribeCompletions =
+				runtime.processDomain.subscribeCompletions((completion) => {
+					considerFreshCompletion(runtime, completion.counters);
+				});
+			await rebaseSelectedHistory(initialHistory);
 			runtime.processDomain.setIdleResetGapSeconds(
 				runtime.config.idleResetGapSeconds,
 			);
@@ -1349,9 +1363,12 @@ export function createWatchdogExtension(
 		});
 
 		pi.on("agent_start", (_event, ctx) => {
+			if (!scopeIsCurrent(ctx)) return;
+			runtime.ctx = ctx;
 			runtime.abortBoundaryLeafId = owns(runtime)
 				? ctx.sessionManager.getLeafId()
 				: undefined;
+			runtime.boundaryInputClock = runtime.explicitInputClock;
 			const active = runtime.activeReflection;
 			if (active !== undefined && runtime.internalRun.kind !== "confirmed") {
 				runtime.internalRun = {
@@ -1362,20 +1379,37 @@ export function createWatchdogExtension(
 			observe(runtime, ctx);
 		});
 
+		pi.on("input", (event, ctx) => {
+			// Only newly submitted explicit user input releases the abort hold:
+			// source "extension" (plugin/other-extension sendUserMessage) and
+			// role-only user messages never qualify. Normal delivery is not
+			// altered; the hold only gates this plugin's own dispatch.
+			if (!scopeIsCurrent(ctx) || !owns(runtime)) return;
+			if (event.source !== "interactive" && event.source !== "rpc") return;
+			runtime.explicitInputClock += 1;
+			if (ctx.isIdle() && cancelAbortedRun(runtime))
+				runtime.abortSettlementPending = true;
+			resetCycleForUserTakeover(runtime);
+			runtime.abortedHold = false;
+		});
+
 		pi.on("message_start", (event, ctx) => {
+			if (!scopeIsCurrent(ctx)) return;
 			const active = runtime.activeReflection;
 			if (active?.handle.matchesPrompt(event.message)) {
 				runtime.internalRun = { kind: "confirmed", attempt: active.attempt };
 				observe(runtime, ctx);
 				return;
 			}
-			if (isUserTakeoverMessageStart(event)) resetCycleForUserTakeover(runtime);
 		});
 
 		pi.on("tool_call", (event) => {
+			if (runtime.abortedToolCallIds.has(event.toolCallId))
+				return { block: true, reason: "Reflection inquiry cancelled." };
 			const active = runtime.activeReflection;
 			if (active === undefined || runtime.internalRun.kind !== "confirmed")
 				return;
+			active.toolCallIds.add(event.toolCallId);
 			if (event.toolName === REFLECTION_TOOL_NAME) return;
 			if (active.toolCalls >= MAX_REFLECTION_TOOL_CALLS)
 				return {
@@ -1385,9 +1419,41 @@ export function createWatchdogExtension(
 			active.toolCalls += 1;
 		});
 
-		const handleMessageEnd = (event: MessageEndEvent) => {
+		const handleMessageEnd = (
+			event: MessageEndEvent,
+			ctx: ExtensionContext,
+		) => {
+			if (!scopeIsCurrent(ctx)) return;
+			const correlation = inquiryCorrelation(
+				record(record(event.message)?.details)?.piInquiry,
+			);
+			if (
+				correlation !== null &&
+				runtime.abortedInquiryIds.has(correlation.inquiryId)
+			) {
+				if (event.message.role === "assistant")
+					for (const block of event.message.content)
+						if (block.type === "toolCall")
+							runtime.abortedToolCallIds.add(block.id);
+				return;
+			}
 			const active = runtime.activeReflection;
-			if (active === undefined) return;
+			if (
+				event.message.role === "assistant" &&
+				event.message.stopReason === "aborted" &&
+				correlation === null &&
+				runtime.internalRun.kind !== "confirmed"
+			) {
+				if (cancelAbortedRun(runtime, runtime.abortBoundaryLeafId, true))
+					runtime.abortSettlementPending = true;
+				return;
+			}
+			if (
+				active === undefined ||
+				(correlation !== null &&
+					!sameCorrelation(correlation, active.handle.correlation))
+			)
+				return;
 			// Only a run whose inquiry prompt was confirmed via message_start may
 			// capture an assistant. A provisional internal run shares the turn
 			// with ordinary work and must never claim its assistant replies.
@@ -1396,6 +1462,7 @@ export function createWatchdogExtension(
 				runtime.internalRun.attempt !== active.attempt
 			)
 				return;
+			if (event.message.role === "assistant") active.responseObserved = true;
 			// Provider failures belong to Pi's retry cycle, not result validation.
 			if (
 				event.message.role === "assistant" &&
@@ -1410,6 +1477,22 @@ export function createWatchdogExtension(
 			const toolCalls = event.message.content.filter(
 				(block) => block.type === "toolCall",
 			);
+			for (const call of toolCalls) active.toolCallIds.add(call.id);
+			// An aborted owned response keeps its authoritative aborted outcome:
+			// neither invalid-response staging (which would reask) nor the
+			// stop-rewrite below may convert a user abort into more work.
+			if (event.message.stopReason === "aborted") {
+				if (cancelAbortedRun(runtime, runtime.abortBoundaryLeafId, true))
+					runtime.abortSettlementPending = true;
+				return {
+					message: {
+						...active.handle.neutralize(event.message, {
+							stopReason: "aborted",
+						}),
+						content: [],
+					},
+				};
+			}
 			if (toolCalls.length === 0 && active.planned === undefined)
 				active.planned = {
 					error: `reflection must be submitted with ${REFLECTION_TOOL_NAME}`,
@@ -1452,42 +1535,58 @@ export function createWatchdogExtension(
 			{ uninterruptible: true },
 		);
 
-		pi.on("turn_end", async (event) => {
+		pi.on("turn_end", async (event, ctx) => {
 			if (
+				!scopeIsCurrent(ctx) ||
 				!isSuccessfulTurn(event) ||
-				runtime.internalRun.kind !== "none" ||
-				runtime.externallyPaused ||
-				runtime.processDomain.paused
+				runtime.internalRun.kind === "confirmed"
 			)
 				return;
-			if (owns(runtime)) await runtime.processDomain.recordRootLoop();
-			else await runtime.processDomain.recordAllLoop();
-			latchAutomaticReflection(runtime);
+			const branch = ctx.sessionManager.getBranch();
+			if (
+				typeof event.messageEntryId !== "string" ||
+				!Array.isArray(event.toolResultEntryIds) ||
+				!event.toolResultEntryIds.every((id) =>
+					branch.some(
+						(entry) =>
+							entry.id === id &&
+							entry.type === "message" &&
+							entry.message.role === "toolResult",
+					),
+				)
+			)
+				return;
+			await runtime.processDomain.completeTurn(
+				runtime.attachmentInstance,
+				event.messageEntryId,
+			);
 			refreshWidget(runtime);
 		});
 
 		pi.on("agent_end", () => {});
 		pi.on("agent_settled", (_event, ctx) => {
-			// Identity guard: observe() can synchronously cascade through the hub
-			// into syncOwnership -> maybeDispatch and dispatch a queued manual
-			// reflection. That newborn reflection has no result yet and must not
-			// be treated as the settled run's reflection below; only the active
-			// reflection present at handler entry belongs to this settlement.
+			if (!scopeIsCurrent(ctx) || !ctx.isIdle()) return;
+			if (runtime.abortSettlementPending) {
+				runtime.abortSettlementPending = false;
+				observe(runtime, ctx);
+				return;
+			}
+			// Reentrant observation cannot finalize a newborn or unconsumed inquiry.
 			const activeAtEntry = runtime.activeReflection;
 			const abortBoundaryLeafId = runtime.abortBoundaryLeafId;
 			runtime.abortBoundaryLeafId = undefined;
-			const abortedTakeover =
-				abortBoundaryLeafId !== undefined &&
-				isAbortedTerminalTakeover(
-					ctx.sessionManager.getBranch(),
-					abortBoundaryLeafId,
-				);
+			if (cancelAbortedRun(runtime, abortBoundaryLeafId)) {
+				observe(runtime, ctx);
+				return;
+			}
 			observe(runtime, ctx);
 			const active = runtime.activeReflection;
 			if (
 				active !== undefined &&
 				active === activeAtEntry &&
-				runtime.internalRun.kind !== "none"
+				((runtime.internalRun.kind === "confirmed" &&
+					active.responseObserved) ||
+					active.planned !== undefined)
 			) {
 				const planned = active.planned;
 				runtime.internalRun = { kind: "none" };
@@ -1497,13 +1596,23 @@ export function createWatchdogExtension(
 							`Reflection attempt ${active.attempt}/${MAX_REFLECTION_REASKS} invalid: ${planned.error}; retrying.`,
 							"warning",
 						);
+						if (
+							runtime.activeReflection !== active ||
+							runtime.abortedHold ||
+							!owns(runtime)
+						)
+							return;
+						active.responseObserved = false;
 						active.attempt += 1;
 						active.planned = undefined;
+						runtime.internalRun = {
+							kind: "provisional",
+							attempt: active.attempt,
+						};
 						sendActiveReflection(
 							runtime,
 							buildReflectionReaskPrompt(planned.error),
 						);
-						if (abortedTakeover) resetCycleForUserTakeover(runtime);
 						return;
 					}
 					const fold = active.handle.complete();
@@ -1512,12 +1621,23 @@ export function createWatchdogExtension(
 							deliverAs: "steer",
 							triggerTurn: false,
 						});
+					if (
+						runtime.activeReflection !== active ||
+						runtime.abortedHold ||
+						!owns(runtime)
+					)
+						return;
 					runtime.ctx?.ui.notify(
 						`Reflection failed: ${planned.error}`,
 						"warning",
 					);
+					if (
+						runtime.activeReflection !== active ||
+						runtime.abortedHold ||
+						!owns(runtime)
+					)
+						return;
 					finishReflection(runtime);
-					if (abortedTakeover) resetCycleForUserTakeover(runtime);
 					maybeDispatch(runtime);
 					return;
 				}
@@ -1529,11 +1649,47 @@ export function createWatchdogExtension(
 							deliverAs: "steer",
 							triggerTurn: false,
 						});
-					finishReflection(runtime, planned, result.report);
-					pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
-					pi.appendEntry(REFLECTION_COMPLETED_ENTRY, active.handle.correlation);
+					if (
+						runtime.activeReflection !== active ||
+						!owns(runtime) ||
+						runtime.abortedHold
+					)
+						return;
+					try {
+						pi.appendEntry(REFLECTION_RESULT_ENTRY, result);
+					} catch (error) {
+						finishReflection(runtime);
+						throw error;
+					}
+					if (
+						runtime.activeReflection !== active ||
+						!owns(runtime) ||
+						runtime.abortedHold
+					)
+						return;
+					try {
+						pi.appendEntry(
+							REFLECTION_COMPLETED_ENTRY,
+							active.handle.correlation,
+						);
+					} catch (error) {
+						finishReflection(runtime);
+						throw error;
+					}
+					if (
+						runtime.activeReflection !== active ||
+						!owns(runtime) ||
+						runtime.abortedHold
+					)
+						return;
 					publishReflectionCompleted(runtime, planned);
-					if (abortedTakeover) resetCycleForUserTakeover(runtime);
+					if (
+						runtime.activeReflection !== active ||
+						!owns(runtime) ||
+						runtime.abortedHold
+					)
+						return;
+					finishReflection(runtime, planned, result.report);
 					maybeDispatch(runtime);
 					return;
 				}
@@ -1543,13 +1699,16 @@ export function createWatchdogExtension(
 						deliverAs: "steer",
 						triggerTurn: false,
 					});
+				if (
+					runtime.activeReflection !== active ||
+					runtime.abortedHold ||
+					!owns(runtime)
+				)
+					return;
 				finishReflection(runtime);
-				if (abortedTakeover) resetCycleForUserTakeover(runtime);
 				maybeDispatch(runtime);
 				return;
 			}
-			if (abortedTakeover) resetCycleForUserTakeover(runtime);
-			latchAutomaticReflection(runtime);
 			maybeDispatch(runtime);
 		});
 

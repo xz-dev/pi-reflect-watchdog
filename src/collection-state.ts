@@ -8,8 +8,8 @@ export const CHECKPOINT_REPLAY_RETENTION_MS = 10_000;
  */
 export const GRACE_FENCE_MS = 10_000;
 
-/** Host heartbeat period and sleep-detection gap (Lean: BEAT_MS/SLEEP_GAP_MS). */
-export const HEARTBEAT_MS = 5_000;
+/** Normal accounting cadence and approximate suspension-detection gap. */
+export const HEARTBEAT_MS = 1_000;
 export const SLEEP_GAP_MS = 10_000;
 
 interface PeerContributor {
@@ -20,6 +20,7 @@ interface PeerContributor {
 }
 
 export interface PeerCheckpoint {
+	readonly activeLoops?: bigint;
 	readonly generation: bigint;
 	readonly seq: bigint;
 	readonly busy: boolean;
@@ -28,6 +29,7 @@ export interface PeerCheckpoint {
 }
 
 export interface CheckpointLedgerEntry {
+	readonly activeLoops?: bigint;
 	readonly generation: bigint;
 	readonly seq: bigint;
 	readonly rootLoops: bigint;
@@ -45,8 +47,6 @@ export type LiveContributor = LocalContributor | PeerContributor;
 
 export interface CollectionAccounting {
 	readonly generation: bigint;
-	readonly paused: boolean;
-	readonly pausedAtMs: number | null;
 	readonly activeMs: bigint;
 	readonly activeLoops: bigint;
 	readonly taskMs: bigint;
@@ -63,12 +63,13 @@ export interface CollectionState {
 	readonly idleResetGapMs: number;
 	readonly live: ReadonlyMap<string, LiveContributor>;
 	readonly ledger: ReadonlyMap<string, CheckpointLedgerEntry>;
+	readonly mainActiveLoops: bigint;
+	readonly mainReminderLoops: bigint;
 	readonly accounting: CollectionAccounting;
 }
 
 export interface CollectionSnapshot {
 	readonly generation: bigint;
-	readonly paused: boolean;
 	readonly anyBusy: boolean;
 	readonly phase: "idle" | "collecting" | "grace";
 	readonly activeMs: bigint;
@@ -81,11 +82,26 @@ export interface CollectionSnapshot {
 }
 
 export interface AcceptedLoopDelta {
+	readonly active?: bigint;
 	readonly root: bigint;
 	readonly all: bigint;
 }
 
 export type CollectionEvent =
+	| {
+			readonly type: "main-snapshot";
+			readonly generation: bigint;
+			readonly activeLoops: bigint;
+			readonly reminderLoops: bigint;
+			readonly atMs: number;
+	  }
+	| {
+			readonly type: "child-loops";
+			readonly generation: bigint;
+			readonly active: bigint;
+			readonly reminder: bigint;
+			readonly atMs: number;
+	  }
 	| {
 			readonly type: "local-activity";
 			readonly contributorId: string;
@@ -95,11 +111,6 @@ export type CollectionEvent =
 	| {
 			readonly type: "local-detached";
 			readonly contributorId: string;
-			readonly atMs: number;
-	  }
-	| {
-			readonly type: "local-loop";
-			readonly scope: "root" | "all";
 			readonly atMs: number;
 	  }
 	| {
@@ -123,11 +134,6 @@ export type CollectionEvent =
 	| {
 			readonly type: "peer-offline";
 			readonly contributorId: string;
-			readonly atMs: number;
-	  }
-	| {
-			readonly type: "pause-changed";
-			readonly paused: boolean;
 			readonly atMs: number;
 	  }
 	| { readonly type: "tick"; readonly atMs: number }
@@ -156,7 +162,8 @@ function validCheckpoint(checkpoint: PeerCheckpoint): boolean {
 		checkpoint.generation >= 0n &&
 		checkpoint.seq > 0n &&
 		checkpoint.rootLoops >= 0n &&
-		checkpoint.allLoops >= checkpoint.rootLoops
+		checkpoint.allLoops >= checkpoint.rootLoops &&
+		(checkpoint.activeLoops ?? checkpoint.allLoops) >= 0n
 	);
 }
 
@@ -170,15 +177,14 @@ function settleAccounting(
 	accounting: CollectionAccounting,
 	atMs: number,
 ): CollectionAccounting {
-	if (accounting.paused) return accounting;
-	const activeDelta =
-		accounting.activeSinceMs === null
-			? 0n
-			: BigInt(atMs - accounting.activeSinceMs);
-	const taskDelta =
-		accounting.taskSinceMs === null
-			? 0n
-			: BigInt(atMs - accounting.taskSinceMs);
+	// Every settlement, including non-timer observations, uses the same gap cap.
+	const elapsed = (sinceMs: number | null): bigint => {
+		if (sinceMs === null) return 0n;
+		const gap = atMs - sinceMs;
+		return BigInt(gap > SLEEP_GAP_MS ? HEARTBEAT_MS : gap);
+	};
+	const activeDelta = elapsed(accounting.activeSinceMs);
+	const taskDelta = elapsed(accounting.taskSinceMs);
 	return {
 		...accounting,
 		activeMs: accounting.activeMs + activeDelta,
@@ -221,27 +227,14 @@ function withLive(
 	const inGrace = state.accounting.graceSinceMs !== null;
 	let accounting = settleAccounting(state.accounting, atMs);
 
-	if (accounting.paused) {
-		return { ...state, nowMs: atMs, live: new Map(), ledger, accounting };
-	}
-	if (!wasBusy && !inGrace && isBusy) {
-		// idle -> collecting: reopen the active interval; a long idle gap
-		// resets counters only, never timestamps beyond the reopen.
-		if (
-			accounting.idleSinceMs !== null &&
-			atMs > accounting.idleSinceMs + state.idleResetGapMs
-		)
-			accounting = resetCycle(accounting);
-		accounting = {
-			...accounting,
-			activeSinceMs: atMs,
-			taskSinceMs: atMs,
-			idleSinceMs: null,
-			graceSinceMs: null,
-		};
-	} else if (inGrace && isBusy) {
-		// grace -> collecting: a contributor rejoined inside the fence, so the
-		// aggregate never truly went idle; reopen the interval with no loss.
+	if (!wasBusy && isBusy) {
+		// Grace freezes at the true all-idle edge, even without a timer expiry.
+		const idleSinceMs = accounting.idleSinceMs ?? accounting.graceSinceMs;
+		if (idleSinceMs !== null && atMs > idleSinceMs + state.idleResetGapMs)
+			accounting = {
+				...resetCycle(accounting),
+				generation: accounting.generation + 1n,
+			};
 		accounting = {
 			...accounting,
 			activeSinceMs: atMs,
@@ -282,21 +275,49 @@ function withLive(
 			graceSinceMs: null,
 		};
 	}
-	return { ...state, nowMs: atMs, live, ledger, accounting };
+	return {
+		...state,
+		nowMs: atMs,
+		live,
+		ledger:
+			accounting.generation === state.accounting.generation
+				? ledger
+				: new Map(
+						Array.from(ledger, ([key, entry]) => [
+							key,
+							{
+								...entry,
+								generation: accounting.generation,
+								activeLoops: 0n,
+								rootLoops: 0n,
+								allLoops: 0n,
+							},
+						]),
+					),
+		mainActiveLoops:
+			accounting.generation === state.accounting.generation
+				? state.mainActiveLoops
+				: 0n,
+		mainReminderLoops:
+			accounting.generation === state.accounting.generation
+				? state.mainReminderLoops
+				: 0n,
+		accounting,
+	};
 }
 
 function addLoopDelta(
 	state: CollectionState,
 	rootDelta: bigint,
 	allDelta: bigint,
+	activeDelta = allDelta,
 ): CollectionState {
-	if (state.accounting.paused || rootDelta < 0n || allDelta < rootDelta)
-		return state;
+	if (rootDelta < 0n || allDelta < rootDelta || activeDelta < 0n) return state;
 	return {
 		...state,
 		accounting: {
 			...state.accounting,
-			activeLoops: state.accounting.activeLoops + allDelta,
+			activeLoops: state.accounting.activeLoops + activeDelta,
 			rootLoops: state.accounting.rootLoops + rootDelta,
 			allLoops: state.accounting.allLoops + allDelta,
 		},
@@ -306,17 +327,27 @@ function addLoopDelta(
 export function checkpointLoopDelta(
 	entry: CheckpointLedgerEntry,
 	checkpoint: PeerCheckpoint,
-): { readonly root: bigint; readonly all: bigint } | null {
+): AcceptedLoopDelta | null {
 	if (
 		checkpoint.generation !== entry.generation ||
 		checkpoint.seq <= entry.seq ||
 		checkpoint.rootLoops < entry.rootLoops ||
-		checkpoint.allLoops < entry.allLoops
+		checkpoint.allLoops < entry.allLoops ||
+		(checkpoint.activeLoops ?? checkpoint.allLoops) <
+			(entry.activeLoops ?? entry.allLoops)
 	)
 		return null;
 	const root = checkpoint.rootLoops - entry.rootLoops;
 	const all = checkpoint.allLoops - entry.allLoops;
-	return root <= all ? { root, all } : null;
+	return root <= all
+		? {
+				active:
+					(checkpoint.activeLoops ?? checkpoint.allLoops) -
+					(entry.activeLoops ?? entry.allLoops),
+				root,
+				all,
+			}
+		: null;
 }
 
 function validAcceptedLoopDelta(
@@ -327,7 +358,10 @@ function validAcceptedLoopDelta(
 		delta.root >= 0n &&
 		delta.all >= delta.root &&
 		delta.root <= checkpoint.rootLoops &&
-		delta.all <= checkpoint.allLoops
+		delta.all <= checkpoint.allLoops &&
+		(delta.active ?? delta.all) >= 0n &&
+		(delta.active ?? delta.all) <=
+			(checkpoint.activeLoops ?? checkpoint.allLoops)
 	);
 }
 
@@ -335,7 +369,11 @@ function sameLoopDelta(
 	left: AcceptedLoopDelta,
 	right: AcceptedLoopDelta,
 ): boolean {
-	return left.root === right.root && left.all === right.all;
+	return (
+		left.root === right.root &&
+		left.all === right.all &&
+		(left.active ?? left.all) === (right.active ?? right.all)
+	);
 }
 
 function synchronizationDeltaAllowed(
@@ -351,6 +389,7 @@ function synchronizationDeltaAllowed(
 	return (
 		sameLoopDelta(delta, { root: 0n, all: 0n }) ||
 		sameLoopDelta(delta, {
+			active: checkpoint.activeLoops ?? checkpoint.allLoops,
 			root: checkpoint.rootLoops,
 			all: checkpoint.allLoops,
 		})
@@ -375,10 +414,10 @@ export function createCollectionState(
 		idleResetGapMs,
 		live: new Map(),
 		ledger: new Map(),
+		mainActiveLoops: 0n,
+		mainReminderLoops: 0n,
 		accounting: {
 			generation: 0n,
-			paused: false,
-			pausedAtMs: null,
 			activeMs: 0n,
 			activeLoops: 0n,
 			taskMs: 0n,
@@ -400,8 +439,58 @@ export function reduceCollectionState(
 	if (atMs === null) return state;
 
 	switch (event.type) {
+		case "main-snapshot": {
+			if (
+				event.generation !== state.accounting.generation ||
+				event.activeLoops < event.reminderLoops ||
+				event.reminderLoops < 0n
+			)
+				return state;
+			const observed = withLive(
+				state,
+				new Map(state.live),
+				pruneLedger(state.ledger, atMs),
+				atMs,
+			);
+			if (observed.accounting.generation !== event.generation) return observed;
+			return {
+				...observed,
+				mainActiveLoops: event.activeLoops,
+				mainReminderLoops: event.reminderLoops,
+				accounting: {
+					...observed.accounting,
+					activeLoops:
+						observed.accounting.activeLoops -
+						observed.mainActiveLoops +
+						event.activeLoops,
+					rootLoops:
+						observed.accounting.rootLoops -
+						observed.mainReminderLoops +
+						event.reminderLoops,
+					allLoops:
+						observed.accounting.allLoops -
+						observed.mainReminderLoops +
+						event.reminderLoops,
+				},
+			};
+		}
+		case "child-loops": {
+			if (
+				event.generation !== state.accounting.generation ||
+				event.active < 0n ||
+				event.reminder < 0n
+			)
+				return state;
+			const observed = withLive(
+				state,
+				new Map(state.live),
+				pruneLedger(state.ledger, atMs),
+				atMs,
+			);
+			if (observed.accounting.generation !== event.generation) return observed;
+			return addLoopDelta(observed, 0n, event.reminder, event.active);
+		}
 		case "local-activity": {
-			if (state.accounting.paused) return state;
 			const live = new Map(state.live);
 			live.set(localContributorKey(event.contributorId), {
 				kind: "local",
@@ -416,16 +505,6 @@ export function reduceCollectionState(
 			const live = new Map(state.live);
 			live.delete(key);
 			return withLive(state, live, pruneLedger(state.ledger, atMs), atMs);
-		}
-		case "local-loop": {
-			if (state.accounting.paused) return state;
-			const advanced = withLive(
-				state,
-				new Map(state.live),
-				pruneLedger(state.ledger, atMs),
-				atMs,
-			);
-			return addLoopDelta(advanced, event.scope === "root" ? 1n : 0n, 1n);
 		}
 		case "peer-synchronized": {
 			const checkpoint = event.checkpoint;
@@ -442,11 +521,11 @@ export function reduceCollectionState(
 			ledger.set(event.replayKey, {
 				generation: checkpoint.generation,
 				seq: checkpoint.seq,
+				activeLoops: checkpoint.activeLoops ?? checkpoint.allLoops,
 				rootLoops: checkpoint.rootLoops,
 				allLoops: checkpoint.allLoops,
 				replayUntilMs: null,
 			});
-			if (state.accounting.paused) return { ...state, nowMs: atMs, ledger };
 			const live = new Map(state.live);
 			for (const [key, contributor] of live)
 				if (
@@ -460,15 +539,18 @@ export function reduceCollectionState(
 				replayKey: event.replayKey,
 				busy: checkpoint.busy,
 			});
+			const observed = withLive(state, live, ledger, atMs);
+			if (observed.accounting.generation !== checkpoint.generation)
+				return observed;
 			return addLoopDelta(
-				withLive(state, live, ledger, atMs),
+				observed,
 				delta.root,
 				delta.all,
+				delta.active ?? delta.all,
 			);
 		}
 		case "peer-checkpoint-verified": {
 			if (
-				state.accounting.paused ||
 				!validCheckpoint(event.checkpoint) ||
 				event.checkpoint.generation !== state.accounting.generation
 			)
@@ -490,16 +572,21 @@ export function reduceCollectionState(
 			ledger.set(contributor.replayKey, {
 				generation: event.checkpoint.generation,
 				seq: event.checkpoint.seq,
+				activeLoops: event.checkpoint.activeLoops ?? event.checkpoint.allLoops,
 				rootLoops: event.checkpoint.rootLoops,
 				allLoops: event.checkpoint.allLoops,
 				replayUntilMs: null,
 			});
 			const live = new Map(state.live);
 			live.set(key, { ...contributor, busy: event.checkpoint.busy });
+			const observed = withLive(state, live, ledger, atMs);
+			if (observed.accounting.generation !== event.checkpoint.generation)
+				return observed;
 			return addLoopDelta(
-				withLive(state, live, ledger, atMs),
+				observed,
 				event.acceptedLoopDelta.root,
 				event.acceptedLoopDelta.all,
+				event.acceptedLoopDelta.active ?? event.acceptedLoopDelta.all,
 			);
 		}
 		case "peer-offline": {
@@ -517,69 +604,10 @@ export function reduceCollectionState(
 				});
 			return withLive(state, live, ledger, atMs);
 		}
-		case "pause-changed": {
-			if (state.accounting.paused === event.paused) return state;
-			let accounting = settleAccounting(state.accounting, atMs);
-			if (event.paused) {
-				accounting = {
-					...accounting,
-					generation: accounting.generation + 1n,
-					paused: true,
-					pausedAtMs: atMs,
-					activeSinceMs: null,
-					taskSinceMs: null,
-					graceSinceMs: null,
-				};
-			} else {
-				const pausedDuration =
-					accounting.pausedAtMs === null ? 0 : atMs - accounting.pausedAtMs;
-				accounting = {
-					...accounting,
-					generation: accounting.generation + 1n,
-					paused: false,
-					pausedAtMs: null,
-					activeSinceMs: null,
-					taskSinceMs: null,
-					graceSinceMs: null,
-					idleSinceMs:
-						accounting.idleSinceMs === null
-							? null
-							: accounting.idleSinceMs + pausedDuration,
-				};
-			}
-			return {
-				...state,
-				nowMs: atMs,
-				live: new Map(),
-				ledger: new Map(),
-				accounting,
-			};
-		}
 		case "tick": {
-			// Host heartbeat (Lean: advance/heartbeat). Detect sleep by the gap
-			// since the previous tick and freeze open timestamps forward so the
-			// slept wall time is never counted; then drive the phase machine so a
-			// fence-expired grace settles to idle even when no other event lands.
-			if (state.accounting.paused) return { ...state, nowMs: atMs };
-			// Sleep freeze (Lean: sleep_freeze_exact, precondition collecting):
-			// only an OPEN active interval loses wall time when the host sleeps,
-			// so only then is the gap since the last proof-of-life frozen. A gap
-			// while idle or in grace is just quiet time and shifts nothing.
-			const gap = atMs - state.nowMs;
-			let accounting = state.accounting;
-			if (accounting.activeSinceMs !== null && gap > SLEEP_GAP_MS) {
-				const shift = gap - HEARTBEAT_MS;
-				accounting = {
-					...accounting,
-					activeSinceMs: accounting.activeSinceMs + shift,
-					taskSinceMs:
-						accounting.taskSinceMs === null
-							? null
-							: accounting.taskSinceMs + shift,
-				};
-			}
+			// Cadence wakes accounting; settlement owns elapsed time and gap capping.
 			return withLive(
-				{ ...state, accounting },
+				state,
 				new Map(state.live),
 				pruneLedger(state.ledger, atMs),
 				atMs,
@@ -589,28 +617,53 @@ export function reduceCollectionState(
 			let accounting = settleAccounting(state.accounting, atMs);
 			accounting = {
 				...accounting,
+				generation: accounting.generation + 1n,
 				taskMs: 0n,
 				rootLoops: 0n,
 				allLoops: 0n,
-				taskSinceMs:
-					!accounting.paused && busyCount(state.live) > 0 ? atMs : null,
+				taskSinceMs: busyCount(state.live) > 0 ? atMs : null,
 			};
 			return {
 				...state,
 				nowMs: atMs,
-				ledger: pruneLedger(state.ledger, atMs),
+				mainReminderLoops: 0n,
+				ledger: new Map(
+					Array.from(pruneLedger(state.ledger, atMs), ([key, entry]) => [
+						key,
+						{
+							...entry,
+							generation: accounting.generation,
+							rootLoops: 0n,
+							allLoops: 0n,
+						},
+					]),
+				),
 				accounting,
 			};
 		}
 		case "cycle-reset": {
 			const accounting = settleAccounting(state.accounting, atMs);
-			const anyBusy = !accounting.paused && busyCount(state.live) > 0;
+			const anyBusy = busyCount(state.live) > 0;
 			return {
 				...state,
 				nowMs: atMs,
-				ledger: pruneLedger(state.ledger, atMs),
+				mainActiveLoops: 0n,
+				mainReminderLoops: 0n,
+				ledger: new Map(
+					Array.from(pruneLedger(state.ledger, atMs), ([key, entry]) => [
+						key,
+						{
+							...entry,
+							generation: accounting.generation + 1n,
+							activeLoops: 0n,
+							rootLoops: 0n,
+							allLoops: 0n,
+						},
+					]),
+				),
 				accounting: {
 					...accounting,
+					generation: accounting.generation + 1n,
 					activeMs: 0n,
 					activeLoops: 0n,
 					taskMs: 0n,
@@ -633,17 +686,15 @@ export function snapshotCollectionState(
 	const nowMs = validTime(atMs) ? Math.max(state.nowMs, atMs) : state.nowMs;
 	const accounting = settleAccounting(state.accounting, nowMs);
 	const busyContributors = busyCount(state.live);
-	const phase = accounting.paused
-		? "idle"
-		: busyContributors > 0
+	const phase =
+		busyContributors > 0
 			? "collecting"
 			: accounting.graceSinceMs !== null
 				? "grace"
 				: "idle";
 	return {
 		generation: accounting.generation,
-		paused: accounting.paused,
-		anyBusy: !accounting.paused && busyContributors > 0,
+		anyBusy: busyContributors > 0,
 		phase,
 		activeMs: accounting.activeMs,
 		activeLoops: accounting.activeLoops,

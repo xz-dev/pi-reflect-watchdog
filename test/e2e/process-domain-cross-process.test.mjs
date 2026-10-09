@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
 	openProcessDomain,
 	openSharedProcessDomain,
@@ -19,6 +20,16 @@ import {
 	ROOT,
 	runBoundedProcess,
 } from "../../scripts/e2e/harness.mjs";
+
+function emptySource() {
+	const session = SessionManager.inMemory();
+	return {
+		getBranch: () => session.getBranch(),
+		getLeafId: () => session.getLeafId(),
+		isMain: () => true,
+		boundaryPolicy: "recorded",
+	};
+}
 
 const open = (options) =>
 	openProcessDomain({
@@ -86,7 +97,7 @@ class MinimalPi {
 	}
 }
 
-function minimalContext(sessionId) {
+function minimalContext(sessionId, session) {
 	let idle = true;
 	return {
 		hasUI: true,
@@ -102,8 +113,8 @@ function minimalContext(sessionId) {
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => undefined,
-			getLeafId: () => null,
-			getBranch: () => [],
+			getLeafId: () => session?.getLeafId() ?? null,
+			getBranch: () => session?.getBranch() ?? [],
 		},
 		ui: {
 			notify() {},
@@ -295,7 +306,7 @@ function spawnContinueChild(declaration, continueDist) {
 		'			case "idle": idle = true; await coordinator.reportIdle(instance, true); reply(id, true); break;',
 		'			case "snapshot": reply(id, coordinator.snapshot); break;',
 		'			case "shutdown": await coordinator.detach(instance, true); reply(id, true); setTimeout(() => process.disconnect?.(), 50); break;',
-		"			default: throw new Error(`unknown command: ${command}`);",
+		'			default: throw new Error("unknown command: " + command);',
 		"		}",
 		"	} catch (error) { reply(id, undefined, error instanceof Error ? error.message : String(error)); }",
 		"});",
@@ -421,7 +432,11 @@ test("real shared transport: continue first opener preserves reflect child accou
 		idleResetGapMs: 10_000,
 	});
 	const instance = {};
-	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	await root.attach(instance, {
+		getBusy: () => false,
+		source: emptySource(),
+		onFatal() {},
+	});
 	t.after(() => root.detach(instance));
 	const child = spawnChild(declaration);
 	t.after(() => child.stop());
@@ -492,7 +507,11 @@ test("real shared transport: reflect first opener keeps continue activity", {
 		idleResetGapMs: 10_000,
 	});
 	const instance = {};
-	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	await root.attach(instance, {
+		getBusy: () => false,
+		source: emptySource(),
+		onFatal() {},
+	});
 	t.after(() => root.detach(instance));
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
@@ -563,7 +582,11 @@ test("wrong capability fails closed with status 78 and sanitized output", {
 	const env = {};
 	const root = createReflectDomainCoordinator({ env, open });
 	const instance = {};
-	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	await root.attach(instance, {
+		getBusy: () => false,
+		source: emptySource(),
+		onFatal() {},
+	});
 	t.after(() => root.detach(instance));
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
@@ -581,7 +604,8 @@ test("wrong capability fails closed with status 78 and sanitized output", {
 		'import { createReflectDomainCoordinator, isReflectDomainFatalError } from "./dist/process-domain.js";',
 		"const open = (options) => openProcessDomain({ ...options, connectTimeoutMs: 1500, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 400, heartbeatTimeToLiveMs: 300 });",
 		"const coordinator = createReflectDomainCoordinator({ open });",
-		"try { await coordinator.attach({}, { getBusy: () => false, onFatal() {} }); process.exitCode = 1; } catch (error) {",
+		'import { SessionManager } from "@earendil-works/pi-coding-agent"; const session = SessionManager.inMemory();',
+		"try { await coordinator.attach({}, { getBusy: () => false, source: { getBranch: () => session.getBranch(), getLeafId: () => session.getLeafId(), isMain: () => true, boundaryPolicy: 'recorded' }, onFatal() {} }); process.exitCode = 1; } catch (error) {",
 		'  console.error("CODE=" + (isReflectDomainFatalError(error) ? error.code : "UNKNOWN"));',
 		"  process.exitCode = 78;",
 		"}",
@@ -627,7 +651,11 @@ test("real process transport removes stopped peer immediately and resumes from c
 		idleResetGapMs: 10_000,
 	});
 	const instance = {};
-	await root.attach(instance, { getBusy: () => false, onFatal() {} });
+	await root.attach(instance, {
+		getBusy: () => false,
+		source: emptySource(),
+		onFatal() {},
+	});
 	t.after(() => root.detach(instance));
 	const declaration = env.PI_EXTENSION_UTILS_PROCESS_DOMAIN;
 	assert.ok(declaration);
@@ -635,12 +663,12 @@ test("real process transport removes stopped peer immediately and resumes from c
 	t.after(() => child.stop());
 	await child.ready();
 
-	await child.command("root-loop");
+	await child.command("all-loop");
 	await child.command("all-loop");
 	await child.command("busy");
 	await waitFor(
 		() =>
-			root.counters()?.rootLoops.value === 1n &&
+			root.counters()?.rootLoops.value === 0n &&
 			root.counters()?.allLoops.value === 2n &&
 			(root.counters()?.activeMs.value ?? 0n) >= 100n,
 		"initial checkpoint aggregation",
@@ -708,14 +736,15 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		activeTickMs: 100,
 	});
 	const pi = new MinimalPi();
-	const context = minimalContext("packed-root");
+	const rootSession = SessionManager.inMemory();
+	const context = minimalContext("packed-root", rootSession);
 	packedExtension.createWatchdogExtension({
 		processDomain: root,
 		services: {
 			loadConfig: async () => ({
 				config: {
-					rootLoopLimit: 3,
-					allLoopLimit: 300,
+					rootLoopLimit: 300,
+					allLoopLimit: 3,
 					taskMinutes: 20,
 					idleResetGapSeconds: 60,
 					reflectionPrompt: "Inspect current work.",
@@ -736,11 +765,11 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 	t.after(() => first.stop());
 	await first.ready();
 	await first.command("busy");
-	await first.command("root-loop");
+	await first.command("all-loop");
 	await waitFor(
 		() =>
 			root.counters()?.anyBusy === true &&
-			root.counters()?.rootLoops.value === 1n &&
+			root.counters()?.allLoops.value === 1n &&
 			(root.counters()?.activeMs.value ?? 0n) >= 100n &&
 			(root.counters()?.taskMs.value ?? 0n) >= 100n,
 		"first packed contributor",
@@ -753,7 +782,8 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		"first SIGKILL contributor removal",
 		5_000,
 	);
-	assert.equal(root.counters()?.rootLoops.value, 1n);
+	assert.equal(root.counters()?.rootLoops.value, 0n);
+	assert.equal(root.counters()?.allLoops.value, 1n);
 	const frozenActiveMs = root.counters()?.activeMs.value ?? 0n;
 	const frozenTaskMs = root.counters()?.taskMs.value ?? 0n;
 	await new Promise((resolve) => setTimeout(resolve, 250));
@@ -764,11 +794,11 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 	t.after(() => replacement.stop());
 	await replacement.ready();
 	await replacement.command("busy");
-	await replacement.command("root-loop");
+	await replacement.command("all-loop");
 	await waitFor(
 		() =>
 			root.counters()?.anyBusy === true &&
-			root.counters()?.rootLoops.value === 2n &&
+			root.counters()?.allLoops.value === 2n &&
 			(root.counters()?.activeMs.value ?? 0n) > frozenActiveMs &&
 			(root.counters()?.taskMs.value ?? 0n) > frozenTaskMs,
 		"replacement packed contributor",
@@ -785,15 +815,28 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 
 	context.setIdle(false);
 	await pi.emit("agent_start", {}, context);
+	// Real Pi persists the finalized reply before turn_end carries its entry ID.
+	const finalReply = {
+		role: "assistant",
+		api: "openai-completions",
+		provider: "fixture",
+		model: "fixture",
+		stopReason: "stop",
+		content: [{ type: "text", text: "agent output" }],
+		timestamp: Date.now(),
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	};
+	const messageEntryId = rootSession.appendMessage(finalReply);
 	await pi.emit(
 		"turn_end",
-		{
-			message: {
-				role: "assistant",
-				stopReason: "stop",
-				content: [{ type: "text", text: "agent output" }],
-			},
-		},
+		{ message: finalReply, messageEntryId, toolResultEntryIds: [] },
 		context,
 	);
 	await waitFor(
@@ -806,7 +849,7 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 	const inquiry = pi.messages.findLast(({ message }) =>
 		String(message?.customType ?? "").endsWith(":inquiry"),
 	);
-	assert.match(inquiry?.message?.content ?? "", /ROOT_LOOP_LIMIT/);
+	assert.match(inquiry?.message?.content ?? "", /ALL_LOOP_LIMIT/);
 	assert.match(
 		inquiry?.message?.content ?? "",
 		/Branch-scoped history recovery unavailable/,
@@ -815,4 +858,58 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+});
+
+test("real authenticated transport: repair, fresh unchanged-count completion, duplicate and reset", {
+	timeout: 20000,
+}, async (t) => {
+	const env = {},
+		root = createReflectDomainCoordinator({ env, open });
+	const instance = {};
+	await root.attach(instance, {
+		getBusy: () => false,
+		source: emptySource(),
+		onFatal() {},
+	});
+	t.after(() => root.detach(instance));
+	const completions = [];
+	root.subscribeCompletions((event) => {
+		assert.equal(
+			root.counters()?.allLoops.value,
+			event.counters.allLoops.value,
+		);
+		completions.push(event.messageEntryId);
+	});
+	const child = spawnChild(env.PI_EXTENSION_UTILS_PROCESS_DOMAIN);
+	t.after(() => child.stop());
+	await child.ready();
+	await child.command("busy");
+	await child.command("refresh-only");
+	await waitFor(() => root.counters()?.allLoops.value === 1n, "repair counts");
+	assert.equal(completions.length, 0);
+	await child.command("complete-last");
+	await waitFor(
+		() => completions.length === 1,
+		"fresh unchanged-count completion",
+	);
+	await child.command("complete-last");
+	await child.command("counters");
+	assert.equal(completions.length, 1);
+	await root.resetReminderCycle();
+	await waitFor(
+		() => root.counters()?.allLoops.value === 0n && root.counters()?.anyBusy,
+		"reset with child activity",
+	);
+	await child.command("complete-last");
+	assert.equal(completions.length, 1);
+	await child.command("all-loop");
+	await waitFor(
+		() => root.counters()?.allLoops.value === 1n && completions.length === 2,
+		"new reminder contribution",
+	);
+	assert.equal(root.counters()?.activeLoops.value, 2n);
+	assert.equal(root.counters()?.rootLoops.value, 0n);
+	await child.stop();
+	await waitFor(() => root.counters()?.anyBusy === false, "departed child");
+	assert.equal(root.counters()?.allLoops.value, 1n);
 });

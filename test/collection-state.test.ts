@@ -39,6 +39,8 @@ function synchronize(
 		contributorId: options.contributorId ?? contributorId,
 		replayKey: options.replayKey ?? replayKey,
 		acceptedLoopDelta: options.acceptedLoopDelta ?? {
+			active:
+				options.checkpoint?.activeLoops ?? options.checkpoint?.allLoops ?? 0n,
 			root: options.checkpoint?.rootLoops ?? 0n,
 			all: options.checkpoint?.allLoops ?? 0n,
 		},
@@ -104,7 +106,6 @@ test("retained reconnect restores loop delta but never backfills offline time", 
 
 	assert.deepEqual(snapshotCollectionState(state, 10_000), {
 		generation: 0n,
-		paused: false,
 		anyBusy: true,
 		phase: "collecting",
 		activeMs: 2_000n,
@@ -186,49 +187,6 @@ test("true first join counts loops completed before its first checkpoint", () =>
 	assert.equal(snapshot.activeLoops, 7n);
 	assert.equal(snapshot.rootLoops, 3n);
 	assert.equal(snapshot.allLoops, 7n);
-});
-
-test("pause generation crossing discards disconnected loop delta", () => {
-	let state = synchronize(createCollectionState(), {
-		atMs: 0,
-		checkpoint: checkpoint({
-			busy: true,
-			rootLoops: 1n,
-			allLoops: 2n,
-		}),
-	});
-	state = reduceCollectionState(state, {
-		type: "peer-offline",
-		contributorId,
-		atMs: 1_000,
-	});
-	state = reduceCollectionState(state, {
-		type: "pause-changed",
-		paused: true,
-		atMs: 2_000,
-	});
-	state = reduceCollectionState(state, {
-		type: "pause-changed",
-		paused: false,
-		atMs: 3_000,
-	});
-	state = synchronize(state, {
-		atMs: 5_000,
-		acceptedLoopDelta: { root: 0n, all: 0n },
-		checkpoint: checkpoint({
-			generation: 2n,
-			seq: 2n,
-			busy: true,
-			rootLoops: 3n,
-			allLoops: 6n,
-		}),
-	});
-
-	const snapshot = snapshotCollectionState(state, 6_000);
-	assert.equal(snapshot.generation, 2n);
-	assert.equal(snapshot.rootLoops, 1n);
-	assert.equal(snapshot.allLoops, 2n);
-	assert.equal(snapshot.activeMs, 2_000n);
 });
 
 test("grace phase: main stop while subagent busy keeps collecting", () => {
@@ -331,8 +289,10 @@ test("idle reset preserves exactly sixty seconds and resets only after overflow"
 		atMs: 0,
 	});
 	state = reduceCollectionState(state, {
-		type: "local-loop",
-		scope: "root",
+		type: "main-snapshot",
+		generation: state.accounting.generation,
+		activeLoops: 1n,
+		reminderLoops: 1n,
 		atMs: 50,
 	});
 	state = reduceCollectionState(state, {
@@ -389,8 +349,10 @@ test("cycle reset zeroes every counter and preserves the live interval", () => {
 		atMs: 0,
 	});
 	state = reduceCollectionState(state, {
-		type: "local-loop",
-		scope: "root",
+		type: "main-snapshot",
+		generation: state.accounting.generation,
+		activeLoops: 1n,
+		reminderLoops: 1n,
 		atMs: 50,
 	});
 	state = reduceCollectionState(state, {
@@ -486,39 +448,214 @@ test("stale checkpoint and stale offline fact cannot mutate current contributor"
 	assert.equal(state.live.size, 1);
 });
 
-test("paused accounting ignores loops and resumes from newly observed activity", () => {
-	let state = createCollectionState();
+test("elapsed clocks preserve milliseconds across delayed refresh and idle edges", () => {
+	let state = reduceCollectionState(createCollectionState(), {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	assert.equal(snapshotCollectionState(state).activeMs, 0n);
+	for (const atMs of [1_100, 3_200])
+		state = reduceCollectionState(state, { type: "tick", atMs });
+	assert.equal(snapshotCollectionState(state).activeMs, 3_200n);
+	assert.equal(snapshotCollectionState(state).activeMs / 1_000n, 3n);
 	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: false,
+		atMs: 3_250,
+	});
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "child",
+		busy: true,
+		atMs: 8_250,
+	});
+	assert.equal(snapshotCollectionState(state).activeMs, 3_250n);
+	assert.equal(snapshotCollectionState(state, 9_000).activeMs, 4_000n);
+});
+
+test("every elapsed settlement caps a long proof-of-life gap at one second", () => {
+	const busy = synchronize(createCollectionState(), {
+		atMs: 0,
+		checkpoint: checkpoint({ busy: true }),
+	});
+	const events = [
+		{ type: "tick", atMs: 300_000 },
+		{
+			type: "local-activity",
+			contributorId: "root",
+			busy: true,
+			atMs: 300_000,
+		},
+		{
+			type: "main-snapshot",
+			generation: 0n,
+			activeLoops: 1n,
+			reminderLoops: 1n,
+			atMs: 300_000,
+		},
+		{
+			type: "peer-checkpoint-verified",
+			contributorId,
+			checkpoint: checkpoint({ seq: 2n, busy: true }),
+			acceptedLoopDelta: { root: 0n, all: 0n },
+			atMs: 300_000,
+		},
+		{
+			type: "peer-synchronized",
+			contributorId: "new-child",
+			replayKey: "new-child/process",
+			checkpoint: checkpoint({ busy: true }),
+			acceptedLoopDelta: { root: 0n, all: 0n },
+			atMs: 300_000,
+		},
+		{ type: "peer-offline", contributorId, atMs: 300_000 },
+		{ type: "reminder-accepted", atMs: 300_000 },
+	] satisfies Parameters<typeof reduceCollectionState>[1][];
+	for (const event of events) {
+		const settled = reduceCollectionState(busy, event);
+		assert.equal(snapshotCollectionState(settled).activeMs, 1_000n, event.type);
+		if (event.type !== "reminder-accepted")
+			assert.equal(snapshotCollectionState(settled).taskMs, 1_000n, event.type);
+	}
+	assert.equal(snapshotCollectionState(busy, 300_000).activeMs, 1_000n);
+	assert.equal(snapshotCollectionState(busy, 10_000).activeMs, 10_000n);
+	assert.equal(snapshotCollectionState(busy, 10_001).activeMs, 1_000n);
+	const reset = reduceCollectionState(busy, {
+		type: "cycle-reset",
+		atMs: 300_000,
+	});
+	assert.equal(snapshotCollectionState(reset, 300_250).activeMs, 250n);
+});
+
+test("union clock preserves fractional full time when reminder resets", () => {
+	let state = reduceCollectionState(createCollectionState(), {
+		type: "local-activity",
+		contributorId: "root",
+		busy: true,
+		atMs: 0,
+	});
+	state = synchronize(state, {
+		atMs: 750,
+		checkpoint: checkpoint({ busy: true }),
+	});
+	state = reduceCollectionState(state, {
+		type: "main-snapshot",
+		generation: state.accounting.generation,
+		activeLoops: 1n,
+		reminderLoops: 1n,
+		atMs: 1_100,
+	});
+	state = reduceCollectionState(state, {
+		type: "reminder-accepted",
+		atMs: 3_200,
+	});
+	const reminder = snapshotCollectionState(state);
+	assert.equal(reminder.activeMs, 3_200n);
+	assert.equal(reminder.activeLoops, 1n);
+	assert.equal(reminder.taskMs, 0n);
+	assert.equal(reminder.rootLoops, 0n);
+	state = reduceCollectionState(state, {
+		type: "local-activity",
+		contributorId: "root",
+		busy: false,
+		atMs: 3_500,
+	});
+	assert.equal(snapshotCollectionState(state, 4_250).activeMs, 4_250n);
+	assert.equal(snapshotCollectionState(state, 4_250).taskMs, 1_050n);
+});
+
+test("idle reset boundary holds even when no heartbeat expires grace", () => {
+	let state = reduceCollectionState(createCollectionState(), {
 		type: "local-activity",
 		contributorId: "root",
 		busy: true,
 		atMs: 0,
 	});
 	state = reduceCollectionState(state, {
-		type: "pause-changed",
-		paused: true,
-		atMs: 1_000,
-	});
-	state = reduceCollectionState(state, {
-		type: "local-loop",
-		scope: "root",
-		atMs: 2_000,
-	});
-	state = reduceCollectionState(state, {
-		type: "pause-changed",
-		paused: false,
-		atMs: 3_000,
-	});
-	state = reduceCollectionState(state, {
 		type: "local-activity",
 		contributorId: "root",
-		busy: true,
-		atMs: 3_000,
+		busy: false,
+		atMs: 200,
 	});
+	const resume = (atMs: number) =>
+		reduceCollectionState(state, {
+			type: "local-activity",
+			contributorId: "root",
+			busy: true,
+			atMs,
+		});
+	assert.equal(snapshotCollectionState(resume(60_200)).activeMs, 200n);
+	assert.equal(snapshotCollectionState(resume(60_201)).activeMs, 0n);
+});
 
-	const snapshot = snapshotCollectionState(state, 4_000);
-	assert.equal(snapshot.activeMs, 2_000n);
-	assert.equal(snapshot.taskMs, 2_000n);
-	assert.equal(snapshot.rootLoops, 0n);
-	assert.equal(snapshot.allLoops, 0n);
+test("main replacement changes only main view; child full/reminder deltas separate; resets fence ledger before reentry", () => {
+	let state = createCollectionState();
+	state = reduceCollectionState(state, {
+		type: "main-snapshot",
+		generation: 0n,
+		activeLoops: 3n,
+		reminderLoops: 2n,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "child-loops",
+		generation: 0n,
+		active: 4n,
+		reminder: 1n,
+		atMs: 0,
+	});
+	state = reduceCollectionState(state, {
+		type: "main-snapshot",
+		generation: 0n,
+		activeLoops: 1n,
+		reminderLoops: 1n,
+		atMs: 0,
+	});
+	assert.equal(snapshotCollectionState(state).activeLoops, 5n);
+	assert.equal(snapshotCollectionState(state).rootLoops, 1n);
+	assert.equal(snapshotCollectionState(state).allLoops, 2n);
+	state = synchronize(state, {
+		atMs: 0,
+		checkpoint: checkpoint({ busy: true, activeLoops: 2n, allLoops: 1n }),
+	});
+	state = reduceCollectionState(state, {
+		type: "reminder-accepted",
+		atMs: 100,
+	});
+	assert.equal(snapshotCollectionState(state).generation, 1n);
+	assert.equal(snapshotCollectionState(state).activeLoops, 7n);
+	assert.equal(snapshotCollectionState(state).allLoops, 0n);
+	assert.equal(snapshotCollectionState(state).anyBusy, true);
+	assert.equal(state.ledger.get(replayKey)?.allLoops, 0n);
+	const stale = reduceCollectionState(state, {
+		type: "peer-checkpoint-verified",
+		contributorId,
+		checkpoint: checkpoint({ seq: 2n, activeLoops: 99n, allLoops: 99n }),
+		acceptedLoopDelta: { active: 97n, root: 0n, all: 98n },
+		atMs: 100,
+	});
+	assert.equal(stale, state);
+	state = reduceCollectionState(state, {
+		type: "peer-checkpoint-verified",
+		contributorId,
+		checkpoint: checkpoint({
+			generation: 1n,
+			seq: 2n,
+			busy: true,
+			activeLoops: 3n,
+			allLoops: 1n,
+		}),
+		acceptedLoopDelta: { active: 1n, root: 0n, all: 1n },
+		atMs: 250,
+	});
+	assert.equal(snapshotCollectionState(state).activeLoops, 8n);
+	assert.equal(snapshotCollectionState(state).allLoops, 1n);
+	state = reduceCollectionState(state, { type: "cycle-reset", atMs: 300 });
+	assert.equal(state.ledger.get(replayKey)?.activeLoops, 0n);
+	assert.equal(snapshotCollectionState(state).generation, 2n);
+	assert.equal(snapshotCollectionState(state).activeLoops, 0n);
+	assert.equal(snapshotCollectionState(state).anyBusy, true);
 });

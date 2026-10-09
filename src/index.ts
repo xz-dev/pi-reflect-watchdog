@@ -7,7 +7,6 @@ export {
 	type ConfigDiagnostic,
 	type ConfigInput,
 	type ConfigResult,
-	type HookPausePair,
 	loadConfigText,
 	type MergeConfigResult,
 	mergeConfig,
@@ -38,9 +37,12 @@ export {
 export {
 	FATAL_EXIT_CODE,
 	isReflectDomainFatalError,
+	type ReflectBranchDomainCoordinator,
+	type ReflectBranchSource,
 	type ReflectDomainCoordinator,
 	type ReflectDomainCounters,
 	ReflectDomainFatalError,
+	type ReflectFreshCompletion,
 } from "./process-domain.js";
 export { DEFAULT_REFLECTION_PROMPT } from "./prompts.js";
 export {

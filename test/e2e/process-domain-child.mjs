@@ -1,3 +1,4 @@
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { openProcessDomain } from "pi-extension-utils/process-domain";
 
 const { createReflectDomainCoordinator } = await import(
@@ -25,6 +26,34 @@ const coordinator = createReflectDomainCoordinator({
 });
 const instance = {};
 let busy = false;
+const session = SessionManager.inMemory();
+let lastEntryId;
+const source = {
+	getBranch: () => session.getBranch(),
+	getLeafId: () => session.getLeafId(),
+	isMain: () => false,
+	boundaryPolicy: "recorded",
+};
+function appendReply() {
+	lastEntryId = session.appendMessage({
+		role: "assistant",
+		api: "openai-completions",
+		provider: "openai",
+		model: "test",
+		content: [{ type: "text", text: "ordinary" }],
+		stopReason: "stop",
+		timestamp: 0,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	});
+	return lastEntryId;
+}
 
 function reply(id, data, error) {
 	process.send?.({ id, data, error });
@@ -33,6 +62,7 @@ function reply(id, data, error) {
 try {
 	await coordinator.attach(instance, {
 		getBusy: () => busy,
+		source,
 		onFatal: (error) => {
 			process.send?.({ event: "transport-error", message: error.message });
 		},
@@ -63,15 +93,32 @@ process.on("message", async (message) => {
 				reply(id, true);
 				break;
 			case "root-loop":
-				await coordinator.recordRootLoop();
+				// A child cannot produce a main root-loop contribution.
+				await coordinator.refreshBranch(instance);
 				reply(id, true);
 				break;
 			case "all-loop":
-				await coordinator.recordAllLoop();
+				await coordinator.completeTurn(instance, appendReply());
+				reply(id, true);
+				break;
+			case "refresh-only":
+				appendReply();
+				await coordinator.refreshBranch(instance);
+				reply(id, true);
+				break;
+			case "complete-last":
+				await coordinator.completeTurn(instance, lastEntryId);
 				reply(id, true);
 				break;
 			case "counters":
-				reply(id, coordinator.counters());
+				reply(
+					id,
+					JSON.parse(
+						JSON.stringify(coordinator.counters() ?? null, (_key, value) =>
+							typeof value === "bigint" ? value.toString() : value,
+						),
+					),
+				);
 				break;
 			case "shutdown":
 				await coordinator.detach(instance);
