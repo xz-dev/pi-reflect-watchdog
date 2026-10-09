@@ -384,7 +384,7 @@ test("packed stock Pi publishes one final reflection-completed hook to a raw Eve
 	]);
 });
 
-test("packed stock Pi semantic hook pause suppresses then resumes automatic reflection", {
+test("packed stock Pi ignores legacy counting-pause hooks and reflects on fresh ordinary completion", {
 	timeout: 60_000,
 }, async (t) => {
 	assertStockPi();
@@ -420,8 +420,13 @@ test("packed stock Pi semantic hook pause suppresses then resumes automatic refl
 	);
 	await writeFile(
 		path.join(producerDir, "index.js"),
-		`import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
+		`import { appendFileSync } from "node:fs";
+import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 export default function producer(pi) {
+  const trace = (kind, value) => appendFileSync(process.env.PI_WATCHDOG_LEGACY_TRACE, JSON.stringify({kind, value}) + "\\n");
+  pi.on("message_start", event => { if (event.message.role === "custom") trace("message", event.message); });
+  pi.events.on("pi:semantic-hook:v1", envelope => trace("hook", envelope));
+  pi.on("agent_settled", (_event, ctx) => trace("entries", ctx.sessionManager.getEntries()));
   pi.registerCommand("fixture-hook", {
     description: "publish a fixture semantic hook",
     handler(args) { publishSemanticHook(pi.events, { name: args.trim() }); },
@@ -456,11 +461,26 @@ export default function producer(pi) {
 	settings.packages.push(producerDir);
 	await writeJson(settingsPath, settings);
 
-	const provider = await startFakeProvider({ responsePlan: warningPlan });
+	const provider = await startFakeProvider({
+		responsePlan: ({ requestIndex }) =>
+			requestIndex === 1
+				? reflectionResponse({
+						type: "NO_ISSUE",
+						reason: "legacy hook has no effect",
+						done: "checked",
+						current_step: "ordinary complete",
+						next_step: "continue",
+					})
+				: { delay: 20, chunks: [{ content: "ordinary final turn" }] },
+	});
 	resources.add(() => provider.close());
 	await writeJson(
 		path.join(isolated.agentDir, "models.json"),
 		modelConfig(provider.baseUrl),
+	);
+	isolated.env.PI_WATCHDOG_LEGACY_TRACE = path.join(
+		resources.base,
+		"legacy-trace.jsonl",
 	);
 	const rpc = new RpcPi({
 		cwd: isolated.workspace,
@@ -481,47 +501,92 @@ export default function producer(pi) {
 		type: "prompt",
 		message: "Complete one ordinary tool round while fixture pause is active.",
 	});
-	await waitForProviderRequests(provider, 2);
-	await new Promise((resolve) => setTimeout(resolve, 200));
-	assert.equal(
-		provider.requests.some((request) =>
-			JSON.stringify(request.body.messages).includes("Trigger source(s):"),
+	await waitForProviderRequests(provider, 3);
+	const reflection = provider.requests.filter((request) =>
+		JSON.stringify(request.body.messages).includes(
+			"Trigger source(s): ROOT_LOOP_LIMIT",
 		),
-		false,
-		"paused threshold emitted no reflection",
 	);
-	const pausedRequestCount = provider.requests.length;
+	assert.equal(
+		reflection.length,
+		1,
+		"one valid inquiry request; no retry or unclosed historical prompt",
+	);
+	await rpc.waitFor((message) => message.type === "agent_settled", 20_000);
+	const trace = (await readFile(isolated.env.PI_WATCHDOG_LEGACY_TRACE, "utf8"))
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+	const inquiries = trace.filter(
+		(item) =>
+			item.kind === "message" &&
+			item.value.customType === "pi-reflect-watchdog:inquiry",
+	);
+	const continuations = trace.filter(
+		(item) =>
+			item.kind === "message" &&
+			item.value.customType === "pi-reflect-watchdog:continuation",
+	);
+	assert.equal(
+		inquiries.length,
+		1,
+		"one consumed plugin inquiry identity, not history substring count",
+	);
+	assert.equal(continuations.length, 1);
+	assert.equal(
+		continuations[0].value.details.correlation.inquiryId,
+		inquiries[0].value.details.inquiryId,
+	);
+	const entries =
+		trace.filter((item) => item.kind === "entries").at(-1)?.value ?? [];
+	const durable = entries.filter(
+		(entry) =>
+			entry.customType === "pi-reflect-watchdog:reflection" ||
+			entry.customType === "pi-reflect-watchdog:reflection-completed",
+	);
+	assert.equal(durable.length, 2);
+	assert.equal(durable[1].data.inquiryId, inquiries[0].value.details.inquiryId);
+	const completedHooks = trace.filter(
+		(item) =>
+			item.kind === "hook" && item.value.name === "reflection-completed",
+	);
+	assert.equal(completedHooks.length, 1);
+	assert.ok(
+		trace.indexOf(completedHooks[0]) < trace.indexOf(continuations[0]),
+		"completion hook precedes consumed new continuation",
+	);
+	assert.equal(
+		provider.requests.length,
+		3,
+		"final ordinary, valid ref, ordinary continuation",
+	);
+	assert.doesNotMatch(
+		JSON.stringify(provider.requests[2].body.messages),
+		/Trigger source\(s\):|Required function call|legacy hook has no effect.*ref/i,
+	);
+	assert.match(
+		JSON.stringify(provider.requests[2].body.messages),
+		/Reflection · NO_ISSUE/,
+	);
+	// Provider may serialize content as a string or as text blocks.
+	const lastContent = provider.requests[2].body.messages.at(-1).content;
+	assert.equal(
+		Array.isArray(lastContent)
+			? lastContent.map((block) => block.text ?? "").join("")
+			: lastContent,
+		"[assistant]\ncontinue",
+	);
+	const beforeResume = provider.requests.length;
 	await rpc.request({
 		type: "prompt",
 		message: "/fixture-hook fixture-resume",
 	});
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	await rpc.request({
-		type: "prompt",
-		message: "Complete another ordinary event after fixture resume.",
-	});
-	const reflectionDeadline = performance.now() + 10_000;
-	let reflection;
-	while (performance.now() < reflectionDeadline) {
-		reflection = provider.requests.find((request) =>
-			JSON.stringify(request.body.messages).includes(
-				"Trigger source(s): ROOT_LOOP_LIMIT",
-			),
-		);
-		if (reflection) break;
-		await new Promise((resolve) => setTimeout(resolve, 20));
-	}
-	assert.ok(reflection, "resume dispatched one qualifying reflection");
 	assert.equal(
-		provider.requests
-			.slice(pausedRequestCount)
-			.filter((request) =>
-				JSON.stringify(request.body.messages).includes(
-					"Trigger source(s): ROOT_LOOP_LIMIT",
-				),
-			).length,
-		1,
-		"resume dispatches exactly one qualifying reflection",
+		provider.requests.length,
+		beforeResume,
+		"hook alone cannot dispatch or replay automatic work",
 	);
 });
 

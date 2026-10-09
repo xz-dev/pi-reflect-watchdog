@@ -13,6 +13,7 @@ export const FAST_PATTERNS = [
 	"test/e2e/cleanup.test.mjs",
 	"test/e2e/run-tests.test.mjs",
 	"test/e2e/stock-pi-fast.test.mjs",
+	"test/e2e/stock-pi-abort.test.mjs",
 ];
 
 export function forcedFailureDiagnostic(step) {
