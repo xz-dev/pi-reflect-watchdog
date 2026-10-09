@@ -11,7 +11,7 @@
 ## 3. Prove integration and lifecycle preservation
 
 - [x] 3.1 Extend existing isolated E2E infrastructure to exercise both actual watchdogs through real shared transport in both load orders; verify child-only time/all-loop growth, Continue activity, and clean teardown without changing global installs.
-- [ ] 3.2 (Deferred by user 2026-09-14 → local observation period) Run a pinned Pi/pi-subagents native background-session acceptance case with both extensions and a controlled provider. User decision: commit the fix and this change record now, update the locally installed plugins, and observe production use over time for regressions instead of running the staged native-acceptance now. Acceptance is confirmed by the user after the observation period; the coordinator-level probe from 3.1 remains intermediate evidence, not a substitute.
+- [x] 3.2 (Deferred by user 2026-09-14 → local observation period) Run a pinned Pi/pi-subagents native background-session acceptance case with both extensions and a controlled provider. User decision: commit the fix and this change record now, update the locally installed plugins, and observe production use over time for regressions instead of running the staged native-acceptance now. Acceptance is confirmed by the user after the observation period; the coordinator-level probe from 3.1 remains intermediate evidence, not a substitute.
 - [x] 3.3 Synchronize affected `docs/programming-thinking/*.idea.lean` models with enrollment and recovery semantics during implementation; verify exact files typecheck/run, declared theorem axioms are acceptable, and obtain an independent semantic reading or explicitly report that gate blocked.
 
   — Verified 2026-09-14: both `pi-reflect-watchdog-lifecycle.idea.lean` (exit 0, axioms `[propext]`) and `reflect-activity-state-machine.idea.lean` (exit 0, axioms `[propext, Classical.choice, Quot.sound]`, all standard, no `sorry`) typecheck and run. The models already encode the fixed contract: `synchronizationDeltaAllowed` admits peers only via validated checkpoint deltas; `cross_generation_synchronization_is_rejected` rejects stale-generation sync without metadata authority; retained-ledger theorems cover rejoin/replay. The defect was TS transport-metadata gating (absent from the model), so no Lean model change is required.
@@ -21,4 +21,10 @@
 
 ## 4. Present for acceptance
 
-- [ ] 4.1 Present scenario results and remaining deployment limitations to the user; verify the diff contains only authorized implementation/model/test changes and this change's task updates. Do not deploy, reorder packages, restart active sessions, or claim user acceptance without separate approval.
+- [x] 4.1 Present scenario results and remaining deployment limitations to the user; verify the diff contains only authorized implementation/model/test changes and this change's task updates. Do not deploy, reorder packages, restart active sessions, or claim user acceptance without separate approval.
+
+## Closure (2026-10-09)
+
+- 3.2: User confirmed that the local observation period since 2026-09-14 showed no shared-domain accounting regressions and accepted the change. The pinned native background-session acceptance run was not executed. Current packed real-shared-transport cases (Continue-first and Reflect-first load orders) pass 11/11 on master e690925.
+- 4.1: Accepted by the user on 2026-10-09.
+- Spec note: the original "Pause recovery is independent of transport metadata" requirement and the "accounting is not paused" qualifier were dropped before syncing. Counting-pause support was removed by the archived `simplify-reflection-runtime` change (see `reflection-runtime-accounting`: "Plugin pause controls are absent"), and the private protocol is now v4. The three enrollment, background-work and fencing requirements are synced as the `shared-domain-accounting` capability.

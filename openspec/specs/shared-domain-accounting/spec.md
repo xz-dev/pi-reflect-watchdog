@@ -1,8 +1,9 @@
-## Purpose
+# shared-domain-accounting Specification
 
+## Purpose
 Ensure Reflect Watchdog accounts for participating background agents over a shared process domain without depending on which extension opened the transport first.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Extension-independent contributor enrollment
 Reflect SHALL accept valid participation from an authenticated online peer running its supported accounting protocol without requiring Reflect-specific fields in shared transport metadata. Transport connection alone SHALL NOT establish a busy contributor.
@@ -22,7 +23,7 @@ Reflect SHALL accept valid participation from an authenticated online peer runni
 - **THEN** the connection contributes neither active time nor loops
 
 ### Requirement: Background-only work contributes to aggregate accounting
-While an enrolled background contributor performs ordinary work and accounting is not paused, Reflect SHALL advance active and task time and count its successful assistant turns in all loops. Background work SHALL NOT increment root loops. Internal reflection turns and unsuccessful outcomes SHALL retain their existing exclusions.
+While an enrolled background contributor performs ordinary work, Reflect SHALL advance active and task time and count its successful assistant turns in all loops. Background work SHALL NOT increment root loops. Internal reflection turns and unsuccessful outcomes SHALL retain their existing exclusions.
 
 #### Scenario: Main is idle while background work continues
 - **WHEN** the main agent is idle throughout a two-second continuously active background interval with three successful ordinary assistant turns
@@ -56,16 +57,3 @@ Reflect MUST bind participation and acknowledgements to the authenticated sender
 - **WHEN** a busy contributor disconnects
 - **THEN** it immediately ceases to contribute live busy state
 - **AND** reconnect recovery uses existing bounded replay rules rather than resetting or duplicating previously accepted totals
-
-### Requirement: Pause recovery is independent of transport metadata
-Reflect SHALL retain domain-wide pause semantics and permit valid participants to synchronize after a pause-generation change without depending on Reflect-specific transport metadata.
-
-#### Scenario: Contributor starts while paused
-- **WHEN** an authenticated Reflect contributor first reports while domain accounting is paused
-- **THEN** its work does not add time or loops during the pause
-- **AND** after resume and synchronization, subsequent ordinary work is counted in either watchdog load order
-
-#### Scenario: Existing contributor resumes
-- **WHEN** a configured pause ends for an already enrolled contributor
-- **THEN** it synchronizes to the current accounting generation and reports current activity
-- **AND** paused work is neither replayed nor counted as elapsed task time

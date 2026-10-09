@@ -16,5 +16,9 @@
   - [x] Three new grace-phase tests (Lean theorem mapping)
   - [x] Update retained-reconnect + idle-reset for grace semantics
   - [x] typecheck + lint + 118/118 unit green
-- [ ] Independent semantic round-trip review of the Lean file — BLOCKED: subagent model resolver appends thinking suffix (`:high`/`:max`) to the model id before registry lookup, so every grok-4.6 / glm-5.3-flash / kimi variant resolves to a non-existent id and is exclusion-cached until 2026-09-11; `pi -ne` CLI model registry is inconsistent with `--list-models`; claude binary missing. Needs owner: fix resolver or point to a working model/auth.
-- [ ] Optional: 5s idle-side heartbeat to settle grace with zero events (deferred; settle-on-next-observation already correct)
+- [x] Independent semantic round-trip review of the Lean file — originally blocked on the subagent model resolver. Closed 2026-10-09: two independent fresh-context Lean readings (hash-pinned, file-only) covered `docs/programming-thinking/reflect-activity-state-machine.idea.lean` as later extended by `simplify-reflection-runtime`; no contradictions; scoping limits (task-clock invariant, monotonic-time assumption, no runtime refinement) recorded in that change's archive.
+- [x] Optional: 5s idle-side heartbeat to settle grace with zero events — dropped, not implemented (closed 2026-10-09). Settle-on-next-observation remains correct, and the activity accounting contract is now `reflection-runtime-accounting`.
+
+## Closure (2026-10-09)
+
+This change predates the spec-driven artifact set and has no delta specs (`skip_specs: true`). Its behavior is specified by the main `reflection-runtime-accounting` capability, synced from the archived `simplify-reflection-runtime` change. Closed and archived with the user's approval.
