@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,7 +38,7 @@ export async function runE2eSuite(
 ) {
 	const patterns = mode === "fast" ? FAST_PATTERNS : ["test/e2e/*.test.mjs"];
 	const temporary = await mkdtemp(
-		path.join("/tmp", "pi-reflect-watchdog-e2e-suite-"),
+		path.join(tmpdir(), "pi-reflect-watchdog-e2e-suite-"),
 	);
 	const artifactDirectory = path.join(temporary, "artifact");
 	try {

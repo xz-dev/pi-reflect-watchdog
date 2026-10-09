@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -57,7 +58,7 @@ export async function createTestResources(
 ) {
 	let cleanup;
 	try {
-		const base = await mkdtemp(path.join("/tmp", prefix));
+		const base = await mkdtemp(path.join(tmpdir(), prefix));
 		cleanup = new CleanupManager();
 		cleanup.add(() => rm(base, { recursive: true, force: true }));
 		if (t) t.after(() => cleanup.run());
