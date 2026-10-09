@@ -79,79 +79,101 @@ This is prompt-level duration guidance, not a new hard timeout. The shared limit
 
 ### Requirement: Reconsideration rather than a prevalidated handoff
 
-A normally completed valid `NO_ISSUE` or `ROUTE_CORRECTION` SHALL produce exactly one ordinary continuation. This behavior SHALL apply to automatic reflection and manual `/reflect`, including manual invocation while the agent is idle. The handoff SHALL return control to ordinary conversation rather than ask for another reflection or result submission.
+A normally completed, non-cancelled valid `NO_ISSUE` or `ROUTE_CORRECTION`, with its result and completion marker durably recorded, SHALL authorize exactly one new plugin-issued ordinary continuation. This behavior SHALL apply to automatic reflection and manual `/reflect`, including manual invocation while the agent is idle. The handoff SHALL return control to ordinary conversation rather than ask for another reflection or result submission. Main-run abort before completion SHALL instead cancel the inquiry without authorizing a new plugin-issued ordinary continuation; a staged valid result SHALL NOT override that cancellation.
+
+An ordinary continuation already submitted to the host before cancellation remains subject to the native-residue limit in `user-takeover-cycle-reset`. Exactly-once handoff refers to plugin submission, not a promise that the host makes exactly one provider request or can retract a submitted wake.
 
 The handoff SHALL return the existing reflection report for assessment in the original conversation, without adding a new instruction to the report body. It SHALL NOT declare the suggested route prevalidated, interpret `NO_ISSUE` as task completion, or require execution of the suggested next step. Report-derived observations and the proposed next step SHALL remain the generated reflection's account, not a claim of verbatim human input; their model-facing role SHALL follow the trigger-specific delivery rule below. Continuing work, waiting for an existing callback, asking a question, and finishing a response SHALL remain decisions of the ordinary agent in the original conversational context.
 
 #### Scenario: Direction is sound but ordinary work remains
 - **GIVEN** ordinary work is incomplete and an automatic reflection finds no direction problem
-- **WHEN** a valid `NO_ISSUE` completes
+- **WHEN** a valid `NO_ISSUE` completes without cancellation
 - **THEN** exactly one ordinary continuation is initiated without another user prompt
 - **AND** the feedback does not claim that the task is complete or require another reflection
 
 #### Scenario: A valid reflection proposes a different direction
-- **WHEN** a valid `ROUTE_CORRECTION` completes
+- **WHEN** a valid `ROUTE_CORRECTION` completes without cancellation
 - **THEN** exactly one ordinary continuation receives the reflection as a perspective to assess
 - **AND** its handoff does not instruct the agent to follow a route on the premise that the plugin has already established it as correct
 
 #### Scenario: Manual reflection begins while idle
 - **GIVEN** the user invokes `/reflect` while the ordinary agent is idle
-- **WHEN** the reflection completes with either valid result type
+- **WHEN** the reflection completes normally with either valid result type
 - **THEN** exactly one ordinary continuation is initiated without requiring another user message
 - **AND** the unchanged report is delivered with the `user` role
 - **AND** there is no special no-continuation exception for idle manual reflection
 
 #### Scenario: Manual reflection interrupts ongoing work
 - **GIVEN** the user invokes `/reflect` during ongoing ordinary work
-- **WHEN** the reflection completes with either valid result type
+- **WHEN** the reflection completes normally with either valid result type
 - **THEN** exactly one ordinary continuation returns to the original conversation
 - **AND** the unchanged report is delivered with the `user` role
 - **AND** the handoff does not substitute the reflection's suggested goal for the user's contextual request
 
 #### Scenario: Waiting is still an appropriate response
 - **GIVEN** ordinary work is waiting for an existing background callback
-- **WHEN** a valid reflection completes
+- **WHEN** a valid reflection completes normally
 - **THEN** the ordinary continuation is initiated once
 - **AND** the handoff does not direct the agent to poll, restart background work, or execute a suggestion merely because control was returned
+
+#### Scenario: User stops reflection before handoff
+- **GIVEN** an automatic or manual reflection is still running or has only staged a result
+- **WHEN** a main-run abort cancels it before completion
+- **THEN** neither result type authorizes a new plugin-issued ordinary continuation
+- **AND** the cancelled result is not delivered as completed feedback on later user re-entry
 
 ### Requirement: Existing lifecycle and compatibility remain intact
 
 The reflection result function SHALL retain the five unique non-empty string fields `type`, `reason`, `done`, `current_step`, and `next_step`, with only `NO_ISSUE` and `ROUTE_CORRECTION` as result types. Existing stored reports SHALL remain readable without migration. The history locator SHALL NOT be added to the stored report or completion-hook payload. Free-text report fields SHALL NOT become completion-state selectors.
 
-Inquiry folding, retry accounting, internal counter exclusions, automatic thresholds, cooldown, cross-process coordination, and completion-hook timing and values SHALL retain their existing contracts, except that a confirmed user takeover SHALL reset the full automatic-threshold activity cycle before further threshold evaluation. Reflection prompts, function calls, and tool results SHALL be folded from subsequent ordinary model requests after finalization. The ordinary continuation for either valid result SHALL count as ordinary work, not another internal inquiry. The change SHALL NOT introduce new configuration options, a task-completion decision type, or a second inquiry lifecycle. Model-facing source projection SHALL NOT change which underlying turns count as ordinary work.
+Inquiry folding, bounded result correction, host-owned provider retry handling, ordinary-loop inquiry exclusions, threshold values, cooldown, cross-process ownership safeguards, and completion-hook timing and values SHALL retain their existing contracts. Time accounting SHALL instead follow official aggregate working state, including inquiry activity; automatic decisions SHALL occur only at new valid ordinary turn completions when no abort hold applies, with no latched automatic request. User-message and navigation resets SHALL follow `user-takeover-cycle-reset`. True main abort SHALL retain full-cycle reset, revoked inquiry authority, cancelled unsubmitted work, and the hold released only by fresh explicit interactive/RPC input or a new `/reflect`. This hold SHALL not pause observation of otherwise working children.
+
+Reflection prompts, correction prompts, function calls, and tool results SHALL be folded from subsequent ordinary model requests after normal finalization or cancellation of the exact owned inquiry. Cancelled material SHALL NOT be presented as a live reflection. Folding SHALL NOT erase historical sessions or lose, duplicate, or reorder unrelated user text, images, or extension messages, and SHALL NOT be described as eliminating a native queue slot's request effect.
+
+Only a non-cancelled, valid reflection whose result and completion marker have been durably recorded SHALL authorize a new plugin-issued ordinary continuation. Valid parameters or a staged submission alone SHALL NOT suffice. That ordinary continuation SHALL count as ordinary work, not another internal inquiry. Already durably completed reports and already published hooks SHALL remain historical effects; later abort SHALL neither roll them back nor publish them again. Re-entry source filtering, reset-before-release, and rejection of old events that would pollute a fresh inquiry or budget SHALL follow the coordinated `user-takeover-cycle-reset` and `reflection-response-contract` requirements.
+
+No task-completion decision type, second inquiry lifecycle, or new user configuration option SHALL be introduced. Model-facing source projection SHALL NOT change which underlying replies qualify as ordinary loops.
 
 #### Scenario: Completion and subsequent reflection
-- **WHEN** a valid reflection is completed and another reflection occurs later
-- **THEN** the original inquiry is folded, the report remains available under the existing storage contract, and the completion hook retains its existing payload shape
-- **AND** the next reflection can use the report with its historical-analysis label without requiring a new report version
+- **WHEN** a non-cancelled valid reflection is durably completed and another reflection occurs later
+- **THEN** the inquiry is folded, the report remains available under the existing storage contract, and the completion hook retains its payload shape
+- **AND** the next reflection can use the report with its historical-analysis label without a new report version
 
 #### Scenario: No-issue completion does not retrigger reflection during cooldown
-- **GIVEN** an automatic threshold was latched while a reflection was running
-- **WHEN** a valid `NO_ISSUE` completes
+- **GIVEN** thresholds were reached while an inquiry was outstanding
+- **WHEN** a non-cancelled valid `NO_ISSUE` is durably completed
 - **THEN** one ordinary continuation is initiated
-- **AND** the existing cooldown still prevents the latched automatic reflection from immediately redispatching
+- **AND** no stored threshold decision is redispatched by finalization
+- **AND** a subsequent valid ordinary completion evaluates current counters under the existing cooldown
 
 #### Scenario: Repeated finalization does not duplicate the handoff
-- **GIVEN** a valid reflection has already been finalized
-- **WHEN** another settled event occurs without a new reflection result
-- **THEN** no second continuation is created for that result
-- **AND** completion recording and completion-hook publication are not repeated
+- **GIVEN** a non-cancelled valid reflection has already been durably finalized
+- **WHEN** another settled event occurs without a new result
+- **THEN** no second continuation, completion record, or hook is created for that result
 
 #### Scenario: No issue or invalid XML
-- **WHEN** a reflection submits `NO_ISSUE` through the result function or supplies legacy XML text instead of calling it
-- **THEN** a valid `NO_ISSUE` initiates exactly one ordinary continuation, while the XML text follows the bounded invalid-response retry path without an ordinary continuation
-- **AND** retries retain at most three total attempts and one shared ten-lookup-call budget, rather than obtaining a fresh budget
+- **WHEN** a non-aborted reflection submits valid `NO_ISSUE` through the result function or supplies legacy XML instead of calling it
+- **THEN** a non-cancelled valid result authorizes exactly one new ordinary continuation only after durable completion, while XML follows bounded correction without an ordinary continuation
+- **AND** correction retains at most three total attempts and one shared ten-lookup-call budget
 
 #### Scenario: A run ends without a valid decision
-- **WHEN** result validation exhausts or a settled inquiry has no captured decision and is cancelled
-- **THEN** this change does not add an ordinary continuation or completion hook for that path
-- **AND** existing warnings and cleanup behavior remain intact
+- **WHEN** validation exhausts or an inquiry authoritatively ends without a valid decision
+- **THEN** no new plugin-issued ordinary continuation or completion hook is authorized for that path
+- **AND** non-aborted validation failure retains its bounded warning and cleanup behavior
+- **AND** native abort is cancellation without an invalid-response warning or reask, with exact-owned context cleanup preserved
 
 #### Scenario: User takeover restarts threshold accounting
-- **GIVEN** automatic thresholds were approaching or already crossed in the interrupted cycle
-- **WHEN** the user sends a real ordinary message or aborts the terminal assistant
-- **THEN** the full activity cycle is reset before automatic thresholds are evaluated again
-- **AND** the interrupted cycle's counters cannot trigger the next automatic reflection
+- **GIVEN** thresholds were approaching or crossed in the current cycle
+- **WHEN** a real ordinary user message begins
+- **THEN** the full cycle resets before the next automatic evaluation
+- **AND** that reset does not claim to retract an inquiry already accepted by native steering
+
+#### Scenario: Native residual work cannot revive a cancelled reflection
+- **GIVEN** native steering accepted an inquiry, correction, or continuation before a true main abort revoked its inquiry authority
+- **WHEN** a residual native slot later causes ordinary work after re-entry
+- **THEN** this does not restore the old inquiry's authority or authorize a new plugin-issued continuation, correction, result, or completion hook
+- **AND** an already-submitted continuation or wake remains subject to native residual request effects rather than a zero-extra-request guarantee
+- **AND** no promise of retracting that slot or eliminating its ordinary request, cost, or ordinary tool effects is made
 
 ### Requirement: Reflection feedback uses trigger-specific model-facing roles
 

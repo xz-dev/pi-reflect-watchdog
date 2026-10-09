@@ -18,20 +18,26 @@ The default reflection perspective SHALL direct its speaking-style guidance to t
 
 ### Requirement: Reask prompt states the same response shape
 
-A reask after an invalid reflection response SHALL require a call to `ref` with the same five non-empty string fields and valid result type, rather than XML or a text reply. Initial and correction attempts SHALL share at most three total attempts and one ten-lookup-call budget. Submitting a result SHALL NOT consume the lookup budget. Plugin-generated correction instructions and errors SHALL be in English.
+A reask after a non-aborted invalid reflection response SHALL require a call to `ref` with the same five non-empty string fields and valid result type, rather than XML or a text reply. Initial and correction attempts SHALL share at most three total attempts and one ten-lookup-call budget. Submitting a result SHALL NOT consume the lookup budget. Plugin-generated correction instructions and errors SHALL be in English.
+
+Cancellation SHALL take precedence over correction. An aborted response, including partial or malformed result arguments, SHALL NOT cause a new plugin-issued correction prompt, an invalid-response retry warning, or a new plugin-issued ordinary continuation. A cancelled attempt's late validation or tool result SHALL NOT consume another attempt or a fresh inquiry's budget. A correction already accepted by the host before cancellation may retain ordinary request effects under the native-residue limit in `user-takeover-cycle-reset`; those effects SHALL NOT restore reflection authority or budgets.
 
 #### Scenario: Reask wording matches the initial contract
-
-- **WHEN** a correction prompt is rendered
+- **WHEN** a correction prompt is rendered for a non-cancelled inquiry
 - **THEN** it requires a call to `ref` alone with `type`, `reason`, `done`, `current_step`, and `next_step`, with type `NO_ISSUE` or `ROUTE_CORRECTION`
 - **AND** it repeats the shared tool-call budget constraint
 
 #### Scenario: Invalid arguments are corrected
-
-- **GIVEN** a confirmed reflection submits an invalid result object
-- **WHEN** the invalid attempt settles and fewer than three attempts have been used
+- **GIVEN** a confirmed non-cancelled reflection submits an invalid result object
+- **WHEN** the invalid attempt settles without abort and fewer than three attempts have been used
 - **THEN** the plugin issues a correlated correction prompt without an ordinary continuation or completion hook
 - **AND** exhausted validation ends through the existing failure cleanup path without granting a new lookup budget
+
+#### Scenario: Aborted partial result is not corrected
+- **GIVEN** an initial or correction response contains no result call or incomplete invalid arguments
+- **WHEN** the response ends as aborted
+- **THEN** the inquiry is cancelled without requesting another response or warning that the user-caused truncation needs correction
+- **AND** the authoritative aborted outcome is preserved
 
 ### Requirement: Provider failures stay outside result correction
 
@@ -75,33 +81,37 @@ The plugin SHALL register `ref` with description exactly `don't use unless ask`.
 
 ### Requirement: Result execution requires confirmed reflection
 
-The function SHALL reject execution unless the current main attachment owns an active reflection whose prompt has been consumed and confirmed for the current attempt. A queued or provisional inquiry alone SHALL NOT authorize execution, and structural validity SHALL never establish that authority. Outside that state, a schema-admissible call SHALL fail with exactly `This function is reserved for the plugin. Please try another function.` without disclosing result fields; a call that fails native schema validation MAY instead receive the host's native validation error. Neither kind of rejected call SHALL record a reflection result, count a reflection attempt, publish a completion hook, trigger a reflection continuation, or terminate unrelated ordinary work.
+The function SHALL reject execution unless the current main attachment owns an active, non-cancelled reflection whose prompt has been consumed and confirmed for the current attempt. A queued or provisional inquiry alone SHALL NOT authorize execution, and structural validity SHALL never establish that authority. Outside that state, a schema-admissible call SHALL fail with exactly `This function is reserved for the plugin. Please try another function.` without disclosing result fields; a schema-invalid call can instead receive the host's native validation error before plugin execution. Neither rejection SHALL record a reflection result, count a reflection attempt, publish a completion hook, trigger a reflection continuation, or terminate unrelated ordinary work.
+
+Abort SHALL revoke the cancelled inquiry's submission and finalization authority. A valid staged submission SHALL NOT bypass cancellation, and a later explicit user action SHALL NOT authorize a call correlated with a cancelled inquiry. This requirement changes runtime authority, not the function declaration or accepted argument format.
 
 #### Scenario: Ordinary or provisional call is rejected
-
 - **GIVEN** no reflection is confirmed, including a native-queued inquiry whose prompt has not yet been consumed
 - **WHEN** the function is called with schema-admissible arguments
 - **THEN** it fails with the English reserved-function error
 - **AND** it does not validate or describe the result fields
 
 #### Scenario: Ordinary malformed call stays inert
-
 - **GIVEN** no reflection is confirmed
 - **WHEN** ordinary work calls the function with arguments that fail the declared schema
-- **THEN** the host may return its native validation error before plugin execution
+- **THEN** native validation can reject the call before plugin execution
 - **AND** no reflection attempt, result, completion hook, or continuation is created, and ordinary work can continue
 
 #### Scenario: Confirmed current attempt accepts submission
-
-- **GIVEN** the current main attachment has consumed the active reflection prompt for the current attempt
+- **GIVEN** the current main attachment has consumed the active, non-cancelled reflection prompt for the current attempt
 - **WHEN** `ref` receives valid result arguments
-- **THEN** the result is accepted for the existing reflection finalization flow
+- **THEN** the result is accepted for normal finalization unless that inquiry is cancelled before completion
 
 #### Scenario: Execution is disabled again after reflection
-
-- **WHEN** the function is called after reflection finishes, ownership is lost, or the attachment shuts down
+- **WHEN** the function is called after reflection finishes, is cancelled, loses ownership, or shuts down
 - **THEN** it fails with the reserved-function error or, for schema-invalid arguments, the native validation error
-- **AND** the minimal declaration is not expanded to explain its use
+- **AND** the declaration is not expanded to explain its use
+
+#### Scenario: Late cancelled submission cannot act in a new inquiry
+- **GIVEN** the user cancelled one reflection and subsequently requested a fresh one
+- **WHEN** a result call from the cancelled inquiry reaches the plugin
+- **THEN** it is rejected without staging or completing a result for either inquiry
+- **AND** it does not change the fresh inquiry's attempt or lookup budget
 
 ### Requirement: Reflection prompts teach function submission
 
@@ -150,24 +160,43 @@ Before native schema validation, compatible arguments SHALL be normalized to the
 
 ### Requirement: Invalid owned submissions stay in the bounded correction flow
 
-When an assistant response captured for the current confirmed reflection attempt contains a `ref` call whose normalized arguments fail the result data contract, the plugin SHALL record that attempt as invalid with a safe validator error and SHALL prevent the response's calls from reaching native dispatch, so the host does not issue a schema-error follow-up request outside the reflection's attempt accounting. The response SHALL end the attempt normally; it SHALL NOT be treated as a cancelled reflection. Settlement SHALL then follow the existing correction flow: a correlated correction prompt while fewer than three attempts have been used, otherwise the existing failure cleanup. Each such response SHALL count as exactly one invalid attempt, SHALL NOT consume lookup budget for its suppressed calls, and SHALL fold out of later context like any other reflection attempt. Diagnostics SHALL NOT echo raw invalid argument values.
+When a non-aborted assistant response captured for the current confirmed reflection attempt contains a `ref` call whose normalized arguments fail the result data contract, the plugin SHALL record that attempt as invalid with a safe validator error and SHALL prevent the response's calls from reaching native dispatch, so the host does not issue a schema-error follow-up request outside reflection attempt accounting. The response SHALL end the attempt normally; it SHALL NOT be treated as a cancelled reflection. Settlement SHALL follow the existing correction flow: a correlated correction prompt while fewer than three attempts have been used, otherwise existing failure cleanup. Each such response SHALL count as exactly one invalid attempt, SHALL NOT consume lookup budget for its suppressed calls, and SHALL fold out of later context like any other reflection attempt. Diagnostics SHALL NOT echo raw invalid argument values. An aborted outcome SHALL take precedence over this invalid-result path under the coordinated native-abort contract.
 
 #### Scenario: Missing field is corrected inside the reflection
-
-- **GIVEN** a confirmed reflection attempt
+- **GIVEN** a non-aborted confirmed reflection attempt
 - **WHEN** the model calls `ref` without `next_step`
 - **THEN** no native validation follow-up request is sent for that response
 - **AND** the attempt is counted once as invalid, a warning is shown, and a correlated correction prompt is issued
 
 #### Scenario: Valid correction after a schema-invalid attempt
-
-- **GIVEN** the previous attempt submitted an invalid `type`
+- **GIVEN** the previous non-aborted attempt submitted an invalid `type`
 - **WHEN** the correction attempt submits valid arguments
 - **THEN** the result is accepted once and finalized through the existing continuation and completion flow
-- **AND** excluding host-owned provider retries, the total provider requests equal the reflection attempts used
+- **AND** excluding host-owned provider retries, total provider requests equal the reflection attempts used
 
 #### Scenario: Three schema-invalid attempts
+- **WHEN** three consecutive non-aborted confirmed attempts submit schema-invalid arguments
+- **THEN** reflection ends through failure cleanup after the third attempt
+- **AND** no fourth provider request, result entry, completion hook, or ordinary continuation is created
 
-- **WHEN** three consecutive confirmed attempts each submit schema-invalid arguments
-- **THEN** the reflection ends through the existing failure cleanup after the third attempt
-- **AND** no fourth provider request, result entry, completion hook, or continuation is created
+### Requirement: Abort outcome takes precedence over response validation
+
+The invalid-response correction contracts, including legacy text/XML rejection and schema-invalid owned submissions, SHALL apply only to non-aborted, non-cancelled attempts. A canonical aborted outcome SHALL take precedence over any response content or pending validation error. The plugin SHALL NOT rewrite an aborted owned response into a normal stop in order to apply correction accounting, dispatch its partial calls, or publish its staged result.
+
+#### Scenario: Aborted response contains schema-invalid arguments
+- **GIVEN** an owned response contains a `ref` call whose arguments fail the structural contract
+- **WHEN** that response has the authoritative aborted outcome
+- **THEN** cancellation wins over the schema-invalid correction flow
+- **AND** no new plugin correction, completed result, completion hook, or ordinary continuation is authorized by that output
+- **AND** already-accepted host work remains subject to the native-residue limit rather than a native-retraction guarantee
+
+#### Scenario: Invalid response is not aborted
+- **GIVEN** an owned response contains invalid result arguments and is not cancelled
+- **WHEN** it settles without an aborted outcome
+- **THEN** the existing bounded invalid-response correction contract remains in force
+
+#### Scenario: Queued correction cannot revive cancelled authority
+- **GIVEN** a correction was accepted by native steering before a main abort cancelled its inquiry
+- **WHEN** its residual native slot later causes an ordinary provider request
+- **THEN** the old result is not accepted and no new plugin retry is authorized
+- **AND** neither the fresh inquiry's attempt budget nor its lookup budget is changed
