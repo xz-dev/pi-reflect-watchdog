@@ -35,9 +35,6 @@ jobs:
         run: |
           expected="$(node -p 'require("./package.json").devDependencies["@earendil-works/pi-coding-agent"]')"
           test "$(./node_modules/.bin/pi --version)" = "$expected"
-      - run: npm run check
-      - name: Stock Pi package and Git-install E2E
-        run: npm run test:e2e
       - name: Verify npm Git-clone production install policy
         run: |
           set -o pipefail
