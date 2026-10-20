@@ -59,6 +59,88 @@ Background execution and result delivery SHALL use supported stock Pi interfaces
 - **WHEN** authenticated versioned child accounting updates counters
 - **THEN** it does not become result submission or authorize background feedback by itself
 
+### Requirement: Reflection inquiries remain serialized
+
+The plugin SHALL keep at most one current plugin-owned private inquiry outstanding, from background admission through execution, result correction and exact-child cancellation drain. A manual request received while an inquiry is outstanding SHALL remain in the existing bounded plugin queue, preserving its supplement and manual origin. After normal non-cancelled finalization, if the attachment is still current main, the waiting request SHALL be admitted exactly once without imposing an additional ordinary-agent settlement barrier. Admission SHALL create no native inquiry slot. Existing normal completion evidence and continuation ordering SHALL remain intact.
+
+A confirmed main-run abort SHALL cancel the outstanding inquiry's authority and discard every manual request still in plugin custody. Neither cancellation cleanup nor a later explicit re-entry SHALL dispatch those discarded requests. Teardown SHALL also discard plugin-pending requests. A new user-invoked `/reflect` after abort SHALL begin fresh manual work and release post-abort inhibition under `user-takeover-cycle-reset`; it SHALL NOT revive an earlier request. Any successful feedback already submitted to the host, or legacy native inquiry queued before private execution replaced that transport, remains subject to the native-residue limit in `user-takeover-cycle-reset`; neither grants new private-inquiry authority.
+
+#### Scenario: Manual request waits behind a submitted inquiry
+- **GIVEN** a private reflection inquiry has been admitted but has not yet settled
+- **WHEN** the user invokes `/reflect inspect the latest correction`
+- **THEN** no overlapping inquiry is submitted
+- **AND** one plugin-pending request preserves that supplement and manual origin
+- **AND** after normal non-cancelled finalization, the waiting request is submitted once even if ordinary continuation work is busy
+
+#### Scenario: Repeated settlement cannot duplicate submission
+- **GIVEN** a manual request has already been submitted
+- **WHEN** repeated settlement observations arrive
+- **THEN** they do not submit the same request again
+
+#### Scenario: Abort discards a queued manual request
+- **GIVEN** one reflection is outstanding and `/reflect check the old approach` is plugin-pending
+- **WHEN** a main-run abort is confirmed
+- **THEN** both the outstanding reflection authority and the waiting request are cancelled
+- **AND** no new plugin-issued correction, continuation, or queued-manual dispatch follows from that cancelled work
+
+#### Scenario: New manual request after stop is independent
+- **GIVEN** an earlier manual request was discarded by abort
+- **WHEN** the user invokes `/reflect check the new approach`
+- **THEN** exactly one new manual inquiry uses `check the new approach`
+- **AND** the old request is neither merged nor replayed
+
+### Requirement: Visible queued state
+
+While a manual reflection is pending in the plugin behind an outstanding inquiry, the plugin's below-editor status bar row SHALL show that the request is queued and how to cancel it, naming the effective configured cancel shortcut key (or the `/cancel-reflect` command when the shortcut is disabled). The row SHALL render the key from effective merged configuration, never a hardcoded default. The indication SHALL clear when the request is submitted, cancelled, or discarded by main-run abort or session teardown. A request already admitted to private execution SHALL NOT be presented as plugin-pending or withdrawable through `/cancel-reflect`, even before its first model request. Exact-child cancellation and abort-driven authority invalidation are separate from that command's pending-only withdrawal window. Neither SHALL imply that already-submitted successful feedback or legacy native slots can be retracted.
+
+#### Scenario: Pending request is shown
+- **GIVEN** a reflection inquiry is already outstanding
+- **WHEN** the user invokes `/reflect`
+- **THEN** the status bar row reports the waiting manual request as queued and names the effective cancel key or command
+
+#### Scenario: Status cleared on dispatch
+- **GIVEN** a plugin-pending reflection with visible status
+- **WHEN** the request is submitted, cancelled, or discarded by main-run abort or teardown
+- **THEN** the queued indication is removed
+
+#### Scenario: Native-queued inquiry is not advertised as cancellable
+- **GIVEN** a legacy native inquiry was queued before the private-execution cutover and ordinary work is busy
+- **WHEN** the plugin reports pending-withdrawal controls
+- **THEN** neither the status row nor the command notification advertises a `/cancel-reflect` withdrawal window for that legacy native work
+
+### Requirement: Withdrawal before dispatch
+
+The user SHALL be able to cancel a manual reflection still pending in the plugin before private-inquiry admission, through both a keyboard shortcut and a `/cancel-reflect` command. Cancelling SHALL remove only that pending request and SHALL NOT withdraw an already-admitted inquiry, abort or alter an active reflection, interrupt the ordinary agent run, or alter unrelated plugin state. Cancelling when nothing is plugin-pending SHALL produce a clear no-op notification. Private admission, not the first model request or native queue submission, SHALL close this pending-only withdrawal window. Already-submitted successful feedback and legacy native work SHALL retain their native-residue limits.
+
+#### Scenario: Cancel a queued request
+
+- **GIVEN** a manual reflection is plugin-pending behind an outstanding inquiry
+- **WHEN** the user presses the cancel shortcut or runs `/cancel-reflect`
+- **THEN** only the pending request is discarded
+- **AND** no inquiry is ever submitted for that cancelled request
+- **AND** the outstanding inquiry is unaffected and the user receives confirmation of the cancellation
+
+#### Scenario: Cancel does not touch an active reflection
+
+- **GIVEN** a private reflection is already admitted, whether or not its first model request has started, and no manual request is plugin-pending
+- **WHEN** the user invokes the cancel gesture
+- **THEN** the active reflection continues unaffected
+- **AND** the user is notified there was nothing queued to cancel
+
+#### Scenario: Cancel cannot retract a native-queued inquiry
+
+- **GIVEN** a legacy native inquiry was queued before the private-execution cutover, and no manual request is plugin-pending
+- **WHEN** the user invokes the cancel gesture
+- **THEN** the submitted inquiry remains unaffected
+- **AND** the ordinary run is not interrupted
+- **AND** the user receives the no-op notification
+
+#### Scenario: Cancel with empty queue
+
+- **GIVEN** no manual reflection is plugin-pending
+- **WHEN** the user invokes the cancel gesture
+- **THEN** nothing changes and the user is notified there is nothing to cancel
+
 ## REMOVED Requirements
 
 ### Requirement: Manual reflections use immediate native steering

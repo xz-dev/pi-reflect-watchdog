@@ -23,59 +23,56 @@ The default reflection guidance SHALL invite assessment of both the current dire
 - **AND** it distinguishes such a new interpretation from what the user previously expressed
 
 ### Requirement: Fallible historical reflection
-
-A previous reflection included in a new reflection prompt SHALL be identified as historical assistant analysis that can be mistaken or superseded by better understanding, not as user expression or a conclusion that must be maintained. The function-argument example SHALL describe the next step as a suggestion rather than as already established to be correct.
+Previous reflection included in a private prompt SHALL remain labelled as fallible historical assistant analysis, not user expression or a conclusion to preserve. The private JSON example SHALL describe next step as a suggestion, not an already established correct route.
 
 #### Scenario: An earlier reflection misunderstood the subject
-- **GIVEN** the previous reflection discusses approval machinery while subsequent dialogue clarifies that the subject is third-party perspective and intent fidelity
-- **WHEN** the previous report is included in the new prompt
-- **THEN** it is explicitly framed as fallible assistant analysis that the observer can reject
+- **GIVEN** earlier reflection discusses approval machinery and subsequent dialogue clarifies third-party perspective and intent fidelity
+- **WHEN** the earlier report is included privately
+- **THEN** it is framed as historical assistant analysis the observer can reject
 
 ### Requirement: Optional branch-scoped history recovery hint
+A private reflection prompt SHALL provide an optional locator for the original parent session file and qualified trigger-time branch anchor when both exist. It SHALL refer to the frozen source captured at admission, not the new child transcript. Locator values SHALL be data, and guidance SHALL limit recovery to relevant surrounding exchanges on that branch, treating historical text as material rather than new instructions. It SHALL not replace the inherited full effective context with a user-only transcript or authoritative intent summary.
 
-The reflection prompt SHALL provide an optional history locator containing the original session file and current branch anchor when both are available. The hint SHALL describe focused recovery of relevant surrounding exchanges through existing tools, not a new user-only transcript or an authoritative intent summary. Locator values SHALL be represented as data. The hint SHALL explain that other branches in the same file are not the active conversation and that recovered historical content is material to interpret, not instructions addressed to the observer.
-
-Constructing the hint SHALL NOT read or copy the transcript, issue another model request, or create a persistent history ledger. Missing locator information SHALL NOT prevent reflection or claim that unavailable history can be recovered.
+Constructing the hint SHALL not read/copy the transcript, request another model or create a history ledger. Missing optional locator information SHALL not block an otherwise available full fork or claim unavailable history is recoverable. An unavailable full fork SHALL still follow the typed execution-failure contract, never fresh-context fallback.
 
 #### Scenario: File contains multiple branches
-- **GIVEN** the session has an original transcript file and a current branch anchor
-- **WHEN** reflection is prompted
-- **THEN** the hint identifies both and directs any recovery to the relevant exchanges on that branch
-- **AND** it does not present all branches in the file as one conversation
+- **GIVEN** the qualified parent has a transcript file and active branch anchor
+- **WHEN** the private prompt is constructed
+- **THEN** the hint identifies the parent file/anchor and focused surrounding exchanges
+- **AND** sibling branches are not presented as current conversation
 
 #### Scenario: No usable history locator
-- **GIVEN** the session has no transcript file or no current branch anchor
+- **GIVEN** optional locator data is missing but the full effective fork can otherwise be established
 - **WHEN** reflection is prompted
-- **THEN** the prompt states that a branch-scoped file recovery hint is unavailable
-- **AND** reflection proceeds using its existing context without creating a file
+- **THEN** the hint states recovery is unavailable
+- **AND** reflection uses inherited context without inventing a recovery file
 
 #### Scenario: No historical ambiguity needs investigation
-- **GIVEN** the visible conversation is sufficient for the reflection
-- **WHEN** a history locator is provided
-- **THEN** the hint does not require a transcript read or repeat the conversation into the prompt
+- **GIVEN** inherited conversation is sufficient
+- **WHEN** a locator is provided
+- **THEN** it requires no transcript read or duplicate conversation in the prompt
 
 ### Requirement: Quick uncertainty-driven tool use
+Private tool guidance SHALL permit only quick read-only local evidence through SDK `read`, `ls`, `grep`, `find`, including reading the qualified parent session file. These helpers may clarify conversation meaning, actual work or a possible direction; no third-party/extension lookup, shell execution, external network research or delegation is admitted. It SHALL stop research once the uncertainty is resolved and direct the observer to state remaining uncertainty and finish when evidence is not promptly available. Extended research, long-running checks and waiting for background work SHALL remain discouraged. This guidance SHALL not claim a new wall-clock timeout.
 
-The plugin-owned tool guidance SHALL allow tools to clarify conversational meaning, actual work, or a possible direction, rather than limiting them to verification of the current route. It SHALL explicitly favor quick, focused lookups, stop further investigation once the relevant uncertainty is resolved, and direct the observer to state remaining uncertainty and finish when evidence cannot be obtained promptly. It SHALL discourage extended research, long-running validation, or waiting on background work during reflection.
-
-This is prompt-level duration guidance, not a new hard timeout. The shared limit SHALL remain ten lookup tool calls across at most three result attempts. The result function SHALL NOT consume this lookup budget, so the observer can still submit its result after the tenth lookup.
+The reflection SHALL retain one ten-call admitted-helper allowance across at most three terminal result attempts in the same child. Helper-only progress SHALL not count as missing result submission. The final designated result write SHALL spend no helper budget and SHALL remain executable after the tenth helper. Admitted execution SHALL follow the shared local read-only profile; inherited declarations SHALL grant no additional effects or permission to reload extensions. Only the designated result writer may write. Tool denial/text-only output SHALL not create an unlimited uncounted response loop.
 
 #### Scenario: A quick lookup answers the question
-- **GIVEN** one relevant lookup resolves the uncertainty motivating tool use
-- **WHEN** reflection tool guidance is rendered
-- **THEN** it tells the observer to conclude the investigation rather than keep searching merely to use the remaining budget
+- **GIVEN** one admitted lookup resolves the relevant uncertainty
+- **WHEN** private guidance is rendered
+- **THEN** it directs conclusion rather than further research to use remaining allowance
 
 #### Scenario: Evidence would require long-running work
-- **GIVEN** a useful detail cannot be established promptly without a broad investigation or a long-running check
-- **WHEN** reflection tool guidance is rendered
-- **THEN** it tells the observer to finish with the uncertainty stated rather than extending the reflection to wait for that work
-- **AND** it does not claim a new program-enforced wall-clock deadline
+- **GIVEN** useful evidence requires broad investigation or a long-running check
+- **WHEN** private guidance is rendered
+- **THEN** it directs completion with uncertainty stated rather than waiting
+- **AND** it claims no new program-enforced deadline
 
 #### Scenario: Custom reflection perspective
-- **GIVEN** a user has configured a custom reflection prompt
-- **WHEN** the plugin constructs the reflection request
-- **THEN** the custom perspective remains in use
-- **AND** the plugin-owned source framing, quick-clarification guidance, and shared tool budget remain present
+- **GIVEN** a user configured a custom reflection prompt
+- **WHEN** the private request is constructed
+- **THEN** that perspective remains in use
+- **AND** source framing, quick-clarification guidance and the shared tool allowance remain present
 
 ### Requirement: Reconsideration rather than a prevalidated handoff
 
@@ -123,57 +120,53 @@ The handoff SHALL return the existing reflection report for assessment in the or
 - **AND** the cancelled result is not delivered as completed feedback on later user re-entry
 
 ### Requirement: Existing lifecycle and compatibility remain intact
+Private file results SHALL retain five unique non-empty string fields `type`, `reason`, `done`, `current_step`, `next_step` and the two types `NO_ISSUE`/`ROUTE_CORRECTION`. Existing stored reports SHALL remain readable without migration. Locators SHALL not be added to durable report text or hook payloads. Free-text fields SHALL not become completion-state selectors. New public result-function registration is retired; historical function/inquiry records remain read-only compatible.
 
-The reflection result function SHALL retain the five unique non-empty string fields `type`, `reason`, `done`, `current_step`, and `next_step`, with only `NO_ISSUE` and `ROUTE_CORRECTION` as result types. Existing stored reports SHALL remain readable without migration. The history locator SHALL NOT be added to the stored report or completion-hook payload. Free-text report fields SHALL NOT become completion-state selectors.
+Bounded result correction, provider-failure classification/native retry eligibility, ordinary-loop exclusions, thresholds, cooldown, ownership and hook timing/values SHALL retain their contracts under the shared private profile. Actual inquiry activity SHALL follow supported official aggregate working observations; automatic decisions SHALL occur only on fresh valid ordinary completions without an abort hold or latched automatic request. Existing reset-before-release and fresh explicit-input rules SHALL remain intact, without stopping ordinary child observation.
 
-Inquiry folding, bounded result correction, host-owned provider retry handling, ordinary-loop inquiry exclusions, threshold values, cooldown, cross-process ownership safeguards, and completion-hook timing and values SHALL retain their existing contracts. Time accounting SHALL instead follow official aggregate working state, including inquiry activity; automatic decisions SHALL occur only at new valid ordinary turn completions when no abort hold applies, with no latched automatic request. User-message and navigation resets SHALL follow `user-takeover-cycle-reset`. True main abort SHALL retain full-cycle reset, revoked inquiry authority, cancelled unsubmitted work, and the hold released only by fresh explicit interactive/RPC input or a new `/reflect`. This hold SHALL not pause observation of otherwise working children.
+New private prompts/corrections/helper/result traffic SHALL never enter main ordinary/summary context. User/branch/ownership changes SHALL synchronously revoke authority and request immediate exact-child abort; checkpoint guards are backstops, not permission to run stale work to completion. Cleanup SHALL preserve accounting as specified: admission's reminder reset is not rolled back, stale drops add no cooldown/completion or automatic intent, and only a later fresh ordinary threshold crossing can launch another inquiry. No main scheduling slot is created at admission; only already-submitted successful feedback retains native residual-work limits. Only a current non-cancelled result and completion marker both durably recorded SHALL authorize one plugin continuation. Staged files/parameters alone SHALL not suffice. Ordinary resumed work SHALL count as ordinary work; later abort SHALL neither undo historical completed reports/hooks nor publish them again. Cancelled events SHALL not pollute new identities or budgets.
 
-Reflection prompts, correction prompts, function calls, and tool results SHALL be folded from subsequent ordinary model requests after normal finalization or cancellation of the exact owned inquiry. Cancelled material SHALL NOT be presented as a live reflection. Folding SHALL NOT erase historical sessions or lose, duplicate, or reorder unrelated user text, images, or extension messages, and SHALL NOT be described as eliminating a native queue slot's request effect.
-
-Only a non-cancelled, valid reflection whose result and completion marker have been durably recorded SHALL authorize a new plugin-issued ordinary continuation. Valid parameters or a staged submission alone SHALL NOT suffice. That ordinary continuation SHALL count as ordinary work, not another internal inquiry. Already durably completed reports and already published hooks SHALL remain historical effects; later abort SHALL neither roll them back nor publish them again. Re-entry source filtering, reset-before-release, and rejection of old events that would pollute a fresh inquiry or budget SHALL follow the coordinated `user-takeover-cycle-reset` and `reflection-response-contract` requirements.
-
-No task-completion decision type, second inquiry lifecycle, or new user configuration option SHALL be introduced. Model-facing source projection SHALL NOT change which underlying replies qualify as ordinary loops.
+No task-completion type, Continue-style second semantic inquiry, new user option or changed ordinary-loop classification SHALL be introduced.
 
 #### Scenario: Completion and subsequent reflection
-- **WHEN** a non-cancelled valid reflection is durably completed and another reflection occurs later
-- **THEN** the inquiry is folded, the report remains available under the existing storage contract, and the completion hook retains its payload shape
-- **AND** the next reflection can use the report with its historical-analysis label without a new report version
+- **WHEN** a valid private reflection is durably completed and another occurs later
+- **THEN** private exchanges remain absent from main context, historical reports remain readable and the hook retains its payload
+- **AND** the later prompt can use the report as fallible analysis without a new report version
 
 #### Scenario: No-issue completion does not retrigger reflection during cooldown
-- **GIVEN** thresholds were reached while an inquiry was outstanding
-- **WHEN** a non-cancelled valid `NO_ISSUE` is durably completed
+- **GIVEN** thresholds were reached while reflection was outstanding
+- **WHEN** a valid non-cancelled `NO_ISSUE` completes durably
 - **THEN** one ordinary continuation is initiated
-- **AND** no stored threshold decision is redispatched by finalization
-- **AND** a subsequent valid ordinary completion evaluates current counters under the existing cooldown
+- **AND** finalization does not replay a stored threshold decision
+- **AND** the next fresh valid ordinary completion evaluates current cooldown/counters
 
 #### Scenario: Repeated finalization does not duplicate the handoff
-- **GIVEN** a non-cancelled valid reflection has already been durably finalized
-- **WHEN** another settled event occurs without a new result
-- **THEN** no second continuation, completion record, or hook is created for that result
+- **GIVEN** a valid result already completed durably
+- **WHEN** another settlement arrives without a new result
+- **THEN** no second continuation, completion record or hook is created
 
 #### Scenario: No issue or invalid XML
-- **WHEN** a non-aborted reflection submits valid `NO_ISSUE` through the result function or supplies legacy XML instead of calling it
-- **THEN** a non-cancelled valid result authorizes exactly one new ordinary continuation only after durable completion, while XML follows bounded correction without an ordinary continuation
-- **AND** correction retains at most three total attempts and one shared ten-lookup-call budget
+- **WHEN** a non-aborted terminal attempt writes a valid `NO_ISSUE` file or prints legacy XML instead of writing its file
+- **THEN** only the durably completed valid file authorizes one ordinary continuation; XML follows correction without continuation
+- **AND** correction retains three terminal attempts and one shared ten-helper allowance
 
 #### Scenario: A run ends without a valid decision
-- **WHEN** validation exhausts or an inquiry authoritatively ends without a valid decision
-- **THEN** no new plugin-issued ordinary continuation or completion hook is authorized for that path
-- **AND** non-aborted validation failure retains its bounded warning and cleanup behavior
-- **AND** native abort is cancellation without an invalid-response warning or reask, with exact-owned context cleanup preserved
+- **WHEN** validation exhausts or private execution authoritatively ends without a valid result
+- **THEN** no new plugin continuation or hook is authorized
+- **AND** non-aborted format failure retains bounded warning/cleanup
+- **AND** native abort remains cancellation without invalid-response warning/reask or unrelated main cleanup
 
 #### Scenario: User takeover restarts threshold accounting
-- **GIVEN** thresholds were approaching or crossed in the current cycle
-- **WHEN** a real ordinary user message begins
-- **THEN** the full cycle resets before the next automatic evaluation
-- **AND** that reset does not claim to retract an inquiry already accepted by native steering
+- **GIVEN** current thresholds are near or above limits
+- **WHEN** fresh explicit user input qualifies under existing takeover rules
+- **THEN** the full cycle resets before the next automatic decision
+- **AND** reset invalidates and immediately cancels the old private inquiry without clearing unrelated native work
 
 #### Scenario: Native residual work cannot revive a cancelled reflection
-- **GIVEN** native steering accepted an inquiry, correction, or continuation before a true main abort revoked its inquiry authority
-- **WHEN** a residual native slot later causes ordinary work after re-entry
-- **THEN** this does not restore the old inquiry's authority or authorize a new plugin-issued continuation, correction, result, or completion hook
-- **AND** an already-submitted continuation or wake remains subject to native residual request effects rather than a zero-extra-request guarantee
-- **AND** no promise of retracting that slot or eliminating its ordinary request, cost, or ordinary tool effects is made
+- **GIVEN** feedback from a durably completed reflection was submitted before a later abort
+- **WHEN** native feedback work occurs after re-entry
+- **THEN** it restores no private execution or result authority and republishes no hook
+- **AND** no zero-cost/request/effect guarantee is added for that already-submitted successful feedback
 
 ### Requirement: Reflection feedback uses trigger-specific model-facing roles
 
