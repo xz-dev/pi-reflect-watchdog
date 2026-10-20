@@ -142,7 +142,33 @@ async function traceEvents(tracePath) {
  * exactly one continuation message → the wake request. Totals are exact.
  */
 async function assertDeliveryOrder(tracePath, index = 0) {
-	const events = await traceEvents(tracePath);
+	const findWake = (events, continuation) =>
+		continuation &&
+		events.find(
+			(event) =>
+				event.kind === "main-request" &&
+				event.sequence > continuation.sequence &&
+				event.entries.some(
+					(entry) =>
+						entry.customType === "pi-reflect-watchdog:reflection-completed" &&
+						JSON.stringify(entry.data) ===
+							JSON.stringify(continuation.details.correlation),
+				),
+		);
+	// A hook/continuation may be visible before its asynchronous wake request.
+	const events = await until(
+		async () => {
+			const snapshot = await traceEvents(tracePath);
+			const continuation = snapshot.filter(
+				(event) =>
+					event.kind === "custom-message" &&
+					event.customType === "pi-reflect-watchdog:continuation",
+			)[index];
+			return findWake(snapshot, continuation) && snapshot;
+		},
+		30_000,
+		`reflection ${index + 1} correlated wake request`,
+	);
 	const hookEvents = events.filter(
 		(event) =>
 			event.kind === "hook" && event.envelope?.name === "reflection-completed",
@@ -185,10 +211,7 @@ async function assertDeliveryOrder(tracePath, index = 0) {
 			hookEvents[index + 1]?.sequence > continuation.sequence,
 			"next hook follows this continuation",
 		);
-	const wake = events.find(
-		(event) =>
-			event.kind === "main-request" && event.sequence > continuation.sequence,
-	);
+	const wake = findWake(events, continuation);
 	assert.ok(wake, "a main request follows the continuation");
 	assert.equal(
 		wake.hookCount,
@@ -611,6 +634,9 @@ test("packed private automatic reflection: assistant report, cooldown expires an
 		2,
 		"exact continuation count",
 	);
+	// The wake must also complete a real main provider turn.
+	settled += 1;
+	await settledAfter(rpc, settled);
 	assert.deepEqual(plan.violations, []);
 	assertNoPrivateResidue(fixture, await sessionText(fixture.sessionDir));
 });
