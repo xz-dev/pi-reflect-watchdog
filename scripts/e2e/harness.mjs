@@ -120,55 +120,53 @@ export async function installPackedArtifact({ base, agentDir }) {
 		throw new Error(
 			"PI_WATCHDOG_E2E_TARBALL is required; run E2E through scripts/e2e/run-tests.mjs",
 		);
+	// Production topology: the packed tarball plus the source manifest's own
+	// reviewed Git pins as root dependencies, under the tracked .npmrc
+	// (allow-git=root, legacy-peer-deps) and exact-commit allowScripts.
 	const installRoot = path.join(base, "installed-artifact");
 	await mkdir(installRoot, { recursive: true });
-	const extensionUtilsTarball = process.env.PI_EXTENSION_UTILS_E2E_TARBALL;
-	const installTargets = extensionUtilsTarball
-		? [`pi-extension-utils@${extensionUtilsTarball}`, tarball]
-		: [tarball];
+	const source = JSON.parse(
+		readFileSync(path.join(ROOT, "package.json"), "utf8"),
+	);
+	await writeJson(path.join(installRoot, "package.json"), {
+		name: "pi-reflect-watchdog-e2e-install",
+		private: true,
+		dependencies: {
+			...source.dependencies,
+			"pi-reflect-watchdog": `file:${tarball}`,
+		},
+		allowScripts: source.allowScripts,
+	});
+	await writeFile(
+		path.join(installRoot, ".npmrc"),
+		readFileSync(path.join(ROOT, ".npmrc"), "utf8"),
+	);
 	const install = await runBoundedProcess(
 		"npm",
 		[
 			"install",
-			"--prefer-offline",
-			"--ignore-scripts",
+			"--omit=dev",
 			"--no-audit",
 			"--no-fund",
-			// Packed E2E installs the watchdog as a tarball dependency, so its
-			// reviewed Git dependency is transitive to this temporary root.
-			// Production Git installs use the tracked allow-git=root policy.
-			"--allow-git=all",
-			"--prefix",
-			installRoot,
-			...installTargets,
+			"--foreground-scripts",
 		],
-		{ timeoutMs: 120_000 },
+		{ cwd: installRoot, timeoutMs: 300_000 },
 	);
 	if (install.status !== 0 || install.timedOut || install.error)
 		throw new Error(
 			`artifact install failed${install.timedOut ? " after timeout" : ""}:\n${install.stdout}\n${install.stderr}`,
 		);
+	if (
+		!`${install.stdout}${install.stderr}`.includes(
+			"Prepared private pi-subagents",
+		)
+	)
+		throw new Error(
+			`reviewed runtime preparation did not run:\n${install.stderr}`,
+		);
 	const packagePath = await realpath(
 		path.join(installRoot, "node_modules", "pi-reflect-watchdog"),
 	);
-	if (extensionUtilsTarball) {
-		const override = await runBoundedProcess(
-			"npm",
-			[
-				"install",
-				"--ignore-scripts",
-				"--no-save",
-				"--prefix",
-				packagePath,
-				extensionUtilsTarball,
-			],
-			{ timeoutMs: 120_000 },
-		);
-		if (override.status !== 0 || override.timedOut || override.error)
-			throw new Error(
-				`pi-extension-utils override failed${override.timedOut ? " after timeout" : ""}:\n${override.stdout}\n${override.stderr}`,
-			);
-	}
 	await writeJson(path.join(agentDir, "settings.json"), {
 		packages: [packagePath],
 		defaultProjectTrust: "never",

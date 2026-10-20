@@ -1,10 +1,14 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createJiti } from "jiti";
 import { openProcessDomain } from "pi-extension-utils/process-domain";
 
-const { createReflectDomainCoordinator } = await import(
+const moduleUrl =
 	process.env.PI_WATCHDOG_PROCESS_DOMAIN_MODULE ??
-		new URL("../../dist/process-domain.js", import.meta.url).href
-);
+	new URL("../../dist/process-domain.js", import.meta.url).href;
+// Installed packages ship TypeScript; load it the way Pi does.
+const { createReflectDomainCoordinator } = moduleUrl.endsWith(".ts")
+	? await createJiti(import.meta.url, { moduleCache: false }).import(moduleUrl)
+	: await import(moduleUrl);
 
 const env = {
 	PI_EXTENSION_UTILS_PROCESS_DOMAIN:

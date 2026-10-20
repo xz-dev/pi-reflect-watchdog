@@ -53,7 +53,6 @@ export {
 	MAX_REFLECTION_TOOL_CALLS,
 	parseReflectionArguments,
 	prepareReflectionArguments,
-	REFLECTION_PARAMETERS,
 	type ReflectionDecision,
 	type ReflectionPromptContext,
 	type ReflectionThresholdSnapshot,

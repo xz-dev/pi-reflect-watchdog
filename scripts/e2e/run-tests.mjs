@@ -14,6 +14,7 @@ export const FAST_PATTERNS = [
 	"test/e2e/run-tests.test.mjs",
 	"test/e2e/stock-pi-fast.test.mjs",
 	"test/e2e/stock-pi-abort.test.mjs",
+	"test/e2e/stock-pi-private.test.mjs",
 ];
 
 export function forcedFailureDiagnostic(step) {
@@ -62,28 +63,6 @@ export async function runE2eSuite(
 		);
 		const tarball = pack.stdout.trim().split(/\r?\n/).at(-1);
 		if (!tarball) throw new Error("suite pack did not report a tarball");
-		let extensionUtilsTarball = process.env.PI_EXTENSION_UTILS_E2E_TARBALL;
-		if (!extensionUtilsTarball) {
-			const utilityPack = await runOrThrow(
-				"npm",
-				[
-					"pack",
-					"--json",
-					"--pack-destination",
-					temporary,
-					path.join(ROOT, "node_modules", "pi-extension-utils"),
-				],
-				{ cwd: ROOT, timeoutMs: 60_000 },
-				"pi-extension-utils pack",
-			);
-			const packed = JSON.parse(utilityPack.stdout);
-			const metadata = Array.isArray(packed)
-				? packed[0]
-				: Object.values(packed)[0];
-			if (!metadata?.filename)
-				throw new Error("pi-extension-utils pack did not report a tarball");
-			extensionUtilsTarball = path.join(temporary, metadata.filename);
-		}
 		if (failureStep === "tests")
 			throw new Error(forcedFailureDiagnostic("tests"));
 		await runOrThrow(
@@ -94,7 +73,6 @@ export async function runE2eSuite(
 				env: {
 					...process.env,
 					PI_WATCHDOG_E2E_TARBALL: tarball,
-					PI_EXTENSION_UTILS_E2E_TARBALL: extensionUtilsTarball,
 				},
 				stdio: "inherit",
 				// The full suite includes stock-Pi startup, Git installation, a real

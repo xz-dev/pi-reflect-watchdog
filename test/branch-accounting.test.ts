@@ -278,6 +278,57 @@ test("cooldown preserves inclusive limit and rejects wrong namespace, attempt, a
 	});
 });
 
+test("private completion (correlated durable result, then marker; no main inquiry reply) starts cooldown", () => {
+	const session = SessionManager.inMemory();
+	session.appendMessage(reply());
+	session.appendCustomEntry("pi-reflect-watchdog:reflection", {
+		version: 1,
+		report: "Reflection · NO_ISSUE",
+		correlation,
+	});
+	session.appendCustomEntry(REFLECTION_COMPLETED_ENTRY, correlation);
+	assert.deepEqual(reflectCooldownState(session.getBranch(), 10), {
+		skipAutomatic: true,
+		remainingLoops: 10,
+	});
+	// Pi emits entry_appended between the two appends; a listener may add
+	// its own custom entry in between.
+	const interleaved = SessionManager.inMemory();
+	interleaved.appendMessage(reply());
+	interleaved.appendCustomEntry("pi-reflect-watchdog:reflection", {
+		version: 1,
+		report: "Reflection · NO_ISSUE",
+		correlation,
+	});
+	interleaved.appendCustomEntry("pi-continue-watchdog:status", { v: 1 });
+	interleaved.appendCustomEntry(REFLECTION_COMPLETED_ENTRY, correlation);
+	assert.deepEqual(reflectCooldownState(interleaved.getBranch(), 10), {
+		skipAutomatic: true,
+		remainingLoops: 10,
+	});
+	const mismatched = SessionManager.inMemory();
+	mismatched.appendMessage(reply());
+	mismatched.appendCustomEntry("pi-reflect-watchdog:reflection", {
+		version: 1,
+		report: "Reflection · NO_ISSUE",
+		correlation: { ...correlation, inquiryId: "other" },
+	});
+	mismatched.appendCustomEntry(REFLECTION_COMPLETED_ENTRY, correlation);
+	assert.deepEqual(
+		reflectCooldownState(mismatched.getBranch(), 10),
+		{ skipAutomatic: false, remainingLoops: 0 },
+		"a result for another inquiry does not complete this marker",
+	);
+	const orphan = SessionManager.inMemory();
+	orphan.appendMessage(reply());
+	orphan.appendCustomEntry(REFLECTION_COMPLETED_ENTRY, correlation);
+	assert.deepEqual(
+		reflectCooldownState(orphan.getBranch(), 10),
+		{ skipAutomatic: false, remainingLoops: 0 },
+		"a marker without its durable result stays an orphan",
+	);
+});
+
 test("recorded main boundaries distinguish real interactive/RPC input from user-role wakes", () => {
 	for (const source of ["interactive", "rpc"] as const) {
 		const session = SessionManager.inMemory();

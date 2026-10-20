@@ -3,6 +3,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 export const REFLECTION_INQUIRY_NAMESPACE = "pi-reflect-watchdog";
 export const REFLECTION_COMPLETED_ENTRY =
 	"pi-reflect-watchdog:reflection-completed";
+export const REFLECTION_RESULT_ENTRY = "pi-reflect-watchdog:reflection";
 export const ACCOUNTING_BOUNDARY_ENTRY =
 	"pi-reflect-watchdog:accounting-boundary";
 
@@ -84,6 +85,12 @@ function watchdogInquiryAssistant(entry: SessionEntry): string | undefined {
 	return watchdogInquiryKey(record(record(entry.message)?.details)?.piInquiry);
 }
 
+function privateResultInquiry(entry: SessionEntry): string | undefined {
+	if (entry.type !== "custom" || entry.customType !== REFLECTION_RESULT_ENTRY)
+		return undefined;
+	return watchdogInquiryKey(record(entry.data)?.correlation);
+}
+
 function completedWatchdogReflection(entry: SessionEntry): string | undefined {
 	if (
 		entry.type !== "custom" ||
@@ -108,11 +115,14 @@ export function reflectCooldownState(
 		if (entry === undefined) continue;
 		const completedInquiry = completedWatchdogReflection(entry);
 		if (completedInquiry !== undefined) {
+			// A private reflection pairs its marker with the durable result
+			// carrying the same correlation; a legacy one with its main reply.
 			for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
-				const assistant = entries[candidate];
+				const source = entries[candidate];
 				if (
-					assistant !== undefined &&
-					watchdogInquiryAssistant(assistant) === completedInquiry
+					source !== undefined &&
+					(watchdogInquiryAssistant(source) === completedInquiry ||
+						privateResultInquiry(source) === completedInquiry)
 				)
 					return {
 						skipAutomatic:

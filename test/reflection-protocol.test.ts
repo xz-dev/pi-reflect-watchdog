@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateToolArguments } from "@earendil-works/pi-ai";
-import { Compile } from "typebox/compile";
 import {
 	buildReflectionPrompt,
 	buildReflectionReaskPrompt,
@@ -9,33 +7,7 @@ import {
 	MAX_REFLECTION_TEXT_CHARACTERS,
 	parseReflectionArguments,
 	prepareReflectionArguments,
-	REFLECTION_PARAMETERS,
 } from "../src/index.js";
-
-const declared = Compile(REFLECTION_PARAMETERS);
-
-function schemaAccepts(args: unknown): boolean {
-	return declared.Check(prepareReflectionArguments(args));
-}
-
-function nativeAccepts(args: unknown): boolean {
-	try {
-		validateToolArguments(
-			{ name: "ref", description: "", parameters: REFLECTION_PARAMETERS },
-			{
-				type: "toolCall",
-				id: "parity",
-				name: "ref",
-				arguments: prepareReflectionArguments(args) as Parameters<
-					typeof validateToolArguments
-				>[1]["arguments"],
-			},
-		);
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 const parityValid = {
 	type: "NO_ISSUE",
@@ -96,14 +68,17 @@ test("argument preparation preserves prototype-named extra fields", () => {
 			...parityValid,
 			[name.toLowerCase()]: "kept",
 		});
-		assert.equal(schemaAccepts(raw), false);
 		assert.equal(parseReflectionArguments(raw).valid, false);
+		assert.equal(
+			parseReflectionArguments(prepareReflectionArguments(raw)).valid,
+			false,
+		);
 	}
 	const collision = { ...parityValid, ["__proto__"]: "a", __PROTO__: "b" };
 	assert.equal(prepareReflectionArguments(collision), collision);
 });
 
-test("declared schema validity of prepared arguments matches the plugin parser", () => {
+test("argument preparation and parsing agree on normalized candidates", () => {
 	const cases: unknown[] = [
 		parityValid,
 		{
@@ -125,28 +100,14 @@ test("declared schema validity of prepared arguments matches the plugin parser",
 		{ ...parityValid, type: "UNKNOWN" },
 		{ ...parityValid, extra: "unexpected" },
 	];
+	const expected = new Set<unknown>([parityValid, cases[1], cases[2]]);
 	for (const raw of cases)
 		assert.equal(
-			schemaAccepts(raw),
-			parseReflectionArguments(raw).valid,
+			parseReflectionArguments(prepareReflectionArguments(raw)).valid,
+			expected.has(raw),
 			JSON.stringify(raw),
 		);
-	for (const raw of cases.filter((args) => {
-		const reason = (args as { reason?: unknown }).reason;
-		return (
-			reason !== null &&
-			typeof reason !== "number" &&
-			typeof reason !== "boolean"
-		);
-	}))
-		assert.equal(nativeAccepts(raw), schemaAccepts(raw), JSON.stringify(raw));
-	// Host behavior, not the declared contract: Pi converts null/number/boolean
-	// primitives before checking. Owned submissions are judged by the
-	// plugin parser before dispatch, so this only reaches ordinary calls, which
-	// still meet the reserved-function rejection.
-	for (const reason of [42, true, null])
-		assert.equal(nativeAccepts({ ...parityValid, reason }), true);
-	// Runtime-only rules: both still reject, the schema cannot express them.
+	// Runtime-only rules the normalizer cannot express still reject.
 	assert.equal(
 		parseReflectionArguments({ ...parityValid, REASON: "duplicate" }).valid,
 		false,
@@ -158,7 +119,6 @@ test("declared schema validity of prepared arguments matches the plugin parser",
 		}).valid,
 		false,
 	);
-	assert.equal(schemaAccepts({ ...parityValid, REASON: "duplicate" }), false);
 });
 
 test("default perspective questions interpretation across contextual exchanges", () => {
@@ -252,7 +212,7 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 	);
 	assert.doesNotMatch(prompt, /Threshold snapshot: active=.*ms|task=.*ms/);
 	assert.match(prompt, /User supplement: \(none\)/);
-	assert.match(prompt, /10 lookup tool calls/);
+	assert.match(prompt, /10 executed evidence calls/);
 	assert.match(prompt, /current_step/);
 	assert.ok(prompt.startsWith("Review the route."));
 	assert.match(
@@ -270,22 +230,27 @@ test("reflection prompt fixes plugin-owned facts and preserves empty supplement 
 		/Do not.*extended investigation.*long-running checks.*wait on background work/,
 	);
 	assert.match(prompt, /"next_step":"suggested next step"/);
-	assert.match(prompt, /finish by calling ref with one JSON object/);
+	assert.match(
+		prompt,
+		/finish by writing the result file with the write tool at the path given in the result-file marker/,
+	);
+	assert.match(prompt, /read, ls, grep and find/);
 	assert.match(
 		prompt,
 		/express all observations and reasoning inside its five fields/,
 	);
-	assert.doesNotMatch(prompt, /XML|<reflection>/);
+	assert.doesNotMatch(prompt, /XML|<reflection>|\bref\b/);
 	assert.doesNotMatch(prompt, /End the response with|[Tt]railing/);
 });
 
-test("reask prompt requires function submission", () => {
+test("reask prompt requires the same file submission", () => {
 	const reask = buildReflectionReaskPrompt(
 		"reflection type must be NO_ISSUE or ROUTE_CORRECTION",
 	);
-	assert.match(reask, /Call ref alone with exactly/);
-	assert.doesNotMatch(reask, /XML|<reflection>/);
-	assert.match(reask, /tool-call budget remains in force/);
+	assert.match(reask, /Write the result file/);
+	assert.match(reask, /result-file marker/);
+	assert.doesNotMatch(reask, /XML|<reflection>|\bref\b/);
+	assert.match(reask, /evidence-call budget remains in force/);
 	assert.doesNotMatch(reask, /[Tt]railing/);
 });
 

@@ -1,5 +1,6 @@
 /* biome-ignore-all lint/suspicious/noExplicitAny: focused dynamic Pi lifecycle fake */
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -10,7 +11,10 @@ import {
 } from "@earendil-works/pi-ai";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamGoogle } from "@earendil-works/pi-ai/api/google-generative-ai";
-import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
+import {
+	convertMessages as convertCompletionsMessages,
+	stream as streamCompletions,
+} from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as streamResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
@@ -22,6 +26,7 @@ import {
 	generateSummaryWithUsage,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { captureAnchor } from "pi-extension-utils/private-inquiry";
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import { deriveBranchAccounting } from "../src/branch-accounting.js";
 import type { WatchdogConfig } from "../src/config.js";
@@ -43,6 +48,12 @@ import {
 } from "../src/process-domain.js";
 
 import { DEFAULT_REFLECTION_PROMPT } from "../src/prompts.js";
+import {
+	awaitReflectionOperation,
+	createReflectionDriver,
+	type ReflectionDriverReply,
+	settleReflectionOperation,
+} from "./fixtures/private-reflection-driver.js";
 
 class Pi {
 	currentCtx: any;
@@ -94,6 +105,10 @@ class Pi {
 	}
 
 	registerMessageRenderer() {}
+
+	getThinkingLevel() {
+		return "medium";
+	}
 
 	sendMessage(message: unknown, options: unknown) {
 		this.messages.push({ message, options });
@@ -450,16 +465,22 @@ function context(
 	const notifications: string[] = [];
 	const statuses: Array<string | undefined> = [];
 	const widgets: Array<unknown> = [];
+	const terminalInputs = new Set<
+		(data: string) => { consume?: boolean } | undefined
+	>();
 	const manager = {
 		getSessionId: () => sessionId,
 		getSessionFile: () => options.sessionFile,
 		getLeafId: (): string | null => branch.at(-1)?.id ?? null,
 		getBranch: () => branch,
+		getEntries: () => branch,
 	};
 	return {
 		hasUI: options.hasUI ?? true,
 		mode: options.mode ?? "rpc",
 		cwd: `/work/${sessionId}`,
+		model: { provider: "fixture-provider", id: "fixture-model" },
+		modelRegistry: {},
 		isProjectTrusted: () => false,
 		isIdle: () => idle,
 		hasPendingMessages: () => pendingMessages,
@@ -484,6 +505,17 @@ function context(
 			setWidget(_key: string, value?: unknown) {
 				widgets.push(value);
 			},
+			onTerminalInput(
+				listener: (data: string) => { consume?: boolean } | undefined,
+			) {
+				terminalInputs.add(listener);
+				return () => terminalInputs.delete(listener);
+			},
+		},
+		terminalInputs,
+		pressKey(data: string) {
+			const results = [...terminalInputs].map((listener) => listener(data));
+			return results.some((result) => result?.consume === true);
 		},
 		notifications,
 		statuses,
@@ -500,20 +532,164 @@ const config: WatchdogConfig = {
 	cancelShortcut: "alt+x",
 };
 
+/** Controller-only outcome injection: no file execution, validation, retries
+ * or attempt budgets. Shared-runtime integration tests use the real-file
+ * driver instead; this stub tests policy under controlled or late outcomes. */
+class ControllerOutcomeStub {
+	/** When true, the abort signal does not resolve parked runs — the test
+	 * keeps the old child draining until it calls `settle` explicitly. */
+	suspendAbort = false;
+	readonly calls: Array<{
+		options: any;
+		resolve: (result: any) => void;
+		prompt: string;
+	}> = [];
+	readonly runs: Promise<any>[] = [];
+	runtimeCreations = 0;
+	private scripts: unknown[] = [];
+
+	private readonly services = {
+		createRuntime: async () => {
+			this.runtimeCreations += 1;
+			return {
+				fork: async (_input: any) => {
+					// An observed fake child: one own terminal assistant message
+					// with realistic provider metadata; nothing else is needed.
+					const self: any = {
+						sessionId: "fake-child",
+						sessionFile: "/var/tmp/fake/child.json",
+						modelId: "fixture-model",
+						inheritedProvider: "fixture",
+						attemptError: undefined,
+						helperCalls: 0,
+						messages: [],
+						prompt: async (text: string) => {
+							self.messages.push({
+								role: "assistant",
+								api: "openai-completions",
+								provider: "fixture",
+								model: "fixture-model",
+								responseId: "fake-child-response",
+								usage: {
+									input: 1,
+									output: 1,
+									cacheRead: 0,
+									cacheWrite: 0,
+									totalTokens: 2,
+									cost: {
+										input: 0,
+										output: 0,
+										cacheRead: 0,
+										cacheWrite: 0,
+										total: 0,
+									},
+								},
+								content: [{ type: "text", text }],
+								stopReason: "stop",
+								timestamp: 1,
+							});
+						},
+						abort: async () => {},
+						subscribe: () => () => {},
+						dispose: async () => {},
+					};
+					return self;
+				},
+				dispose: () => {},
+			} as any;
+		},
+		run: (options: any) => {
+			const run = this.execute(options);
+			this.runs.push(run);
+			return run;
+		},
+	};
+
+	private execute(options: any): Promise<any> {
+		const decision = this.scripts.shift();
+		const record: (typeof this.calls)[number] = {
+			options,
+			resolve: () => {},
+			prompt: options.prompt("/var/tmp/controller-stub/result.json"),
+		};
+		this.calls.push(record);
+		return new Promise<any>((resolve) => {
+			record.resolve = (result: any) => {
+				if (result?.kind !== "decision") {
+					resolve(result);
+					return;
+				}
+				void (async () => {
+					try {
+						const child = await options.runtime.fork({});
+						await child.prompt("settle");
+						await child.dispose();
+					} catch {
+						// Inject even late outcomes to test the controller's stale guard.
+					}
+					resolve({ ...result, sessionId: "fake-child" });
+				})();
+			};
+			options.signal?.addEventListener(
+				"abort",
+				() => {
+					if (!this.suspendAbort) resolve({ kind: "cancelled" });
+				},
+				{ once: true },
+			);
+			if (decision !== undefined)
+				record.resolve({
+					kind: "decision",
+					decision,
+					sessionId: "fake-child",
+					reconsidered: false,
+				});
+		});
+	}
+
+	get service() {
+		return this.services;
+	}
+
+	/** Inject an already-decided outcome; this is not a validator seam. */
+	respond(decision: unknown) {
+		this.scripts.push(decision);
+	}
+
+	get pending() {
+		return this.calls.at(-1);
+	}
+
+	settle(result: any) {
+		const call = this.calls.at(-1);
+		assert.ok(call, "no private reflection is pending");
+		call.resolve(result);
+	}
+
+	isCurrent() {
+		const call = this.calls.at(-1);
+		assert.ok(call, "no private reflection is pending");
+		return call.options.isCurrent();
+	}
+}
+
 function install(
 	options: {
 		hub?: ObservableAgentHub;
 		domain?: ReflectBranchDomainCoordinator;
 		ctx?: ReturnType<typeof context>;
 		limits?: Partial<typeof config>;
+		privateInquiry?: ControllerOutcomeStub;
 	} = {},
 ) {
 	const pi = new Pi();
 	const ctx = options.ctx ?? context();
 	const domain = options.domain ?? new FakeDomain();
+	const privateInquiry = options.privateInquiry ?? new ControllerOutcomeStub();
 	createWatchdogExtension({
 		hub: options.hub ?? createObservableAgentHub(),
 		processDomain: domain,
+		privateInquiry: privateInquiry.service,
 		services: {
 			loadConfig: async () => ({
 				config: { ...config, ...options.limits },
@@ -521,7 +697,7 @@ function install(
 			}),
 		},
 	})(pi as any);
-	return { pi, ctx, domain: domain as FakeDomain };
+	return { pi, ctx, domain: domain as FakeDomain, privateInquiry };
 }
 
 function publishHook(pi: Pi, name: string) {
@@ -574,16 +750,9 @@ function turnEnd(stopReason: string, extra: Record<string, unknown> = {}) {
 	};
 }
 
-function lastInquiry(pi: Pi) {
-	return pi.messages.findLast(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry"),
-	)?.message;
-}
-
-function lastInquiryFold(pi: Pi) {
-	return pi.messages.findLast(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry-fold"),
-	)?.message;
+/** Prompt text the private child received for the latest reflection. */
+function lastPrompt(privateInquiry: ControllerOutcomeStub): string {
+	return privateInquiry.pending?.prompt ?? "";
 }
 
 function continuationMessages(pi: Pi) {
@@ -597,20 +766,78 @@ function runtimeQueuedState(pi: Pi, ctx: ReturnType<typeof context>) {
 	return ctx.statuses.filter(Boolean).at(-1)?.includes("queued") ?? false;
 }
 
-async function correlateReflection(pi: Pi, ctx: ReturnType<typeof context>) {
-	const prompt = lastInquiry(pi);
-	assert.ok(prompt);
-	await pi.emit(
-		"message_start",
-		{
-			message: {
-				role: "custom",
-				customType: prompt.customType,
-				details: prompt.details,
-			},
+/** Seed one replayable assistant entry so trigger-time anchor capture works. */
+/**
+ * Script the next child reply to write a VALID result file and then hold
+ * before settling. `ready()` waits (bounded) until child `index` consumed it
+ * and the file really holds the valid JSON; `release()` lets it settle. The
+ * staged valid file therefore crosses whatever revocation the test does in
+ * between.
+ */
+function stageValidThenHold(
+	driver: ReturnType<typeof createReflectionDriver>,
+	index = 0,
+) {
+	let release!: () => void;
+	driver.respond({
+		write: JSON.stringify(validNoIssue),
+		writeBeforeHold: true,
+		hold: new Promise<void>((resolve) => {
+			release = resolve;
+		}),
+	});
+	return {
+		release: () => release(),
+		async ready() {
+			for (let turn = 0; turn < 2000; turn += 1) {
+				const child = driver.children[index];
+				const file = driver.forkInputs[index]?.resultFile;
+				if (child?.prompts.length === 1 && file !== undefined) {
+					const staged = await readFile(file, "utf8").catch(() => "");
+					if (staged === JSON.stringify(validNoIssue)) return child;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+			throw new Error("valid result was never staged");
 		},
-		ctx,
-	);
+	};
+}
+
+/** Bounded wait for child `index`'s first prompt (async fork/setup). */
+async function firstPromptOf(
+	driver: ReturnType<typeof createReflectionDriver>,
+	index: number,
+): Promise<string> {
+	for (let turn = 0; turn < 2000; turn += 1) {
+		const prompt = driver.children[index]?.prompts[0];
+		if (prompt !== undefined) return prompt;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	throw new Error(`child ${index} was never prompted`);
+}
+
+function seedAnchor(ctx: ReturnType<typeof context>, id = "seed") {
+	ctx.setBranch([
+		...ctx.sessionManager.getBranch(),
+		branchMessage(
+			{
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: id }],
+			},
+			id,
+		),
+	]);
+}
+
+/** Wait for the async private launch to record its `run` call. */
+async function pendingReflection(
+	privateInquiry: ControllerOutcomeStub,
+): Promise<ControllerOutcomeStub["calls"][number]> {
+	await flushAsync();
+	const call = privateInquiry.pending;
+	assert.ok(call, "no private reflection started");
+	return call;
 }
 
 function assistant(text: string | ReturnType<typeof reflectionArguments>) {
@@ -657,28 +884,32 @@ function providerMessageTextForRuntime(message: any) {
 
 async function reflectionHandoff(
 	origin: "automatic" | "manual",
-	reply: any = assistant(validNoIssue).message,
+	raw: unknown = validNoIssue,
+	replyExtras?: Pick<
+		ReflectionDriverReply,
+		"assistantMeta" | "assistantOpaqueContent"
+	>,
 ) {
+	const driver = createReflectionDriver();
 	const { pi, ctx } = install({
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+		privateInquiry: { service: driver.service } as any,
 	});
 	await pi.emit("session_start", {}, ctx);
-	if (origin === "manual") await pi.commands[0]?.handler("", ctx);
-	else {
+	seedAnchor(ctx);
+	driver.respond({
+		write: typeof raw === "string" ? raw : JSON.stringify(raw),
+		...replyExtras,
+	});
+	if (origin === "manual") {
+		await pi.commands[0]?.handler("", ctx);
+	} else {
 		ctx.setIdle(false);
 		await pi.emit("agent_start", {}, ctx);
 		await pi.emit("turn_end", turnEnd("stop"), ctx);
 	}
-	await startReflectionRun(pi, ctx);
-	const captured = await pi.emit(
-		"message_end",
-		{ message: { ...reply, timestamp: 2 } },
-		ctx,
-	);
-	assert.ok(captured);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	await awaitReflectionOperation(driver);
+	await settleReflectionOperation(driver);
 	assert.equal(continuationMessages(pi).length, 1);
 	const result = pi.entries.find(
 		(entry) => entry.customType === "pi-reflect-watchdog:reflection",
@@ -687,11 +918,11 @@ async function reflectionHandoff(
 	return {
 		pi,
 		ctx,
+		driver,
 		result,
+		// The private path persists the continuation marker carrying the
+		// validated `private` source — no main-thread inquiry chain exists.
 		messages: [
-			{ role: "custom", ...lastInquiry(pi), timestamp: 1 },
-			captured.message,
-			{ role: "custom", ...lastInquiryFold(pi), timestamp: 3 },
 			{ role: "custom", ...continuationMessages(pi)[0]?.message, timestamp: 4 },
 		],
 	};
@@ -769,235 +1000,116 @@ const validCorrection = reflectionArguments({
 	nextStep: "continue differently",
 });
 
-async function completeReflectionAttempt(
+/** Resolve the pending private reflection with a validated decision. */
+/** Emit a counted ordinary turn and wait for the private reflection to park. */
+async function triggerAutoReflection(
 	pi: Pi,
 	ctx: ReturnType<typeof context>,
-	text: string | ReturnType<typeof reflectionArguments>,
+	privateInquiry: ControllerOutcomeStub,
+	options: { id?: string; stopReason?: string } = {},
 ) {
-	const captured = await pi.emit("message_end", assistant(text), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	return captured;
-}
-
-async function startReflectionRun(pi: Pi, ctx: ReturnType<typeof context>) {
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
-	await correlateReflection(pi, ctx);
+	// The fixture appends the turn entry itself when messageEntryId is unset,
+	// then fills the ids the production handler needs for completeTurn.
+	await pi.emit("turn_end", turnEnd(options.stopReason ?? "stop"), ctx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	return pendingReflection(privateInquiry);
 }
 
-const EXPLANATORY_SCHEMA_KEYWORDS = [
-	"description",
-	"title",
-	"examples",
-	"default",
-] as const;
-
-test("result tool declares structural constraints without explanatory annotations", () => {
-	const { pi } = install();
-	const tool = pi.tools.get("ref");
-	assert.ok(tool, "result tool must be registered");
-	assert.equal(tool.description, "don't use unless ask");
-	const parameters = JSON.parse(JSON.stringify(tool.parameters));
-	assert.equal(parameters.type, "object");
-	assert.equal(parameters.additionalProperties, false);
-	const fields = ["type", "reason", "done", "current_step", "next_step"];
-	assert.deepEqual([...parameters.required].sort(), [...fields].sort());
-	assert.deepEqual(
-		Object.keys(parameters.properties).sort(),
-		[...fields].sort(),
-	);
-	assert.deepEqual(parameters.properties.type, {
-		type: "string",
-		enum: ["NO_ISSUE", "ROUTE_CORRECTION"],
+/** Settle the pending private run with a validated decision. */
+async function settleDecision(
+	privateInquiry: ControllerOutcomeStub,
+	raw: unknown = validNoIssue,
+) {
+	const call = privateInquiry.pending;
+	assert.ok(call, "no private reflection is pending");
+	call.resolve({
+		kind: "decision",
+		decision: raw,
+		sessionId: "fake-child",
+		reconsidered: false,
 	});
-	for (const field of fields.slice(1))
-		assert.deepEqual(parameters.properties[field], {
-			type: "string",
-			minLength: 1,
-			pattern: "\\S",
-		});
-	const serialized = JSON.stringify(parameters);
-	for (const keyword of EXPLANATORY_SCHEMA_KEYWORDS)
-		assert.doesNotMatch(serialized, new RegExp(`"${keyword}":`));
-	assert.equal(tool.promptSnippet, undefined);
-	assert.equal(tool.promptGuidelines, undefined);
-	assert.equal(typeof tool.prepareArguments, "function");
+	await flushAsync();
+	return call;
+}
+
+test("no public result function is registered and foreign tools stay untouched", async () => {
+	const { pi, ctx } = install();
+	await pi.emit("session_start", {}, ctx);
+	assert.deepEqual([...pi.tools.keys()], []);
 	assert.deepEqual(
-		tool.prepareArguments({
-			TYPE: " no_issue ",
-			Reason: " sound ",
-			done: "checked",
-			current_step: "verify",
-			NEXT_STEP: "continue",
-		}),
-		{
-			type: "NO_ISSUE",
-			reason: "sound",
-			done: "checked",
-			current_step: "verify",
-			next_step: "continue",
-		},
+		pi.commands.map((command) => command.name),
+		["reflect", "cancel-reflect"],
 	);
 });
 
-test("schema-invalid owned result is captured before dispatch and corrected within the attempt bound", async () => {
-	const { pi, ctx } = install();
-	const tool = pi.tools.get("ref");
-	const executed: unknown[] = [];
-	const execute = tool.execute;
-	tool.execute = (...args: unknown[]) => {
-		executed.push(args[1]);
-		return execute(...args);
-	};
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	const notificationsBefore = ctx.notifications.length;
-	await startReflectionRun(pi, ctx);
-	const { next_step: _omitted, ...missingNextStep } = validNoIssue;
-	const captured = await pi.emit(
-		"message_end",
-		{
-			message: {
-				...assistant(validNoIssue).message,
-				content: [
-					{ type: "thinking", thinking: "private" },
-					{
-						type: "toolCall",
-						id: "lookup",
-						name: "read",
-						arguments: { path: "README.md" },
-					},
-					{
-						type: "toolCall",
-						id: "reflect-result",
-						name: "ref",
-						arguments: missingNextStep,
-					},
-				],
-			},
-		},
-		ctx,
-	);
-	assert.deepEqual(captured.message.content, []);
-	assert.equal(captured.message.stopReason, "stop");
-	assert.deepEqual(
-		executed,
-		[],
-		"no call from the invalid response is dispatched",
-	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.deepEqual(ctx.notifications.slice(notificationsBefore), [
-		"Reflection attempt 1/3 invalid: reflection result must contain exactly the five required fields; retrying.",
-	]);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		2,
-	);
-	assert.equal(pi.entries.length, 0);
-	assert.equal(continuationMessages(pi).length, 0);
-	assert.doesNotMatch(lastInquiry(pi).content, /checked|verify/);
-
-	await startReflectionRun(pi, ctx);
-	const corrected = await completeReflectionAttempt(pi, ctx, {
-		...validNoIssue,
-		type: "bogus" as "NO_ISSUE",
+test("an invalid private result is corrected inside the bounded attempt chain", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
 	});
-	assert.deepEqual(corrected.message.content, []);
-	await startReflectionRun(pi, ctx);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
-	assert.deepEqual(executed, [validNoIssue]);
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	const { next_step: _omitted, ...missingNextStep } = validNoIssue;
+	driver.respond({ write: JSON.stringify(missingNextStep) });
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	assert.equal((await settleReflectionOperation(driver))?.kind, "decision");
+	assert.equal(driver.children.length, 1);
+	const child = driver.children[0];
+	assert.ok(child);
+	assert.equal(child.prompts.length, 2, "one same-child correction");
+	assert.match(
+		child.prompts[1] ?? "",
+		/must contain exactly the five required fields/,
+	);
+	assert.doesNotMatch(child.prompts[1] ?? "", /checked|verify/);
 	assert.equal(continuationMessages(pi).length, 1);
 	assert.equal(
 		pi.entries.filter(
-			(entry) =>
-				entry.customType === "pi-reflect-watchdog:reflection-completed",
+			({ customType }) =>
+				customType === "pi-reflect-watchdog:reflection-completed",
 		).length,
 		1,
 	);
+	await pi.emit("session_shutdown", {}, ctx);
 });
 
-test("three schema-invalid owned results end through failure cleanup", async () => {
-	const { pi, ctx } = install();
+test("three invalid private results exhaust the attempt bound and stay silent", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
+	seedAnchor(ctx);
 	const notificationsBefore = ctx.notifications.length;
-	for (let attempt = 1; attempt <= 3; attempt += 1) {
-		await startReflectionRun(pi, ctx);
-		const captured = await completeReflectionAttempt(pi, ctx, {
-			...validNoIssue,
-			reason: 42 as unknown as string,
+	for (let attempt = 0; attempt < 3; attempt += 1)
+		driver.respond({
+			write: JSON.stringify({ ...validNoIssue, reason: 42 }),
 		});
-		assert.deepEqual(captured.message.content, []);
-	}
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	const result = await settleReflectionOperation(driver);
+	assert.equal(result?.kind, "decision-failed");
 	assert.deepEqual(ctx.notifications.slice(notificationsBefore), [
+		// Every manual request transits the queue; a directly admitted one
+		// is reported as dispatched with the generic queued notice.
+		"Reflection queued.",
 		"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
 		"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
 		"Reflection failed: reflection field reason must be a non-empty string",
 	]);
+	assert.equal(driver.operations.length, 1);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		driver.children.at(-1)?.prompts.length,
 		3,
+		"three consumed invalid responses in the same child",
 	);
 	assert.equal(pi.entries.length, 0);
 	assert.equal(continuationMessages(pi).length, 0);
-});
-
-test("reserved result tool reveals no usage and rejects calls outside confirmed reflection", async () => {
-	const { pi, ctx } = install();
-	const tool = pi.tools.get("ref");
-	assert.ok(tool, "result tool must be registered");
-	assert.equal(tool.description, "don't use unless ask");
-	assert.equal(tool.promptSnippet, undefined);
-	assert.equal(tool.promptGuidelines, undefined);
-	const declaration = JSON.stringify(tool.parameters);
-	const reject = () =>
-		assert.rejects(
-			() => tool.execute("reserved", {}, undefined, undefined, ctx),
-			{
-				message:
-					"This function is reserved for the plugin. Please try another function.",
-			},
-		);
-	await reject();
-	await pi.emit("session_start", {}, ctx);
-	await reject();
-	await pi.commands[0]?.handler("", ctx);
-	await reject();
-	assert.equal(pi.entries.length, 0);
-	await startReflectionRun(pi, ctx);
-	assert.match(lastInquiry(pi).content, /ref/);
-	assert.match(lastInquiry(pi).content, /current_step/);
-	const result = await tool.execute(
-		"result",
-		{
-			type: "NO_ISSUE",
-			reason: "sound",
-			done: "checked",
-			current_step: "verify",
-			next_step: "continue",
-		},
-		undefined,
-		undefined,
-		ctx,
-	);
-	assert.equal(result.terminate, true);
-	assert.equal(result.isError, undefined);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(continuationMessages(pi).length, 1);
-	assert.equal(JSON.stringify(tool.parameters), declaration);
-	assert.equal(pi.tools.size, 1);
-	await reject();
-	await pi.emit("session_shutdown", {}, ctx);
-	await reject();
 });
 
 test("Reflect cooldown follows completed inquiry blocks and the inclusive ten-loop boundary", () => {
@@ -1123,18 +1235,25 @@ test("Reflect cooldown length clamps to [10, 30] at rootLoopLimit/3", () => {
 });
 
 test("automatic Reflect is consumed during cooldown while manual Reflect bypasses", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const ctx = context("root", { mode: "tui" });
 	const { pi, domain } = install({
 		ctx,
+		privateInquiry,
 		limits: { rootLoopLimit: 3, allLoopLimit: 100 },
 	});
 	ctx.setBranch([...completedReflect(), ordinaryLoop("ordinary-1")]);
 	await pi.emit("session_start", {}, ctx);
 	ctx.setIdle(false);
-	domain.setCounters({ rootLoops: 3n });
 	await pi.emit("agent_start", {}, ctx);
+	domain.setCounters({ rootLoops: 3n });
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(lastInquiry(pi), undefined);
+	await flushAsync();
+	assert.equal(
+		privateInquiry.pending,
+		undefined,
+		"cooldown consumes the automatic threshold without a child",
+	);
 	assert.equal(domain.resetWrites, 1);
 	assert.equal(
 		ctx.notifications.filter(
@@ -1142,38 +1261,45 @@ test("automatic Reflect is consumed during cooldown while manual Reflect bypasse
 		).length,
 		1,
 	);
+	privateInquiry.respond(validNoIssue);
 	await pi.commands[0]?.handler("manual bypass", ctx);
+	await flushAsync();
 	assert.match(
-		lastInquiry(pi)?.content ?? "",
+		lastPrompt(privateInquiry),
 		/manual bypass/,
 		"busy manual reflection submits immediately during cooldown",
 	);
 });
 
 test("legacy pause hooks neither subscribe nor alter accounting or hold", async () => {
-	const { pi, ctx, domain } = install({ limits: { rootLoopLimit: 1 } });
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx, domain } = install({
+		limits: { rootLoopLimit: 1 },
+		privateInquiry,
+	});
 	await pi.emit("session_start", {}, ctx);
 	assert.equal(pi.bus.get("pi:semantic-hook:v1")?.size ?? 0, 0);
 	publishHook(pi, "work-paused");
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	await triggerAutoReflection(pi, ctx, privateInquiry);
 	assert.equal(domain.rootWrites, 1);
-	assert.ok(lastInquiry(pi));
 });
 
-test("minimal core exposes /reflect, /cancel-reflect and one reserved tool", async () => {
+test("minimal core exposes /reflect and /cancel-reflect with no reserved tool", async () => {
 	const { pi, ctx } = install();
 	await pi.emit("session_start", {}, ctx);
 	assert.deepEqual(
 		pi.commands.map((command) => command.name),
 		["reflect", "cancel-reflect"],
 	);
-	assert.deepEqual([...pi.tools.keys()], ["ref"]);
+	// The owned ref tool is retired: the private child writes the designated
+	// result file and only built-in read/ls/grep/find helpers execute.
+	assert.deepEqual([...pi.tools.keys()], []);
 });
 
-test("ordinary user message resets the full cycle without touching reflection-owned messages", async () => {
+test("ordinary user message resets the full cycle without touching reflection state", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	await pi.emit("session_start", {}, ctx);
@@ -1191,47 +1317,77 @@ test("ordinary user message resets the full cycle without touching reflection-ow
 	assert.equal(domain.counters().rootLoops.value, 0n);
 	assert.equal(domain.counters().allLoops.value, 0n);
 
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
-	const resetBeforeReflection = domain.counters().revision;
-	await correlateReflection(pi, ctx);
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
+	assert.ok(call.prompt.includes("ROOT_LOOP_LIMIT"));
+	// Admission's reminder reset has happened; settlement must add none.
+	const resetsAtLaunch = domain.resetWrites;
+	let fullResets = 0;
+	const fullReset = domain.resetCycleOnUserTakeover.bind(domain);
+	domain.resetCycleOnUserTakeover = async () => {
+		fullResets += 1;
+		return fullReset();
+	};
+	const countersAtLaunch = domain.counters();
+	await settleDecision(privateInquiry);
 	assert.equal(
-		domain.counters().revision,
-		resetBeforeReflection,
-		"matching the reflection inquiry must not self-reset",
+		domain.resetWrites,
+		resetsAtLaunch,
+		"matching the reflection result must not self-reset the reminder cycle",
 	);
+	assert.equal(fullResets, 0, "nor the full cycle");
+	for (const key of ["activeLoops", "rootLoops", "allLoops"] as const)
+		assert.equal(domain.counters()[key].value, countersAtLaunch[key].value);
 });
 
 test("takeover discards stale automatic intent while preserving the manual queue", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
+	const automatic = await triggerAutoReflection(pi, ctx, privateInquiry);
+	assert.ok(automatic.prompt.includes("ROOT_LOOP_LIMIT"));
 
 	await pi.commands[0]?.handler("manual stays", ctx);
-	const manualInquiries = pi.messages.filter(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry"),
-	).length;
+	assert.equal(privateInquiry.calls.length, 1);
 	assert.equal(runtimeQueuedState(pi, ctx), true);
 	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
 	assert.equal(domain.counters().rootLoops.value, 0n);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		manualInquiries,
-		"user takeover does not dispatch the stale automatic reflection",
+		automatic.options.signal?.aborted,
+		true,
+		"takeover aborts the in-flight private child immediately",
 	);
 	assert.equal(
-		runtimeQueuedState(pi, ctx),
-		true,
-		"manual request remains queued after takeover",
+		privateInquiry.calls.length,
+		1,
+		"user takeover launches no replacement while the old child drains",
+	);
+	// The old run settles (abort → cancelled): the takeover's generation
+	// bump makes the pre-takeover queued manual stale — it drops silently
+	// at drain rather than fulfilling under the new cycle. Coordinator
+	// af337239: explicit generation check replaces the earlier
+	// 'queue preserved' expectation.
+	automatic.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	assert.equal(
+		privateInquiry.calls.length,
+		1,
+		"the stale-generation queued manual drops silently at drain — it is\n" +
+			"never launched under the new takeover generation",
+	);
+	// A fresh manual under the new generation still fulfills normally,
+	// proving the drain consumed rather than wedged the queue.
+	await pi.commands[0]?.handler("fresh after takeover", ctx);
+	privateInquiry.calls
+		.at(-1)
+		?.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	assert.equal(
+		privateInquiry.calls.length,
+		2,
+		"the post-takeover request captured the new generation and fulfilled",
 	);
 });
 
@@ -1307,36 +1463,38 @@ test("terminal abort resets while non-abort and missing boundary preserve counte
 	assert.equal(domain.counters().allLoops.value, 1n);
 });
 
-test("abort cancels a staged reflection result before persistence or continuation", async () => {
+test("abort cancels a pending private run before persistence or continuation", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	const branch: any[] = [ordinaryLoop("before")];
 	ctx.setBranch(branch);
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.match(lastInquiry(pi)?.content ?? "", /ROOT_LOOP_LIMIT/);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	assert.ok(captured);
-	ctx.setBranch([
-		...branch,
-		branchMessage(
-			{
-				...captured.message,
-				stopReason: "aborted",
-			},
-			"reflection-aborted-tail",
-		),
-	]);
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry, {
+		id: "staged",
+	});
+	assert.ok(call.prompt.includes("ROOT_LOOP_LIMIT"));
+
+	// The main run aborts while the private child is still pending.
 	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	// A main-run abort cancels the staged result before it can act: no
-	// durable reflection entries, no ordinary continuation, and the cancelled
-	// inquiry's controls are withheld from later model-visible context.
+	await abortSettledRun(
+		pi,
+		ctx,
+		ctx.sessionManager.getBranch(),
+		assistant("tail").message,
+	);
+	assert.equal(
+		call.options.signal?.aborted,
+		true,
+		"abort signals the exact child immediately",
+	);
+
+	// The cancelled child settles late: zero parent traffic, no durable
+	// entries, no continuation, and the hold keeps dispatch parked.
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
 	assert.equal(
 		pi.entries.filter(
 			(entry) =>
@@ -1344,28 +1502,15 @@ test("abort cancels a staged reflection result before persistence or continuatio
 				entry.customType === "pi-reflect-watchdog:reflection-completed",
 		).length,
 		0,
-		"an aborted staged result leaves no durable reflection entries",
+		"a cancelled private run leaves no durable reflection entries",
 	);
 	assert.equal(continuationMessages(pi).length, 0);
 	assert.equal(domain.counters().rootLoops.value, 0n);
 	assert.equal(domain.counters().allLoops.value, 0n);
-	assert.deepEqual(
-		pi.actions.filter((action) => action === "continuation").length,
+	assert.equal(
+		pi.messages.filter(({ message }) => message.customType).length,
 		0,
-	);
-	const cancelled = await pi.emit(
-		"context",
-		{
-			messages: [lastInquiryFold(pi), lastInquiry(pi)]
-				.filter((message) => message !== undefined)
-				.map((message) => ({ role: "custom", ...message, timestamp: 1 })),
-		},
-		ctx,
-	);
-	assert.deepEqual(
-		cancelled.messages,
-		[],
-		"cancelled correlated controls stay out of model context",
+		"no main-session inquiry/fold/continuation traffic at all",
 	);
 });
 
@@ -1375,41 +1520,116 @@ async function abortSettledRun(
 	branch: any[],
 	capturedMessage: any,
 ) {
-	ctx.setBranch([
-		...branch,
-		branchMessage({ ...capturedMessage, stopReason: "aborted" }, "abort-tail"),
-	]);
+	const aborted = { ...capturedMessage, stopReason: "aborted" };
+	// A fresh run starts (capturing the abort boundary at the current leaf),
+	// then its authoritative aborted outcome reaches message_end; the hold +
+	// revocation install there, and the trailing agent_settled only settles.
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	ctx.setBranch([...branch, branchMessage(aborted, "abort-tail")]);
+	await pi.emit("message_end", { message: aborted }, ctx);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
 }
 
-test("post-abort hold blocks dispatch until explicit input or /reflect releases it", async () => {
+// K (completion hook, staged-result scenario). Packed cannot hold this window:
+// the real child's result write and the acceptance of its settled turn are
+// one provider response. The real shared runner runs here; only the child is
+// a driver that writes a valid file and then holds before settling.
+test("abort after a valid result is staged but before acceptance publishes nothing", async () => {
+	const driver = createReflectionDriver();
 	const { pi, ctx, domain } = install({
+		privateInquiry: { service: driver.service } as any,
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
+	const hooks = captureReflectionHooks(pi);
+	ctx.setBranch([ordinaryLoop("before")]);
+	await pi.emit("session_start", {}, ctx);
+	let release!: () => void;
+	driver.respond({
+		write: JSON.stringify(validNoIssue),
+		writeBeforeHold: true,
+		hold: new Promise<void>((resolve) => {
+			release = resolve;
+		}),
+	});
+	await pi.commands[0]?.handler("", ctx);
+	const operation = await awaitReflectionOperation(driver);
+	const child = await (async () => {
+		for (let index = 0; index < 2000; index += 1) {
+			const found = driver.children[0];
+			if (found !== undefined && found.prompts.length === 1) {
+				const resultFile = driver.forkInputs[0]?.resultFile ?? "";
+				const staged = await readFile(resultFile, "utf8").catch(() => "");
+				if (staged === JSON.stringify(validNoIssue)) return found;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		throw new Error("valid result was never staged");
+	})();
+	domain.setCounters({ rootLoops: 1n, allLoops: 1n });
+	await abortSettledRun(
+		pi,
+		ctx,
+		ctx.sessionManager.getBranch(),
+		assistant("tail").message,
+	);
+	assert.equal(operation.options.signal?.aborted, true);
+	release();
+	const result = await settleReflectionOperation(driver);
+	assert.equal(
+		result?.kind,
+		"cancelled",
+		"the staged valid file is not accepted",
+	);
+	assert.equal(child.aborted, true, "the exact child was aborted");
+	assert.deepEqual(hooks, []);
+	assert.equal(
+		pi.entries.filter(({ customType }) =>
+			customType?.startsWith("pi-reflect-watchdog:reflection"),
+		).length,
+		0,
+	);
+	assert.equal(continuationMessages(pi).length, 0);
+	assert.equal(driver.children.length, 1, "no replacement child");
+	assert.equal(child.prompts.length, 1, "no correction or retry");
+});
+
+test("post-abort hold blocks dispatch until explicit input or /reflect releases it", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	const branch: any[] = [ordinaryLoop("before")];
 	ctx.setBranch(branch);
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	await abortSettledRun(pi, ctx, branch, captured.message);
-	const requestsAtAbort = pi.messages.length;
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
+	await abortSettledRun(
+		pi,
+		ctx,
+		ctx.sessionManager.getBranch(),
+		call.options ? assistant("tail").message : undefined,
+	);
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
 
 	// Counters observed during the hold must not retain work for release.
 	domain.setCounters({ rootLoops: 5n, allLoops: 5n });
 	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(pi.messages.length, requestsAtAbort, "hold blocks dispatch");
+	assert.equal(
+		privateInquiry.calls.length,
+		1,
+		"hold blocks dispatch of a fresh crossing",
+	);
 
 	// A user-role message alone does not release the hold (extension wakes).
 	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
 	await pi.emit("agent_start", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
-		pi.messages.length,
-		requestsAtAbort,
+		privateInquiry.calls.length,
+		1,
 		"role-only user message keeps the hold",
 	);
 
@@ -1420,19 +1640,22 @@ test("post-abort hold blocks dispatch until explicit input or /reflect releases 
 });
 
 test("extension-sourced input and repeated settlement cannot release the hold", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
-	const branch: any[] = [ordinaryLoop("before")];
-	ctx.setBranch(branch);
+	ctx.setBranch([ordinaryLoop("before")]);
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	await abortSettledRun(pi, ctx, branch, captured.message);
-	const requestsAtAbort = pi.messages.length;
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
+	await abortSettledRun(
+		pi,
+		ctx,
+		ctx.sessionManager.getBranch(),
+		assistant("tail").message,
+	);
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
 
 	await pi.emit(
 		"input",
@@ -1442,8 +1665,8 @@ test("extension-sourced input and repeated settlement cannot release the hold", 
 	await pi.emit("agent_settled", {}, ctx);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
-		pi.messages.length,
-		requestsAtAbort,
+		privateInquiry.calls.length,
+		1,
 		"extension input and repeated settlement keep the hold",
 	);
 
@@ -1452,97 +1675,84 @@ test("extension-sourced input and repeated settlement cannot release the hold", 
 		{ type: "input", source: "interactive", text: "real user" },
 		ctx,
 	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	// rootLoopLimit is 1: one ordinary loop in the fresh cycle crosses it, so
-	// a released hold would produce exactly one new inquiry; a still-held
-	// cycle produces none. Either way nothing before release dispatched.
-	const inquiryCount = pi.messages.length - requestsAtAbort;
+	await triggerAutoReflection(pi, ctx, privateInquiry, { id: "fresh" });
+	// rootLoopLimit is 1: the fresh cycle's ordinary loop crosses it, so a
+	// released hold produces exactly one new private run; a still-held cycle
+	// produces none. Either way nothing before release dispatched.
+	const launches = privateInquiry.calls.length - 1;
 	assert.ok(
-		inquiryCount === 0 || inquiryCount === 1,
-		`unexpected inquiry count after release: ${inquiryCount}`,
+		launches === 0 || launches === 1,
+		`unexpected private launches after release: ${launches}`,
 	);
 });
 
 test("extension input before abort settlement cannot bypass the hold", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
 	await pi.emit("input", { source: "extension", text: "callback" }, ctx);
-	await abortSettledRun(pi, ctx, [], assistant(validNoIssue).message);
-	const count = pi.messages.length;
+	await abortSettledRun(pi, ctx, [], assistant("tail").message);
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
 	domain.setCounters({ rootLoops: 5n, allLoops: 5n });
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
-		pi.messages.length,
-		count,
+		privateInquiry.calls.length,
+		1,
 		"extension input must not count as explicit re-entry",
 	);
 });
 
 test("abort inhibition and re-entry reset precede synchronous counter notifications", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
+	await triggerAutoReflection(pi, ctx, privateInquiry);
 	const reset = domain.resetCycleOnUserTakeover.bind(domain);
-	const inquiriesAtReset: number[] = [];
+	const launchesAtReset: number[] = [];
 	domain.resetCycleOnUserTakeover = async () => {
 		// Reentrant observers can see the old snapshot before reset is published.
 		domain.setCounters({ rootLoops: 5n, allLoops: 5n });
-		inquiriesAtReset.push(
-			pi.messages.filter(({ message }) =>
-				String(message.customType).endsWith(":inquiry"),
-			).length,
-		);
+		launchesAtReset.push(privateInquiry.calls.length);
 		return reset();
 	};
-	await abortSettledRun(pi, ctx, [], assistant(validNoIssue).message);
+	await abortSettledRun(pi, ctx, [], assistant("tail").message);
 	assert.deepEqual(
-		inquiriesAtReset,
+		launchesAtReset,
 		[1],
 		"abort must hold before reset notifications",
 	);
 	await pi.emit("input", { source: "rpc", text: "resume" }, ctx);
 	assert.deepEqual(
-		inquiriesAtReset,
+		launchesAtReset,
 		[1, 1],
 		"re-entry must reset while still held",
 	);
 	assert.equal(domain.counters().rootLoops.value, 0n);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType).endsWith(":inquiry"),
-		).length,
-		2,
-	);
+	await triggerAutoReflection(pi, ctx, privateInquiry, { id: "fresh" });
+	assert.equal(privateInquiry.calls.length, 2);
 });
 
 test("explicit input submitted during abort settlement is not re-held", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
-	const branch: any[] = [ordinaryLoop("before")];
-	ctx.setBranch(branch);
+	ctx.setBranch([ordinaryLoop("before")]);
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
 	ctx.setBranch([
-		...branch,
+		...ctx.sessionManager.getBranch(),
 		branchMessage(
-			{ ...captured.message, stopReason: "aborted" },
+			{ ...assistant("tail").message, stopReason: "aborted" },
 			"abort-tail-input",
 		),
 	]);
@@ -1550,87 +1760,96 @@ test("explicit input submitted during abort settlement is not re-held", async ()
 	// The user submits while the aborted run is still settling.
 	await pi.emit("input", { type: "input", source: "rpc", text: "quick" }, ctx);
 	await pi.emit("agent_settled", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	// rootLoopLimit is 1: the first ordinary loop of the fresh cycle crosses it,
-	// so a cycle NOT re-held by the older settlement dispatches exactly one new
-	// inquiry (2 total). A wrongly installed hold would leave it at 1 forever.
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	// rootLoopLimit is 1: the first ordinary loop of the fresh cycle crosses
+	// it, so a cycle NOT re-held by the older settlement launches exactly one
+	// new private run (2 total). A wrongly installed hold would leave it at 1.
+	await triggerAutoReflection(pi, ctx, privateInquiry, { id: "fresh" });
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		privateInquiry.calls.length,
 		2,
 		"the older settlement did not re-hold the user's new cycle",
 	);
 });
 
 test("new /reflect during abort settlement cancels old requests and survives old settlement", async () => {
-	const { pi, ctx, domain } = install();
+	const privateInquiry = new ControllerOutcomeStub();
+	// The old child stays draining after revocation until `settle` — that is
+	// the real during-settlement window this race exercises.
+	privateInquiry.suspendAbort = true;
+	const { pi, ctx, domain } = install({ privateInquiry });
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("old approach", ctx);
-	await startReflectionRun(pi, ctx);
+	const oldCall = await pendingReflection(privateInquiry);
+	assert.match(oldCall.prompt, /old approach/);
+	// A second /reflect queues behind the active private run.
 	await pi.commands[0]?.handler("discard waiting", ctx);
+	// Abort the main run at the authoritative boundary: the aborted
+	// message_end installs the hold + revocation, but the old private run
+	// is still draining (slot retained until its own settlement).
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	const aborted = { ...assistant("tail").message, stopReason: "aborted" };
 	ctx.setBranch([
-		branchMessage(assistant(validNoIssue).message, "abort-manual"),
+		...ctx.sessionManager.getBranch(),
+		branchMessage(aborted, "abort-tail"),
 	]);
-	ctx.setBranch([
-		branchMessage(
-			{ ...assistant(validNoIssue).message, stopReason: "aborted" },
-			"abort-manual",
-		),
-	]);
+	await pi.emit("message_end", { message: aborted }, ctx);
 	ctx.setIdle(true);
-	await pi.commands[0]?.handler("new approach", ctx);
-	const fresh = lastInquiry(pi);
-	assert.match(fresh.content, /new approach/);
-	assert.doesNotMatch(fresh.content, /old approach|discard waiting/);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(lastInquiry(pi), fresh);
-	assert.equal(domain.counters().rootLoops.value, 0n);
-	await startReflectionRun(pi, ctx);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
-	assert.equal(continuationMessages(pi).length, 1);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType).endsWith(":inquiry"),
-		).length,
-		2,
+		oldCall.options.signal?.aborted,
+		true,
+		"old private run was revoked at the abort boundary",
 	);
+	// The fresh explicit request lands DURING settlement — before the old
+	// run's drain and the aborted main run's agent_settled.
+	await pi.commands[0]?.handler("new approach", ctx);
+	await flushAsync();
+	assert.equal(
+		privateInquiry.calls.length,
+		1,
+		"queued manual stays behind the still-draining old run",
+	);
+	// The old run's own settlement drains the slot; the queued explicit
+	// request is the scheduling trigger — no extra user command needed.
+	oldCall.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	// The aborted main run's settlement must not discard or re-hold the
+	// already-admitted fresh reflection.
+	await pi.emit("agent_settled", {}, ctx);
+	await flushAsync();
+	assert.equal(privateInquiry.calls.length, 2, "fresh request launched");
+	assert.match(lastPrompt(privateInquiry), /new approach/);
+	assert.doesNotMatch(
+		lastPrompt(privateInquiry),
+		/old approach|discard waiting/,
+	);
+	assert.equal(domain.counters().rootLoops.value, 0n);
+	// The fresh request completes independently of the old settlement.
+	await settleDecision(privateInquiry);
+	assert.equal(continuationMessages(pi).length, 1);
 });
 
 test("aborted correction attempt neither reasks nor warns", async () => {
-	const { pi, ctx } = install();
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx } = install({ privateInquiry });
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	const invalid = { ...validNoIssue, reason: "   " };
-	// The owned response is aborted mid-correction instead of settling clean.
-	const abortedAssistant = {
-		...assistant(invalid).message,
-		stopReason: "aborted",
-		content: [
-			{
-				type: "toolCall",
-				id: "ref-aborted",
-				name: "ref",
-				arguments: JSON.stringify(invalid),
-			},
-		],
-	};
-	const rewritten = await pi.emit(
-		"message_end",
-		{ message: abortedAssistant },
+	const call = await pendingReflection(privateInquiry);
+	// The child is revoked mid-operation: it reports cancelled instead of a
+	// validated payload or a correction attempt.
+	await abortSettledRun(
+		pi,
 		ctx,
+		ctx.sessionManager.getBranch(),
+		assistant("tail").message,
 	);
-	assert.equal(rewritten?.message.stopReason, "aborted");
-	assert.deepEqual(rewritten?.message.content, []);
-	const branch: any[] = [
-		branchMessage(abortedAssistant, "correction-abort-tail"),
-	];
-	ctx.setBranch(branch);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	assert.equal(call.options.signal?.aborted, true);
+	call.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
 	assert.deepEqual(
 		ctx.notifications.filter(
 			(text) =>
@@ -1638,93 +1857,40 @@ test("aborted correction attempt neither reasks nor warns", async () => {
 				text.startsWith("Reflection failed"),
 		),
 		[],
-		"an aborted attempt issues no retry warning",
+		"a cancelled private run issues no retry warning",
 	);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		privateInquiry.calls.length,
 		1,
 		"no correction reask follows the abort",
 	);
 });
 
-test("late correlated result and tool calls preserve a fresh confirmed inquiry and its budgets", async () => {
-	const { pi, ctx } = install();
+test("late cancelled outcome preserves a fresh manual reflection and its authority", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx } = install({ privateInquiry });
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("old", ctx);
-	await startReflectionRun(pi, ctx);
-	const oldReply = assistant(validNoIssue);
-	oldReply.message.content = [
-		{
-			type: "toolCall",
-			id: "old-result",
-			name: "ref",
-			arguments: validNoIssue,
-		},
-	];
-	const captured = await pi.emit("message_end", oldReply, ctx);
-	await abortSettledRun(pi, ctx, [], captured.message);
-	// Stock Pi completes old settlement before running deferred /reflect.
-	await pi.emit("agent_settled", {}, ctx);
+	const oldCall = await pendingReflection(privateInquiry);
+	// The main run aborts; the stale private outcome settles after the hold.
+	await abortSettledRun(pi, ctx, [], assistant("tail").message);
+	oldCall.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	await pi.emit("input", { source: "rpc", text: "resume" }, ctx);
+	privateInquiry.respond(validCorrection);
 	await pi.commands[0]?.handler("fresh", ctx);
-	await startReflectionRun(pi, ctx);
-	const freshPrompt = lastInquiry(pi);
-	const requests = pi.messages.length;
-	await pi.handlers.get("message_end")?.({ message: captured.message }, ctx);
-	await assert.rejects(
-		() => pi.tools.get("ref").execute("old-result", validNoIssue),
-		/reserved for the plugin/,
-	);
+	await flushAsync();
+	const freshCall = privateInquiry.pending;
+	assert.ok(freshCall);
+	assert.match(freshCall.prompt, /fresh/);
+	assert.notEqual(freshCall, oldCall);
 	assert.equal(
-		(
-			await pi.emit(
-				"tool_call",
-				{ toolCallId: "old-result", toolName: "read", input: {} },
-				ctx,
-			)
-		)?.block,
-		true,
+		oldCall.options.isCurrent(),
+		false,
+		"the revoked run's isCurrent can never re-claim authority",
 	);
-	await pi.emit(
-		"tool_result",
-		{
-			toolCallId: "old-result",
-			toolName: "ref",
-			input: validNoIssue,
-			content: [],
-			isError: false,
-		},
-		ctx,
-	);
-	assert.equal(lastInquiry(pi), freshPrompt);
-	assert.equal(
-		pi.messages.length,
-		requests,
-		"old callbacks cannot send a retry or replace fresh authority",
-	);
-	for (let index = 0; index < 10; index++)
-		assert.equal(
-			(
-				await pi.emit(
-					"tool_call",
-					{ toolCallId: `fresh-${index}`, toolName: "read", input: {} },
-					ctx,
-				)
-			)?.block,
-			undefined,
-		);
-	assert.equal(
-		(
-			await pi.emit(
-				"tool_call",
-				{ toolCallId: "fresh-11", toolName: "read", input: {} },
-				ctx,
-			)
-		)?.block,
-		true,
-	);
-	await completeReflectionAttempt(pi, ctx, validCorrection);
+	assert.equal(privateInquiry.calls.length, 2);
 	assert.equal(continuationMessages(pi).length, 1);
 	assert.equal(
 		pi.entries.filter(
@@ -1738,55 +1904,54 @@ test("late correlated result and tool calls preserve a fresh confirmed inquiry a
 	);
 });
 
-test("late result call from a cancelled inquiry stays reserved with no active inquiry", async () => {
-	const { pi, ctx } = install({
+test("stale private outcome after takeover writes nothing upstream", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
 	});
-	const branch: any[] = [ordinaryLoop("before")];
-	ctx.setBranch(branch);
+	ctx.setBranch([ordinaryLoop("before")]);
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	await abortSettledRun(pi, ctx, branch, captured.message);
-
-	// The stale ref call arrives after the hold; it must be reserved-rejected.
-	let rejection: unknown;
-	try {
-		await pi.emit(
-			"message_end",
-			{
-				message: {
-					role: "assistant",
-					stopReason: "toolUse",
-					content: [
-						{
-							type: "toolCall",
-							id: "stale-ref",
-							name: "ref",
-							arguments: JSON.stringify(validNoIssue),
-						},
-					],
-				},
-			},
-			ctx,
-		);
-	} catch (error) {
-		rejection = error;
-	}
-	assert.match(
-		String(rejection),
-		/This function is reserved for the plugin\. Please try another function\./,
+	// Keep the run open past revocation so a valid decision truly arrives late.
+	privateInquiry.suspendAbort = true;
+	const call = await triggerAutoReflection(pi, ctx, privateInquiry);
+	await abortSettledRun(
+		pi,
+		ctx,
+		ctx.sessionManager.getBranch(),
+		assistant("tail").message,
+	);
+	const before =
+		pi.messages.length + pi.entries.length + ctx.notifications.length;
+	assert.equal(
+		call.options.signal?.aborted,
+		true,
+		"revoked before the outcome",
+	);
+	assert.equal(call.options.isCurrent(), false);
+	const counters = domain.counters();
+	// The stale child resolves a fully valid decision late; revocation wins.
+	call.resolve({
+		kind: "decision",
+		decision: validNoIssue,
+		sessionId: "fake-child",
+		reconsidered: false,
+	});
+	const settled = await privateInquiry.runs.at(-1);
+	await flushAsync();
+	assert.equal(
+		settled?.kind,
+		"decision",
+		"the late valid decision reached the seam",
 	);
 	assert.equal(
-		pi.entries.filter((entry) =>
-			entry.customType.startsWith("pi-reflect-watchdog:reflection"),
-		).length,
-		0,
-		"a cancelled inquiry's late submission records nothing",
+		pi.messages.length + pi.entries.length + ctx.notifications.length,
+		before,
+		"a late valid outcome is dropped without traffic",
 	);
+	assert.equal(privateInquiry.calls.length, 1, "no replacement launch");
+	for (const key of ["activeLoops", "rootLoops", "allLoops", "taskMs"] as const)
+		assert.equal(domain.counters()[key].value, counters[key].value);
 });
 
 test("cancel-reflect keeps withdrawal-only behavior after abort cancellation", async () => {
@@ -1803,37 +1968,29 @@ test("cancel-reflect keeps withdrawal-only behavior after abort cancellation", a
 	);
 });
 
-test("authoritative domain loops trigger the ask from ordinary work", async () => {
-	const { pi, ctx, domain } = install();
+test("authoritative domain loops trigger the private run from ordinary work", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
+	const { pi, ctx, domain } = install({
+		privateInquiry,
+		limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+	});
 	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(pi.messages.length, 0, "one loop remains below threshold");
-	await pi.emit("turn_end", turnEnd("toolUse"), ctx);
-	assert.equal(domain.rootWrites, 2);
+	const first = await triggerAutoReflection(pi, ctx, privateInquiry, {
+		id: "loop-1",
+	});
+	assert.ok(first.prompt.includes("ROOT_LOOP_LIMIT"));
+	assert.equal(domain.rootWrites, 1);
 	assert.equal(domain.allWrites, 0);
-	assert.match(
-		lastInquiry(pi)?.content ?? "",
-		/ROOT_LOOP_LIMIT/,
-		"threshold reflection steers the current ordinary run",
-	);
 	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
-	await correlateReflection(pi, ctx);
-	await pi.emit("message_end", assistant(validNoIssue), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(domain.resetWrites, 1);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	first.resolve({ kind: "cancelled", sessionId: "fake-child" });
+	await flushAsync();
+	await triggerAutoReflection(pi, ctx, privateInquiry, { id: "loop-2" });
+	// Each threshold crossing consumes the reminder latch on dispatch.
+	assert.equal(domain.resetWrites, 2);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		1,
-		"the reset cycle re-arms threshold latches without an immediate duplicate",
+		privateInquiry.calls.length,
+		2,
+		"the reset cycle re-arms threshold latches without a duplicate",
 	);
 });
 
@@ -1889,11 +2046,13 @@ test("only agent-produced text or tool calls count as loops", async () => {
 });
 
 test("same-process child threshold queues reflection while the child stays busy", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const hub = createObservableAgentHub();
 	const domain = new FakeDomain();
 	const root = install({
 		hub,
 		domain,
+		privateInquiry,
 		ctx: context("root", { hasUI: true }),
 		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
@@ -1905,45 +2064,59 @@ test("same-process child threshold queues reflection while the child stays busy"
 	});
 	await root.pi.emit("session_start", {}, root.ctx);
 	await child.pi.emit("session_start", {}, child.ctx);
+	seedAnchor(root.ctx);
 	child.ctx.setIdle(false);
 	await child.pi.emit("agent_start", {}, child.ctx);
 	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
+	await flushAsync();
 	assert.equal(domain.rootWrites, 0);
 	assert.equal(domain.allWrites, 1);
-	assert.match(lastInquiry(root.pi)?.content ?? "", /ALL_LOOP_LIMIT/);
+	assert.ok(
+		privateInquiry.pending?.prompt.includes("ALL_LOOP_LIMIT"),
+		"child loop crossed the all-loop threshold on the owner's behalf",
+	);
 });
 
 test("cross-process child threshold queues reflection while the child stays busy", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
 	domain.setRemoteBusy(true);
 	domain.remoteCompletion();
-	assert.match(lastInquiry(pi)?.content ?? "", /ALL_LOOP_LIMIT/);
+	await flushAsync();
+	assert.ok(
+		privateInquiry.pending?.prompt.includes("ALL_LOOP_LIMIT"),
+		"remote completion crossed the all-loop threshold",
+	);
 });
 
 test("native Pi steering queue accepts reflection despite an existing pending message", async () => {
+	const privateInquiry = new ControllerOutcomeStub();
 	const { pi, ctx, domain } = install({
+		privateInquiry,
 		limits: { allLoopLimit: 1, rootLoopLimit: 60 },
 	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	ctx.setIdle(false);
 	ctx.setPendingMessages(true);
 	await pi.emit("agent_start", {}, ctx);
 	domain.remoteCompletion();
-	const inquiry = lastInquiry(pi);
-	assert.match(inquiry?.content ?? "", /ALL_LOOP_LIMIT/);
-	assert.deepEqual(pi.messages[pi.messages.length - 1]?.options, {
-		triggerTurn: true,
-		deliverAs: "steer",
-	});
+	await flushAsync();
+	assert.ok(
+		privateInquiry.pending?.prompt.includes("ALL_LOOP_LIMIT"),
+		"pending messages never block the private launch",
+	);
 });
 
 test("valid final reflections publish exact payloads once after durable entries", async () => {
-	for (const [text, expected] of [
+	for (const [decision, expected] of [
 		[
 			validNoIssue,
 			{
@@ -1961,18 +2134,23 @@ test("valid final reflections publish exact payloads once after durable entries"
 			},
 		],
 	] as const) {
+		const driver = createReflectionDriver();
 		const ctx = context("root", {
 			mode: "tui",
 			sessionFile: "/missing/hook-session.jsonl",
 		});
 		ctx.setBranch([ordinaryLoop("hook-anchor")]);
-		const { pi, domain } = install({ ctx });
+		const { pi, domain } = install({
+			ctx,
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		driver.respond({ write: JSON.stringify(decision) });
 		await pi.commands[0]?.handler("", ctx);
-		assert.match(lastInquiry(pi)?.content ?? "", /hook-anchor/);
-		await startReflectionRun(pi, ctx);
-		await completeReflectionAttempt(pi, ctx, text);
+		await awaitReflectionOperation(driver);
+		await settleReflectionOperation(driver);
 		assert.deepEqual(hooks, [
 			{ version: 1, name: "reflection-completed", values: expected },
 		]);
@@ -2014,16 +2192,21 @@ test("completion hook clips transport text without changing durable result", asy
 		},
 	];
 	for (const item of cases) {
-		const { pi, ctx } = install();
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		driver.respond({
+			write: JSON.stringify(
+				reflectionArguments({ reason: item.reason, nextStep: item.nextStep }),
+			),
+		});
 		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
-		await completeReflectionAttempt(
-			pi,
-			ctx,
-			reflectionArguments({ reason: item.reason, nextStep: item.nextStep }),
-		);
+		await awaitReflectionOperation(driver);
+		await settleReflectionOperation(driver);
 		const result = pi.entries.find(
 			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
 		)?.data as { decision: { reason: string; nextStep: string } };
@@ -2049,7 +2232,10 @@ test("incomplete persistence never publishes completion", async () => {
 			"pi-reflect-watchdog:reflection",
 			"pi-reflect-watchdog:reflection-completed",
 		]) {
-			const { pi, ctx } = install();
+			const driver = createReflectionDriver();
+			const { pi, ctx } = install({
+				privateInquiry: { service: driver.service } as any,
+			});
 			const hooks = captureReflectionHooks(pi);
 			const appendEntry = pi.appendEntry.bind(pi);
 			pi.appendEntry = (customType: string, data: unknown) => {
@@ -2058,15 +2244,13 @@ test("incomplete persistence never publishes completion", async () => {
 				appendEntry(customType, data);
 			};
 			await pi.emit("session_start", {}, ctx);
+			seedAnchor(ctx);
+			driver.respond({ write: JSON.stringify(args) });
 			await pi.commands[0]?.handler("", ctx);
-			await startReflectionRun(pi, ctx);
-			await pi.emit("message_end", assistant(args), ctx);
-			await pi.emit("turn_end", turnEnd("stop"), ctx);
-			ctx.setIdle(true);
-			await assert.rejects(
-				() => pi.emit("agent_settled", {}, ctx),
-				/fixture append failed/,
-			);
+			await awaitReflectionOperation(driver);
+			// The persistence throw surfaces inside the private task; the run
+			// settles without durable entries, hook or continuation.
+			await settleReflectionOperation(driver);
 			const persisted = pi.entries.length;
 			await pi.emit("agent_settled", {}, ctx);
 			assert.equal(
@@ -2085,79 +2269,127 @@ test("incomplete persistence never publishes completion", async () => {
 
 test("retry, exhaustion, no decision, ownership loss, and shutdown stay silent", async () => {
 	{
-		const { pi, ctx } = install();
+		// Retry + exhaustion: invalid payloads correct in the same child and
+		// exhaust the bound; no hook, no continuation, no parent traffic.
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		driver.respond({ write: "invalid" });
+		driver.respond({ write: "invalid again" });
+		driver.respond({ write: "invalid exhausted" });
 		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
-		await completeReflectionAttempt(pi, ctx, "invalid");
-		assert.deepEqual(hooks, [], "retry attempt is silent");
-		for (const text of ["invalid again", "invalid exhausted"]) {
-			await startReflectionRun(pi, ctx);
-			await completeReflectionAttempt(pi, ctx, text);
-		}
+		await awaitReflectionOperation(driver);
+		const result = await settleReflectionOperation(driver);
+		assert.equal(result?.kind, "decision-failed");
 		assert.deepEqual(hooks, [], "exhausted validation is silent");
 		assert.equal(continuationMessages(pi).length, 0);
 	}
 	{
-		const { pi, ctx } = install();
+		// No decision: the child's response throws — a provider/transport
+		// execution error, not a published reflection.
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		driver.respond({ throw: new Error("provider down") });
 		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
-		await pi.emit("turn_end", turnEnd("stop"), ctx);
-		ctx.setIdle(true);
-		await pi.emit("agent_settled", {}, ctx);
+		await awaitReflectionOperation(driver);
+		const result = await settleReflectionOperation(driver);
+		assert.notEqual(result?.kind, "decision");
 		assert.deepEqual(hooks, [], "settled run without decision is silent");
 		assert.equal(continuationMessages(pi).length, 0);
 	}
 	{
+		// Ownership loss mid-operation: the second install claims the hub
+		// before the private run settles — its outcome commits nothing.
 		const hub = createObservableAgentHub();
 		const domain = new FakeDomain();
+		const driver = createReflectionDriver();
 		const root = install({
 			hub,
 			domain,
+			privateInquiry: { service: driver.service } as any,
 			ctx: context("root", { hasUI: false }),
 		});
 		const hooks = captureReflectionHooks(root.pi);
 		await root.pi.emit("session_start", {}, root.ctx);
+		seedAnchor(root.ctx);
+		// A valid file is staged and held across the ownership move.
+		const staged = stageValidThenHold(driver);
 		await root.pi.commands[0]?.handler("", root.ctx);
-		await startReflectionRun(root.pi, root.ctx);
+		await awaitReflectionOperation(driver);
+		await staged.ready();
 		const owner = install({
 			hub,
 			domain,
 			ctx: context("owner", { hasUI: true }),
 		});
 		await owner.pi.emit("session_start", {}, owner.ctx);
-		root.ctx.setIdle(true);
-		await root.pi.emit("agent_settled", {}, root.ctx);
+		staged.release();
+		await settleReflectionOperation(driver);
 		assert.deepEqual(hooks, [], "ownership loss is silent");
 		assert.equal(continuationMessages(root.pi).length, 0);
 	}
 	{
-		const { pi, ctx } = install();
+		// Shutdown while parked: the private run never publishes.
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
 		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
-		await pi.emit("message_end", assistant(validNoIssue), ctx);
+		const operation = await awaitReflectionOperation(driver);
 		await pi.emit("session_shutdown", {}, ctx);
-		ctx.setIdle(true);
-		await pi.emit("agent_settled", {}, ctx);
+		// Shutdown revokes: the parked child aborts and the run settles
+		// cancelled — wait without the never-scripted check (the child IS
+		// intentionally parked when the shutdown lands).
+		for (let attempt = 0; attempt < 2000 && !operation.settled; attempt += 1)
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		await flushAsync();
 		assert.deepEqual(hooks, [], "shutdown is silent");
 		assert.equal(continuationMessages(pi).length, 0);
 	}
 });
 
 test("throwing completion listener cannot change result, UI, counters, or later dispatch", async () => {
+	const driver = createReflectionDriver();
 	const ctx = context("root", { mode: "tui" });
-	const { pi, domain } = install({ ctx });
+	const { pi, domain } = install({
+		ctx,
+		privateInquiry: { service: driver.service } as any,
+	});
 	const hooks = captureReflectionHooks(pi, true);
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	driver.respond({ write: JSON.stringify(validCorrection) });
+	// "second" stays unscripted: it parks as a real pending child, exactly
+	// the unconsumed later dispatch the original test asserted.
 	await pi.commands[0]?.handler("first", ctx);
-	await startReflectionRun(pi, ctx);
 	await pi.commands[0]?.handler("second", ctx);
-	await completeReflectionAttempt(pi, ctx, validCorrection);
+	// Wait on the first run itself: under load it can publish and dispatch
+	// the parked "second" before a latest-operation helper looks.
+	await awaitReflectionOperation(driver);
+	// Exactly operation 0 (never "latest", which may be the parked second).
+	const first = driver.operations[0];
+	assert.ok(first);
+	for (let turn = 0; turn < 2000 && !first.settled; turn += 1)
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	assert.equal(first.settled, true, "first run settled");
+	for (
+		let turn = 0;
+		turn < 2000 && (hooks.length < 1 || driver.operations.length < 2);
+		turn += 1
+	)
+		await new Promise((resolve) => setTimeout(resolve, 1));
 	assert.equal(hooks.length, 1);
 	assert.equal(
 		pi.entries.filter(
@@ -2173,40 +2405,49 @@ test("throwing completion listener cannot change result, UI, counters, or later 
 	);
 	assert.equal(domain.counters().activeMs.value, 0n);
 	assert.equal(domain.counters().taskMs.value, 0n);
+	// A second queued manual dispatched by the post-drain release proves
+	// listener failure never touched the queue.
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		driver.operations.length,
 		2,
 		"later dispatch survives listener failure",
 	);
 });
 
 test("inquiry activity is officially busy while confirmed replies add no ordinary loops", async () => {
-	const { pi, ctx, domain } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx, domain } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	assert.equal(domain.activityWrites.includes(true), true);
-	const replacement = await pi.emit(
-		"message_end",
-		assistant(validNoIssue),
-		ctx,
-	);
-	assert.deepEqual(
-		replacement.message.content,
-		assistant(validNoIssue).message.content,
-	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
+	const operation = await awaitReflectionOperation(driver);
+	// The private child's own working period flips the domain busy flag —
+	// official busy while the run is in flight.
+	for (
+		let turn = 0;
+		turn < 2000 && !domain.activityWrites.includes(true);
+		turn += 1
+	)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	assert.equal(
-		domain.rootWrites,
-		0,
-		"message_end must not clear internal identity",
+		domain.activityWrites.includes(true),
+		true,
+		"private child work is officially busy",
 	);
-	assert.equal(domain.allWrites, 0);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.ok(lastInquiryFold(pi));
+	const rootBefore = domain.rootWrites;
+	const allBefore = domain.allWrites;
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	for (let turn = 0; turn < 2000 && !operation.settled; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	await flushAsync();
+	assert.equal(
+		domain.rootWrites - rootBefore,
+		0,
+		"private child replies add no ordinary loops",
+	);
+	assert.equal(domain.allWrites - allBefore, 0);
 	assert.equal(
 		pi.entries.filter(
 			(entry) =>
@@ -2214,19 +2455,20 @@ test("inquiry activity is officially busy while confirmed replies add no ordinar
 		).length,
 		1,
 	);
-	assert.equal(domain.counters().activeMs.value, 0n);
-	assert.equal(domain.counters().taskMs.value, 0n);
 });
 
 test("provisional reflection never captures an uncorrelated ordinary assistant", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	// Reflection dispatched while an ordinary run is busy stays provisional
-	// until its own prompt is correlated via message_start; the ordinary
-	// assistant reply must pass through untouched.
+	await awaitReflectionOperation(driver);
+	// The private path never inspects or rewrites main assistant turns —
+	// an ordinary assistant reply passing through the runtime while the
+	// private child is in flight stays untouched and is never captured.
 	const replacement = await pi.emit(
 		"message_end",
 		assistant("ordinary work in progress"),
@@ -2235,80 +2477,93 @@ test("provisional reflection never captures an uncorrelated ordinary assistant",
 	assert.equal(
 		replacement,
 		undefined,
-		"provisional run must not rewrite the ordinary assistant",
-	);
-	// The steer prompt then starts its own turn and is correlated.
-	await pi.emit("agent_start", {}, ctx);
-	await correlateReflection(pi, ctx);
-	const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-	assert.deepEqual(
-		captured.message.content,
-		assistant(validNoIssue).message.content,
-	);
-	assert.equal(
-		captured.message.stopReason ?? "stop",
-		"toolUse",
-		"neutralized inquiry assistant keeps a non-abort terminal state",
+		"private run must not rewrite the ordinary assistant",
 	);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
+	assert.equal(driver.operations.length, 1);
 });
 
 for (const terminal of ["success", "error"] as const) {
 	test(`reflection provider retries preserve the attempt until ${terminal} settlement`, async () => {
-		const { pi, ctx, domain } = install();
+		const driver = createReflectionDriver();
+		const { pi, ctx, domain } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
 		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
 		await pi.commands[0]?.handler("", ctx);
-		await startReflectionRun(pi, ctx);
+		const operation = await awaitReflectionOperation(driver);
+		let releaseRetry!: () => void;
+		const hold = new Promise<void>((resolve) => {
+			releaseRetry = resolve;
+		});
+		driver.respond({
+			nativeRetry: true,
+			hold,
+			write: JSON.stringify(validCorrection),
+			stopReason: terminal === "success" ? "stop" : "error",
+			...(terminal === "error"
+				? { errorMessage: "native retry exhausted" }
+				: {}),
+		});
+		for (
+			let turn = 0;
+			turn < 2000 && (driver.children[0]?.messages.length ?? 0) === 0;
+			turn += 1
+		)
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		const child = driver.children[0];
+		assert.ok(child);
+		assert.equal(
+			(child.messages[0] as { stopReason: string }).stopReason,
+			"error",
+		);
+		assert.equal(
+			child.prompts.length,
+			1,
+			"native retry remains inside the same prompt, not a format correction",
+		);
+		assert.equal(operation.options.fork.retryPolicy, "native");
+		assert.equal(operation.settled, false);
+		assert.equal(operation.options.signal?.aborted, false);
+		assert.deepEqual(hooks, []);
+		assert.equal(
+			pi.entries.filter(({ customType }) =>
+				/:reflection(?:-completed)?$/.test(customType),
+			).length,
+			0,
+		);
+		assert.equal(pi.messages.length, 0);
+		const writesBefore = domain.allWrites;
 		const notifications = [...ctx.notifications];
-		const errorMessage =
-			"Error Code model_not_found: unknown provider for model axis/gpt-6-astra\n\n[pi-retry] provider returned error";
-		for (let attempt = 0; attempt < 4; attempt += 1) {
-			const failed = {
-				role: "assistant",
-				stopReason: "error",
-				errorMessage,
-				content: [],
-			};
-			const replacement = await pi.emit(
-				"message_end",
-				{ message: failed },
-				ctx,
-			);
-			const delivered = replacement?.message ?? failed;
-			assert.equal(delivered.stopReason, "error");
-			assert.equal(delivered.errorMessage, errorMessage);
-			await pi.emit("turn_end", { message: failed }, ctx);
-			await pi.emit("agent_end", { messages: [failed] }, ctx);
-			assert.equal(domain.rootWrites, 0);
-			assert.equal(domain.allWrites, 0);
-			assert.equal(
-				pi.messages.length,
-				1,
-				"no correction prompt during retries",
-			);
-			assert.deepEqual(ctx.notifications, notifications);
-			assert.deepEqual(hooks, []);
-			if (attempt < 3) await pi.emit("agent_start", {}, ctx);
-		}
-		if (terminal === "success") {
-			await pi.emit("agent_start", {}, ctx);
-			await completeReflectionAttempt(pi, ctx, validCorrection);
-			assert.equal(hooks.length, 1);
-			assert.equal(continuationMessages(pi).length, 1);
-		} else {
-			ctx.setIdle(true);
-			await pi.emit("agent_settled", {}, ctx);
-			assert.deepEqual(hooks, []);
-			assert.equal(continuationMessages(pi).length, 0);
-			assert.equal(pi.entries.length, 0);
-		}
-		assert.equal(lastInquiry(pi).details.attempt, 1);
-		assert.ok(lastInquiryFold(pi));
-		assert.equal(domain.rootWrites, 0);
-		assert.equal(domain.allWrites, 0);
+		releaseRetry();
+		const result = await settleReflectionOperation(driver);
+		assert.equal(
+			result?.kind,
+			terminal === "success" ? "decision" : "execution-error",
+		);
+		assert.equal(child.prompts.length, 1);
+		assert.equal(driver.children.length, 1);
+		assert.equal(hooks.length, terminal === "success" ? 1 : 0);
+		assert.equal(
+			continuationMessages(pi).length,
+			terminal === "success" ? 1 : 0,
+		);
+		assert.equal(
+			pi.entries.filter(
+				({ customType }) =>
+					customType === "pi-reflect-watchdog:reflection-completed",
+			).length,
+			terminal === "success" ? 1 : 0,
+		);
+		assert.equal(
+			domain.allWrites,
+			writesBefore,
+			"private native retries add no ordinary loops",
+		);
 		assert.deepEqual(ctx.notifications, notifications);
 		const messages = pi.messages.length;
 		await pi.emit("agent_settled", {}, ctx);
@@ -2321,166 +2576,120 @@ for (const terminal of ["success", "error"] as const) {
 	});
 }
 
-test("confirmed neutralized assistant never synthesizes aborted stopReason", async () => {
-	const { pi, ctx } = install();
+test("private terminal source preserves its actual stopReason", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	const replacement = await pi.emit(
-		"message_end",
-		{
-			message: {
-				role: "assistant",
-				content: assistant(validNoIssue).message.content,
-				stopReason: "stop",
-			},
-		},
-		ctx,
-	);
-	assert.equal(replacement.message.stopReason, "stop");
-	assert.equal(replacement.message.errorMessage, undefined);
+	const operation = await awaitReflectionOperation(driver);
+	// The private child's own terminal assistant keeps its real stopReason
+	// — a settled "stop" is preserved verbatim; the runtime never
+	// synthesizes an aborted state over it.
+	driver.respond({
+		write: JSON.stringify(validNoIssue),
+		stopReason: "stop",
+	});
+	for (let turn = 0; turn < 2000 && !operation.settled; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	await flushAsync();
+	const result = await operation.result;
+	assert.equal(result.kind, "decision");
+	assert.equal(operation.options.signal?.aborted, false);
+	const marker = pi.messages.find(
+		({ message }) => message.customType === "pi-reflect-watchdog:continuation",
+	)?.message;
+	const source = marker?.details?.private as
+		| Record<string, unknown>
+		| undefined;
+	assert.equal(source?.stopReason, "stop");
+	// A cancelled run conversely never reports a synthesized neutralized
+	// terminal — kind is cancelled, not decision.
+	await pi.emit("session_shutdown", {}, ctx);
 });
 
-test("invalid result re-ask folds every attempt out of later context", async () => {
-	const { pi, ctx, domain } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	const firstCaptured = await pi.emit(
-		"message_end",
-		assistant("not result"),
-		ctx,
-	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 0);
-	assert.equal(domain.allWrites, 0);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(pi.entries.length, 0);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		2,
-		"invalid result dispatches one correlated re-ask after settlement",
-	);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	await correlateReflection(pi, ctx);
-	const secondCaptured = await pi.emit(
-		"message_end",
-		assistant(validNoIssue),
-		ctx,
-	);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	assert.equal(domain.rootWrites, 0);
-	assert.equal(domain.allWrites, 0);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(
-		pi.entries.filter(
-			(entry) =>
-				entry.customType === "pi-reflect-watchdog:reflection-completed",
-		).length,
-		1,
-	);
-
-	let timestamp = 1;
-	const transcript = pi.messages
-		.filter(({ message }) => {
-			const type = String(message.customType ?? "");
-			return type.endsWith(":inquiry") || type.endsWith(":inquiry-fold");
-		})
-		.flatMap(({ message }) => {
-			const control = { role: "custom", ...message, timestamp: timestamp++ };
-			if (!String(message.customType).endsWith(":inquiry")) return [control];
-			const captured =
-				message.details.attempt === 1
-					? firstCaptured.message
-					: secondCaptured.message;
-			return [control, { ...captured, timestamp: timestamp++ }];
+// Retired triage #40–42: new main inquiry/fold traffic is replaced by private
+// same-child correction and silent exhaustion; historical folding tests remain.
+for (const invalidAttempts of [1, 2, 3])
+	test(`private file correction uses ${invalidAttempts} invalid attempts without parent residue`, async () => {
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
 		});
-	const folded = await pi.emit("context", { messages: transcript }, ctx);
-	assert.deepEqual(
-		folded.messages,
-		[],
-		"reflection retries and control messages must not reach later model context",
-	);
-});
-
-test("three-attempt result correction chain emits one final fold and leaves no context", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	const captured = [
-		await completeReflectionAttempt(pi, ctx, { ...validNoIssue, reason: "" }),
-	];
-	await startReflectionRun(pi, ctx);
-	captured.push(
-		await completeReflectionAttempt(pi, ctx, "invalid attempt two"),
-	);
-	await startReflectionRun(pi, ctx);
-	captured.push(await completeReflectionAttempt(pi, ctx, validNoIssue));
-
-	const controls = pi.messages.filter(({ message }) => {
-		const type = String(message.customType ?? "");
-		return type.endsWith(":inquiry") || type.endsWith(":inquiry-fold");
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		await pi.commands[0]?.handler("", ctx);
+		const operation = await awaitReflectionOperation(driver);
+		const notifications = [...ctx.notifications];
+		for (let attempt = 0; attempt < invalidAttempts; attempt += 1)
+			driver.respond({ write: `invalid private attempt ${attempt}` });
+		if (invalidAttempts < 3)
+			driver.respond({ write: JSON.stringify(validNoIssue) });
+		const result = await settleReflectionOperation(driver);
+		assert.equal(
+			result?.kind,
+			invalidAttempts === 3 ? "decision-failed" : "decision",
+		);
+		assert.equal(driver.children.length, 1);
+		const child = driver.children[0];
+		assert.ok(child);
+		assert.equal(child.prompts.length, Math.min(invalidAttempts + 1, 3));
+		assert.deepEqual(child.fileStates, Array(child.prompts.length).fill("{}"));
+		assert.equal(child.disposed, true);
+		assert.equal(operation.options.signal?.aborted, false);
+		assert.equal(
+			pi.messages.filter(({ message }) =>
+				/:inquiry(?:-fold)?$/.test(String(message.customType)),
+			).length,
+			0,
+		);
+		// The existing bounded per-attempt warning precedes each correction;
+		// the third invalid attempt ends with the terminal failure instead.
+		const invalid =
+			"decision result file does not contain one complete JSON object";
+		const retries = Array.from(
+			{ length: Math.min(invalidAttempts, 2) },
+			(_, index) =>
+				`Reflection attempt ${index + 1}/3 invalid: ${invalid}; retrying.`,
+		);
+		assert.deepEqual(
+			ctx.notifications,
+			invalidAttempts === 3
+				? [...notifications, ...retries, `Reflection failed: ${invalid}.`]
+				: [...notifications, ...retries],
+		);
+		assert.equal(hooks.length, invalidAttempts === 3 ? 0 : 1);
+		assert.equal(
+			continuationMessages(pi).length,
+			invalidAttempts === 3 ? 0 : 1,
+		);
+		assert.equal(
+			pi.entries.filter(({ customType }) =>
+				/:reflection(?:-completed)?$/.test(customType),
+			).length,
+			invalidAttempts === 3 ? 0 : 2,
+		);
+		const projected = await pi.emit(
+			"context",
+			{
+				messages: pi.messages.map(({ message }) => ({
+					role: "custom",
+					...message,
+					timestamp: 1,
+				})),
+			},
+			ctx,
+		);
+		assert.doesNotMatch(
+			JSON.stringify(projected),
+			/invalid private attempt|private_inquiry_result_file|result\.json/,
+		);
+		if (invalidAttempts === 3) assert.deepEqual(projected.messages, []);
+		await pi.emit("session_shutdown", {}, ctx);
 	});
-	assert.equal(
-		controls.filter(({ message }) =>
-			String(message.customType).endsWith(":inquiry"),
-		).length,
-		3,
-	);
-	assert.equal(
-		controls.filter(({ message }) =>
-			String(message.customType).endsWith(":inquiry-fold"),
-		).length,
-		1,
-	);
-	let timestamp = 1;
-	let assistantIndex = 0;
-	const transcript = controls.flatMap(({ message }) => {
-		const control = { role: "custom", ...message, timestamp: timestamp++ };
-		if (!String(message.customType).endsWith(":inquiry")) return [control];
-		const reply = captured[assistantIndex++];
-		assert.ok(reply);
-		return [control, { ...reply.message, timestamp: timestamp++ }];
-	});
-	const folded = await pi.emit("context", { messages: transcript }, ctx);
-	assert.deepEqual(folded.messages, []);
-});
-
-test("three invalid result attempts emit one final fold without result evidence", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	const notificationsBeforeAttempts = ctx.notifications.length;
-	for (let attempt = 1; attempt <= 3; attempt += 1) {
-		await startReflectionRun(pi, ctx);
-		await completeReflectionAttempt(pi, ctx, `invalid attempt ${attempt}`);
-	}
-
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		3,
-	);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry-fold"),
-		).length,
-		1,
-	);
-	assert.equal(pi.entries.length, 0);
-	assert.deepEqual(ctx.notifications.slice(notificationsBeforeAttempts), [
-		"Reflection attempt 1/3 invalid: reflection must be submitted with ref; retrying.",
-		"Reflection attempt 2/3 invalid: reflection must be submitted with ref; retrying.",
-		"Reflection failed: reflection must be submitted with ref",
-	]);
-});
 
 for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 	for (const trigger of ["automatic", "busy-manual", "idle-manual"] as const)
@@ -2490,14 +2699,18 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				type,
 				nextStep: "wait for the existing callback",
 			});
+			const driver = createReflectionDriver();
 			const { pi, ctx, domain } = install({
 				limits:
 					origin === "automatic"
 						? { rootLoopLimit: 2, allLoopLimit: 100 }
 						: undefined,
+				privateInquiry: { service: driver.service } as any,
 			});
 			const hooks = captureReflectionHooks(pi);
 			await pi.emit("session_start", {}, ctx);
+			seedAnchor(ctx);
+			driver.respond({ write: JSON.stringify(args) });
 			if (origin === "manual") {
 				if (trigger === "busy-manual") {
 					ctx.setIdle(false);
@@ -2505,8 +2718,9 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				}
 				await pi.commands[0]?.handler("check clarified request", ctx);
 				if (trigger === "busy-manual") {
+					await awaitReflectionOperation(driver);
 					assert.ok(
-						lastInquiry(pi),
+						driver.operations.length === 1,
 						"busy manual submits immediately without waiting for settlement",
 					);
 				}
@@ -2517,17 +2731,13 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				// The first loop stays below the limit; the second crosses it.
 				await pi.emit("turn_end", turnEnd("stop"), ctx);
 			}
-			await startReflectionRun(pi, ctx);
-			const captured = await pi.emit("message_end", assistant(args), ctx);
-			assert.ok(captured);
-			await pi.emit("turn_end", turnEnd("stop"), ctx);
+			await awaitReflectionOperation(driver);
+			await settleReflectionOperation(driver);
 			ctx.setIdle(true);
 			await pi.emit("agent_settled", {}, ctx);
 
-			const inquiry = pi.messages.find(({ message }) =>
-				String(message.customType ?? "").endsWith(":inquiry"),
-			)?.message;
-			const fold = lastInquiryFold(pi);
+			// Private reflections write no main-thread inquiry chain; the
+			// continuation marker carries the validated `private` source.
 			const continuations = pi.messages.filter(
 				({ message }) =>
 					message.customType === "pi-reflect-watchdog:continuation",
@@ -2538,9 +2748,14 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				"valid result schedules one ordinary continuation",
 			);
 			const continuation = continuations[0];
-			assert.ok(inquiry);
-			assert.ok(fold);
 			assert.ok(continuation);
+			assert.equal(
+				pi.messages.filter(({ message }) =>
+					String(message.customType ?? "").endsWith(":inquiry"),
+				).length,
+				0,
+				"private reflection leaves no main-thread inquiry messages",
+			);
 			assert.deepEqual(continuation.options, {
 				deliverAs: "steer",
 				triggerTurn: true,
@@ -2564,10 +2779,7 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 					content: [{ type: "text", text: clarification }],
 					timestamp: 1,
 				},
-				{ role: "custom", ...inquiry, timestamp: 2 },
-				{ ...captured.message, timestamp: 3 },
-				{ role: "custom", ...fold, timestamp: 4 },
-				{ role: "custom", ...continuation.message, timestamp: 5 },
+				{ role: "custom", ...continuation.message, timestamp: 2 },
 			];
 			const projected = await pi.emit("context", { messages: transcript }, ctx);
 			const repeated = await pi.emit("context", { messages: transcript }, ctx);
@@ -2594,9 +2806,12 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				origin === "automatic" ? "assistant" : "user",
 			);
 			if (origin === "automatic") {
-				assert.equal((report[0] as any).provider, "fixture");
+				assert.equal((report[0] as any).provider, "fixture-provider");
 				assert.equal((report[0] as any).model, "fixture-model");
-				assert.equal((report[0] as any).responseId, "fixture-response");
+				assert.equal(
+					(report[0] as any).responseId,
+					"private-child-1-response-1",
+				);
 				assert.equal((report[0] as any).details?.piInquiry, undefined);
 			} else {
 				assert.deepEqual(Object.keys(report[0]).sort(), [
@@ -2623,18 +2838,41 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				"raw reflection result stays folded",
 			);
 			const writesBefore = domain.rootWrites;
-			assert.equal(writesBefore, origin === "automatic" ? 2 : 0);
+			// The seeded replay anchor is ordinary prior work: the domain
+			// charges it at the first post-reflection refresh, so automatic
+			// shows its two crossing turns + the anchor and manual shows the
+			// anchor alone.
+			assert.equal(writesBefore, origin === "automatic" ? 3 : 1);
+			// Persist the durable entries + the continuation marker into the
+			// branch the same way reload would — the private source travels
+			// inside the marker's own details, not a main-thread chain.
 			ctx.setBranch([
 				...ctx.sessionManager.getBranch(),
-				branchMessage(captured.message, "source"),
 				...pi.entries.map((entry, index) => ({
 					type: "custom",
 					id: `stored-${index}`,
-					parentId: "source",
+					parentId: null,
 					timestamp: "2026-09-08T00:00:00.000Z",
 					...entry,
 				})),
+				{
+					type: "custom-message",
+					id: "stored-continuation",
+					parentId: null,
+					timestamp: "2026-09-08T00:00:01.000Z",
+					customType: continuation.message.customType,
+					content: continuation.message.content,
+					display: continuation.message.display,
+					details: continuation.message.details,
+				},
 			]);
+			ctx.setIdle(false);
+			await pi.emit("agent_start", {}, ctx);
+			await pi.emit(
+				"message_start",
+				{ message: { role: "custom", ...continuation.message } },
+				ctx,
+			);
 			ctx.setIdle(false);
 			await pi.emit("agent_start", {}, ctx);
 			await pi.emit(
@@ -2670,7 +2908,8 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 				pi.messages.filter(({ message }) =>
 					String(message.customType).endsWith(":inquiry"),
 				).length,
-				1,
+				0,
+				"private reflection writes no inquiry messages on resume",
 			);
 			assert.equal(
 				pi.entries.filter((entry) =>
@@ -2683,19 +2922,13 @@ for (const type of ["ROUTE_CORRECTION", "NO_ISSUE"] as const)
 
 test("native wake reenters only after durable completion with internal state released", async () => {
 	for (const origin of ["automatic", "manual"] as const) {
+		const driver = createReflectionDriver();
 		const { pi, ctx } = install({
 			limits: { rootLoopLimit: 1, allLoopLimit: 100 },
+			privateInquiry: { service: driver.service } as any,
 		});
 		await pi.emit("session_start", {}, ctx);
-		if (origin === "manual") await pi.commands[0]?.handler("", ctx);
-		else {
-			ctx.setIdle(false);
-			await pi.emit("agent_start", {}, ctx);
-			await pi.emit("turn_end", turnEnd("stop"), ctx);
-		}
-		await startReflectionRun(pi, ctx);
-		const captured = await pi.emit("message_end", assistant(validNoIssue), ctx);
-		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		seedAnchor(ctx);
 		const sendMessage = pi.sendMessage.bind(pi);
 		let reentered = false;
 		pi.sendMessage = (message: any, options) => {
@@ -2710,12 +2943,7 @@ test("native wake reenters only after durable completion with internal state rel
 			);
 			const projected = pi.handlers.get("context")?.(
 				{
-					messages: [
-						{ role: "custom", ...lastInquiry(pi), timestamp: 1 },
-						captured.message,
-						{ role: "custom", ...lastInquiryFold(pi), timestamp: 2 },
-						{ role: "custom", ...message, timestamp: 3 },
-					],
+					messages: [{ role: "custom", ...message, timestamp: 1 }],
 				},
 				ctx,
 			);
@@ -2739,8 +2967,15 @@ test("native wake reenters only after durable completion with internal state rel
 			);
 			reentered = true;
 		};
-		ctx.setIdle(true);
-		await pi.emit("agent_settled", {}, ctx);
+		driver.respond({ write: JSON.stringify(validNoIssue) });
+		if (origin === "manual") await pi.commands[0]?.handler("", ctx);
+		else {
+			ctx.setIdle(false);
+			await pi.emit("agent_start", {}, ctx);
+			await pi.emit("turn_end", turnEnd("stop"), ctx);
+		}
+		await awaitReflectionOperation(driver);
+		await settleReflectionOperation(driver);
 		assert.equal(reentered, true);
 		assert.equal(
 			pi.entries.filter((entry) =>
@@ -2837,6 +3072,117 @@ test("projection pairs reused inquiry ids locally and ignores malformed or quote
 			timestamp: 41,
 		},
 	];
+	const privateCorrelation = {
+		version: 1,
+		namespace: "pi-reflect-watchdog",
+		inquiryId: "private-ok",
+		attempt: 1,
+	};
+	const privateSource = {
+		sessionId: "child-session-1",
+		api: "openai-completions",
+		provider: "fixture",
+		model: "fixture-model",
+		responseId: "child-response",
+		// Correlation binding: the embedded source must equal the marker
+		// correlation exactly (coordinator cec7d649).
+		inquiryId: "private-ok",
+		attempt: 1,
+		timestamp: 99,
+		stopReason: "stop",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	};
+	const privateReport = "Reflection · NO_ISSUE\nReason: private handoff";
+	const privateMarker = (origin: string, report: string, source: unknown) => ({
+		role: "custom",
+		customType: "pi-reflect-watchdog:continuation",
+		content: "[assistant]\ncontinue",
+		display: true,
+		details: {
+			version: 1,
+			origin,
+			report,
+			correlation: privateCorrelation,
+			private: source,
+		},
+		timestamp: 42,
+	});
+	const withPrivate = [
+		...messages,
+		privateMarker("automatic", privateReport, privateSource),
+	];
+	const privateResult = await pi.emit(
+		"context",
+		{ messages: withPrivate },
+		ctx,
+	);
+	const projected = privateResult.messages.at(-2) as any;
+	assert.equal(projected?.role, "assistant");
+	assert.equal(providerMessageTextForRuntime(projected), privateReport);
+	assert.equal(projected.responseId, "child-response");
+	assert.equal(projected.provider, "fixture");
+	assert.equal(projected.model, "fixture-model");
+	// Real provider-adapter serialization: the projected assistant must
+	// survive an actual pi-ai message conversion, not only passthrough.
+	const serialized = convertCompletionsMessages(
+		{
+			id: "m",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://example.invalid/v1",
+			input: ["text"],
+		} as any,
+		{ messages: [projected] } as any,
+		{ thinkingFormat: "openai" } as any,
+		undefined,
+	);
+	assert.deepEqual(serialized, [{ role: "assistant", content: privateReport }]);
+	const manualPrivate = await pi.emit(
+		"context",
+		{
+			messages: [
+				...messages,
+				privateMarker("manual", privateReport, privateSource),
+			],
+		},
+		ctx,
+	);
+	assert.equal(manualPrivate.messages.at(-2)?.role, "user");
+	assert.equal(
+		providerMessageTextForRuntime(manualPrivate.messages.at(-2)),
+		privateReport,
+	);
+	for (const bad of [
+		privateMarker("automatic", "bare bool must not project", true),
+		privateMarker("automatic", "missing fields must not project", {
+			sessionId: "x",
+		}),
+		privateMarker("automatic", "bad usage must not project", {
+			...privateSource,
+			usage: { input: -1 },
+		}),
+		privateMarker("automatic", "bad stop reason must not project", {
+			...privateSource,
+			stopReason: "aborted",
+		}),
+	]) {
+		const rejected = await pi.emit("context", { messages: [bad] }, ctx);
+		assert.equal(
+			rejected.messages.some(
+				(message: any) =>
+					message.role !== "custom" &&
+					providerMessageTextForRuntime(message).includes("must not project"),
+			),
+			false,
+		);
+	}
 	const first = await pi.emit("context", { messages }, ctx);
 	const second = await pi.emit("context", { messages }, ctx);
 	assert.deepEqual(second, first);
@@ -2924,7 +3270,10 @@ test("serialized mixed-trigger handoffs restore once without replay or rewriting
 	const entries = JSON.parse(JSON.stringify(session.getEntries()));
 	const before = JSON.stringify(entries);
 	const messages = buildSessionContext(entries).messages;
-	const restored = install();
+	const restoredDriver = createReflectionDriver();
+	const restored = install({
+		privateInquiry: { service: restoredDriver.service } as any,
+	});
 	restored.ctx.setBranch(entries);
 	await restored.pi.emit("session_start", {}, restored.ctx);
 	for (let request = 0; request < 2; request += 1) {
@@ -2980,16 +3329,30 @@ test("serialized mixed-trigger handoffs restore once without replay or rewriting
 		"projection appends no result or completion",
 	);
 	assert.equal(JSON.stringify(entries), before);
-	// Existing version-1 storage remains usable independently of new markers.
+	// Existing version-1 storage remains usable independently of new markers:
+	// a fresh private reflection sees the legacy report in its prompt
+	// (the prior durable reflection entry feeds the historical section).
 	restored.ctx.setBranch([entries[0]]);
+	restoredDriver.respond({ write: JSON.stringify(validNoIssue) });
 	await restored.pi.commands[0]?.handler("", restored.ctx);
-	assert.match(lastInquiry(restored.pi).content, /legacy version-1 report/);
+	await awaitReflectionOperation(restoredDriver);
+	await settleReflectionOperation(restoredDriver);
+	const privatePrompts = restoredDriver.children[0]?.prompts ?? [];
+	assert.equal(privatePrompts.length > 0, true);
+	assert.match(
+		privatePrompts[0] ?? "",
+		/legacy version-1 report/,
+		"legacy version-1 durable report reaches the private prompt",
+	);
 });
 
 test("incomplete persisted handoffs omit reports rather than guessing an origin or source", async () => {
 	for (const origin of ["automatic", "manual"] as const) {
 		const { pi, ctx, messages, result } = await reflectionHandoff(origin);
-		const marker = messages[3];
+		// The private handoff is exactly one marker carrying the validated
+		// `private` source — corrupting or dropping any part of it must
+		// reject the projection rather than guess a report source.
+		const marker = messages[0];
 		const details = marker.details;
 		const malformed = [
 			{ details: undefined },
@@ -2997,13 +3360,23 @@ test("incomplete persisted handoffs omit reports rather than guessing an origin 
 			{ details: { ...details, origin: undefined } },
 			{ details: { ...details, origin: "guessed" } },
 			{ details: { ...details, correlation: undefined } },
+			// A present-but-invalid `private` key rejects the whole marker —
+			// no legacy fallthrough, no bare flag accepted.
+			{ details: { ...details, private: true } },
+			{ details: { ...details, private: { provider: "fixture" } } },
+			{ details: { ...details, private: undefined } },
 			...[
 				{ version: 2 },
 				{ namespace: "other" },
-				{ inquiryId: "missing" },
+				// inquiryId "missing" is a syntactically valid identifier: the
+				// private marker is self-contained — there is no legacy chain
+				// to contradict it, so it still projects. "bad id" stays
+				// malformed (fails the identifier pattern).
 				{ inquiryId: "bad id" },
 				{ attempt: 0 },
-				{ attempt: 2 },
+				// attempt 2 is legal private-path metadata: a later attempt's
+				// marker is a valid handoff, not corruption (the legacy
+				// single-attempt chain bound is gone).
 			].map((patch) => ({
 				details: {
 					...details,
@@ -3013,11 +3386,17 @@ test("incomplete persisted handoffs omit reports rather than guessing an origin 
 			{ customType: "other:continuation" },
 			{ content: "[assistant]\ncontinue\n" },
 		];
-		const contexts = malformed.map((patch) => [
-			...messages.slice(0, 3),
-			{ ...marker, ...patch },
+		const contexts = malformed.map((patch) => [{ ...marker, ...patch }]);
+		// A marker stripped of its `private` source entirely also cannot
+		// project (there is no legacy chain to back it).
+		contexts.push([
+			{
+				...marker,
+				details: Object.fromEntries(
+					Object.entries(details).filter(([key]) => key !== "private"),
+				),
+			},
 		]);
-		contexts.push(messages.filter((message) => message.role !== "assistant"));
 		for (const input of contexts) {
 			const retained = JSON.parse(JSON.stringify(input));
 			const projected = await pi.emit("context", { messages: retained }, ctx);
@@ -3037,6 +3416,96 @@ test("incomplete persisted handoffs omit reports rather than guessing an origin 
 			continuationMessages(pi).length,
 			1,
 			"restoration tests did not replay the original wake",
+		);
+	}
+});
+
+test("private source binding requires exact marker-correlation match", async () => {
+	for (const origin of ["automatic", "manual"] as const) {
+		const { pi, ctx, messages, result } = await reflectionHandoff(origin);
+		const marker = messages[0];
+		const details = marker.details;
+		const source = details.private;
+		assert.ok(source, "handoff carries the validated private source");
+		const validAlternate = {
+			details: {
+				...details,
+				correlation: {
+					...details.correlation,
+					inquiryId: "bound-alt-1",
+					attempt: 2,
+				},
+				private: {
+					...source,
+					inquiryId: "bound-alt-1",
+					attempt: 2,
+				},
+			},
+		};
+		const tamperedMarkerId = {
+			details: {
+				...details,
+				correlation: {
+					...details.correlation,
+					inquiryId: "tampered",
+				},
+			},
+		};
+		const tamperedMarkerAttempt = {
+			details: {
+				...details,
+				correlation: {
+					...details.correlation,
+					attempt: details.correlation.attempt + 1,
+				},
+			},
+		};
+		const tamperedSourceId = {
+			details: {
+				...details,
+				private: { ...source, inquiryId: "forged" },
+			},
+		};
+		const tamperedSourceAttempt = {
+			details: {
+				...details,
+				private: { ...source, attempt: source.attempt + 7 },
+			},
+		};
+		const project = async (patched: Record<string, unknown>) => {
+			const projected = await pi.emit(
+				"context",
+				{ messages: [{ ...marker, ...patched }] },
+				ctx,
+			);
+			return convertToLlm(projected.messages).some(
+				(message) => providerMessageTextForRuntime(message) === result.report,
+			);
+		};
+		assert.equal(
+			await project(validAlternate),
+			true,
+			"syntactically valid matching alternatives still project",
+		);
+		assert.equal(
+			await project(tamperedMarkerId),
+			false,
+			"tampered marker inquiryId rejects",
+		);
+		assert.equal(
+			await project(tamperedMarkerAttempt),
+			false,
+			"tampered marker attempt rejects",
+		);
+		assert.equal(
+			await project(tamperedSourceId),
+			false,
+			"tampered source inquiryId rejects",
+		);
+		assert.equal(
+			await project(tamperedSourceAttempt),
+			false,
+			"tampered source attempt rejects",
 		);
 	}
 });
@@ -3096,7 +3565,8 @@ test("built-in compaction and branch summaries do not project the report for eit
 			assert.equal(prompt.split("[assistant]\ncontinue").length - 1, 1);
 			assert.equal(prompt.includes(handoff.result.report), false);
 			assert.equal(prompt.includes("Reflection · NO_ISSUE"), false);
-			assert.match(prompt, /ref\(/);
+			// Private reflections leave no inquiry tool-call chain for the
+			// summary to serialize — the report must simply not appear.
 			assert.equal(prompt.includes('"origin"'), false);
 		}
 		const marker = session
@@ -3113,13 +3583,44 @@ test("built-in compaction and branch summaries do not project the report for eit
 			{ messages: retained },
 			handoff.ctx,
 		);
+		// The private continuation marker carries its own validated source —
+		// compaction at the marker boundary retains the marker, so the
+		// report still projects (the legacy chain no longer exists to be
+		// destroyed). What compaction must NOT do is replay or re-project
+		// beyond the retained boundary: exactly one report, one wake.
+		const projectedReports = convertToLlm(projected.messages).filter(
+			(message) =>
+				providerMessageTextForRuntime(message) === handoff.result.report,
+		);
 		assert.equal(
-			convertToLlm(projected.messages).some(
+			projectedReports.length,
+			1,
+			"the retained private marker still projects its own report",
+		);
+		assert.equal(
+			projectedReports[0]?.role,
+			origin === "automatic" ? "assistant" : "user",
+		);
+		// Coordinator cec7d649: the marker retained post-boundary projects
+		// the same report body/role/order as equivalent content — but a
+		// marker EXCLUDED by a deeper compaction boundary must never
+		// resurrect from durable storage.
+		const lastEntry = session.getEntries().at(-1);
+		session.appendCompaction("deeper summary", lastEntry?.id ?? marker.id, 200);
+		handoff.ctx.setBranch(session.getBranch());
+		const deeperRetained = session.buildSessionContext().messages;
+		const deeperProjected = await handoff.pi.emit(
+			"context",
+			{ messages: deeperRetained },
+			handoff.ctx,
+		);
+		assert.equal(
+			convertToLlm(deeperProjected.messages).some(
 				(message) =>
 					providerMessageTextForRuntime(message) === handoff.result.report,
 			),
 			false,
-			"a report still in private storage is not reconstructed after its source was compacted",
+			"a marker excluded by the compaction boundary never resurrects",
 		);
 		assert.equal(continuationMessages(handoff.pi).length, 1);
 	}
@@ -3171,22 +3672,29 @@ for (const [label, provider, modelId, api, adapter] of [
 				networkAttempts += 1;
 				throw new Error("unexpected network request");
 			});
-			const reply = {
-				...assistant(validNoIssue).message,
-				api,
-				provider: model.provider,
-				model: model.id,
-				responseId: "original-reflection-response-id",
-				content: [
+			// The private child's own terminal assistant carries real provider
+			// metadata plus opaque thinking/signature blocks — the sanitize
+			// gate must strip them before the marker, and the wire assertion
+			// is non-vacuous because they exist in the source.
+			const handoff = await reflectionHandoff(origin, validNoIssue, {
+				assistantMeta: {
+					api,
+					provider: model.provider,
+					model: model.id,
+					responseId: "original-reflection-response-id",
+				},
+				assistantOpaqueContent: [
 					{
 						type: "thinking",
 						thinking: "private reflection thought",
 						thinkingSignature: "private signature",
 					},
-					...assistant(validNoIssue).message.content,
+					{
+						type: "text",
+						text: "private file /var/tmp/pi-reflect-inquiry/result.json",
+					},
 				],
-			};
-			const handoff = await reflectionHandoff(origin, reply);
+			});
 			const clarification =
 				"Keep error handling. Quoted /reflect and [assistant]\ncontinue do not change this request.";
 			const ordinary = {
@@ -3319,7 +3827,7 @@ for (const [label, provider, modelId, api, adapter] of [
 				const wire = JSON.stringify(payload);
 				assert.doesNotMatch(
 					wire,
-					/private reflection thought|private signature|msg_original_reflection|original-reflection-response-id/,
+					/private reflection thought|private signature|msg_original_reflection|original-reflection-response-id|pi-reflect-inquiry|result\.json/,
 				);
 				assert.equal(wire.includes(JSON.stringify(validNoIssue)), false);
 				if (tail.length > 0) assert.ok(wire.includes("ordinary tool result"));
@@ -3333,14 +3841,16 @@ for (const [label, provider, modelId, api, adapter] of [
 		});
 
 test("completed reflection becomes the next prompt's leading branch reference", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
 	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	await pi.emit("message_end", assistant(validNoIssue), ctx);
-	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	await awaitReflectionOperation(driver);
+	await settleReflectionOperation(driver);
 
 	const result = pi.entries.find(
 		(entry) => entry.customType === "pi-reflect-watchdog:reflection",
@@ -3380,8 +3890,18 @@ test("completed reflection becomes the next prompt's leading branch reference", 
 		},
 	]);
 
+	driver.respond({ write: JSON.stringify(validNoIssue) });
 	await pi.commands[0]?.handler("", ctx);
-	const prompt = lastInquiry(pi)?.content ?? "";
+	await awaitReflectionOperation(driver);
+	// Wait for the second child's first prompt — the prompt carries the
+	// historical reflection forward as its leading reference.
+	for (
+		let turn = 0;
+		turn < 2000 && (driver.children[1]?.prompts.length ?? 0) === 0;
+		turn += 1
+	)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	const prompt = driver.children[1]?.prompts[0] ?? "";
 	const previous = prompt.indexOf(data.report);
 	const current = prompt.indexOf("[Plugin-generated reflection context]");
 	assert.ok(previous >= 0, "latest valid branch reflection must be included");
@@ -3390,30 +3910,52 @@ test("completed reflection becomes the next prompt's leading branch reference", 
 		"previous reflection must precede current context",
 	);
 	assert.doesNotMatch(prompt, /poison/);
+	await settleReflectionOperation(driver);
 });
 
-test("manual reflection remains available without a complete history locator", async () => {
-	for (const { sessionFile, withLeaf } of [
-		{ sessionFile: undefined, withLeaf: true },
-		{ sessionFile: "/missing/session.jsonl", withLeaf: false },
-		{ sessionFile: undefined, withLeaf: false },
-	]) {
-		const ctx = context("root", { sessionFile });
-		if (withLeaf) ctx.setBranch([ordinaryLoop("current-leaf")]);
-		const { pi } = install({ ctx });
+// Retired triage #63: missing full source fails closed; an optional file
+// locator is not a substitute for, or a requirement of, a qualified anchor.
+test("manual reflection requires a qualified source but not an optional history locator", async () => {
+	for (const withLeaf of [false, true]) {
+		const ctx = context("root", { sessionFile: undefined });
+		if (withLeaf) seedAnchor(ctx);
+		const driver = createReflectionDriver();
+		const { pi } = install({
+			ctx,
+			privateInquiry: { service: driver.service } as any,
+		});
+		const hooks = captureReflectionHooks(pi);
 		await pi.emit("session_start", {}, ctx);
+		if (!withLeaf)
+			assert.throws(() => captureAnchor(ctx.sessionManager), {
+				reason: "no-replayable-anchor",
+			});
+		driver.respond({ write: JSON.stringify(validNoIssue) });
 		await pi.commands[0]?.handler("", ctx);
-		assert.match(
-			lastInquiry(pi)?.content ?? "",
-			/Branch-scoped history recovery unavailable/,
-		);
-		assert.equal(pi.messages.length, 1);
+		if (withLeaf) {
+			await awaitReflectionOperation(driver);
+			assert.equal((await settleReflectionOperation(driver))?.kind, "decision");
+			assert.equal(driver.forkInputs[0]?.anchorId, "seed");
+			assert.equal(driver.forkInputs[0]?.parent, ctx.sessionManager);
+			assert.equal(hooks.length, 1);
+		} else {
+			await flushAsync();
+			assert.equal(driver.operations.length, 0);
+			assert.equal(driver.children.length, 0);
+			assert.equal(pi.messages.length, 0);
+			assert.equal(hooks.length, 0);
+		}
+		await pi.emit("session_shutdown", {}, ctx);
 	}
 });
 
 test("queued second reflection dispatches after completed evidence is visible", async () => {
 	const ctx = context("root", { sessionFile: "/missing/queued-session.jsonl" });
-	const { pi } = install({ ctx });
+	const driver = createReflectionDriver();
+	const { pi } = install({
+		ctx,
+		privateInquiry: { service: driver.service } as any,
+	});
 	const hooks = captureReflectionHooks(pi);
 	const branch: any[] = [
 		branchMessage(
@@ -3422,52 +3964,64 @@ test("queued second reflection dispatches after completed evidence is visible", 
 		),
 	];
 	ctx.setBranch(branch);
-	const originalAppendEntry = pi.appendEntry.bind(pi);
-	pi.appendEntry = (customType: string, data: unknown) => {
-		originalAppendEntry(customType, data);
-		branch.push({
-			type: "custom",
-			id: `saved-${branch.length}`,
-			customType,
-			data,
-		});
-		ctx.setBranch(branch);
-	};
+	// The fake Pi's appendEntry already extends the live branch once, as Pi
+	// does; a stale-array override here used to drop the seeded anchor.
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// Only the first run is scripted; the second parks at its first prompt
+	// so its captured input is observed deterministically.
+	driver.respond({ write: JSON.stringify(validNoIssue) });
 	await pi.commands[0]?.handler("first supplement", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("second supplement", ctx);
 	const queuedAtLeaf = ctx.sessionManager.getLeafId();
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	await settleReflectionOperation(driver);
+	for (
+		let turn = 0;
+		turn < 2000 && (driver.operations.length < 2 || !driver.awaitingResponse);
+		turn += 1
+	)
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	assert.equal(driver.awaitingResponse, true, "second child prompted");
 
-	const inquiries = pi.messages.filter(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry"),
+	// The waiting explicit request fulfills at the first run's drain — the
+	// second operation's own child prompt carries the second supplement.
+	assert.equal(
+		driver.operations.length,
+		2,
+		"queued second reflection launched after the first settled",
 	);
-	assert.equal(inquiries.length, 2);
-	assert.match(inquiries[1]?.message.content ?? "", /Reason: sound/);
-	assert.match(inquiries[1]?.message.content ?? "", /second supplement/);
+	assert.match(driver.children[1]?.prompts[0] ?? "", /Reason: sound/);
+	assert.match(driver.children[1]?.prompts[0] ?? "", /second supplement/);
 	assert.notEqual(ctx.sessionManager.getLeafId(), queuedAtLeaf);
+	// The locator anchors at dispatch time — after the first run's
+	// durable entries landed (saved-N ids), not at the queued leaf.
 	assert.ok(
-		inquiries[1]?.message.content.includes(
-			JSON.stringify({
-				sessionFile: ctx.sessionManager.getSessionFile(),
-				branchLeafId: ctx.sessionManager.getLeafId(),
-			}),
+		driver.children[1]?.prompts[0]?.includes(
+			`"sessionFile":"${ctx.sessionManager.getSessionFile()}"`,
 		),
-		"history locator comes from dispatch, not the queued request",
+		"history locator carries the qualified parent session file",
+	);
+	assert.notEqual(
+		queuedAtLeaf,
+		ctx.sessionManager.getLeafId(),
+		"dispatch anchor differs from the queued-at leaf",
+	);
+	assert.doesNotMatch(
+		driver.children[1]?.prompts[0] ?? "",
+		new RegExp(`"branchLeafId":"${queuedAtLeaf}"`),
+		"locator does not reuse the queued-at leaf",
 	);
 	assert.doesNotMatch(
 		JSON.stringify(pi.entries),
 		/historyLocator|sessionFile|branchLeafId/,
 	);
 	assert.equal(hooks.length, 1);
-	assert.deepEqual(pi.actions.slice(-6), [
-		"fold",
+	assert.deepEqual(pi.actions.slice(-4), [
 		"entry:pi-reflect-watchdog:reflection",
 		"entry:pi-reflect-watchdog:reflection-completed",
 		"hook:reflection-completed",
 		"continuation",
-		"inquiry",
 	]);
 });
 
@@ -3492,205 +4046,200 @@ test("domain snapshots, not local wall-clock state, drive status text", async ()
 test("surviving observer reclaims main and owns /reflect after shutdown", async () => {
 	const hub = createObservableAgentHub();
 	const domain = new FakeDomain();
+	const rootDriver = createReflectionDriver();
+	const observerDriver = createReflectionDriver();
 	const root = install({
 		hub,
 		domain,
 		ctx: context("root", { hasUI: true }),
+		privateInquiry: { service: rootDriver.service } as any,
 	});
 	const observer = install({
 		hub,
 		domain,
 		ctx: context("observer", { hasUI: false }),
+		privateInquiry: { service: observerDriver.service } as any,
 	});
 	await root.pi.emit("session_start", {}, root.ctx);
 	await observer.pi.emit("session_start", {}, observer.ctx);
 	await root.pi.emit("session_shutdown", {}, root.ctx);
 	await root.pi.commands[0]?.handler("old owner", root.ctx);
 	assert.equal(root.pi.messages.length, 0);
+	seedAnchor(observer.ctx);
+	observerDriver.respond({ write: JSON.stringify(validNoIssue) });
 	await observer.pi.commands[0]?.handler("new owner", observer.ctx);
-	assert.match(lastInquiry(observer.pi)?.content ?? "", /new owner/);
+	await awaitReflectionOperation(observerDriver);
+	await settleReflectionOperation(observerDriver);
+	assert.match(
+		observerDriver.children[0]?.prompts[0] ?? "",
+		/new owner/,
+		"the reclaiming observer's private child receives the request",
+	);
 });
 
 test("reflection tool budget and history hint stay shared across result attempts", async () => {
 	const ctx = context("root", { sessionFile: "/missing/retry-session.jsonl" });
 	ctx.setBranch([ordinaryLoop("initial-anchor")]);
-	const { pi } = install({ ctx });
-	await pi.emit("session_start", {}, ctx);
-	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
-	const initialPrompt = lastInquiry(pi)?.content ?? "";
-	assert.match(initialPrompt, /initial-anchor/);
-	for (let index = 0; index < 5; index += 1)
-		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
-	ctx.setBranch([ordinaryLoop("later-anchor")]);
-	await completeReflectionAttempt(pi, ctx, "invalid result");
-	await startReflectionRun(pi, ctx);
-	assert.doesNotMatch(
-		lastInquiry(pi)?.content ?? "",
-		/history locator|later-anchor/i,
-	);
-	for (let index = 0; index < 5; index += 1)
-		assert.equal(await pi.emit("tool_call", {}, ctx), undefined);
-	assert.deepEqual(await pi.emit("tool_call", {}, ctx), {
-		block: true,
-		reason:
-			"Reflection tool-call budget exhausted. If reflection is complete, call ref alone to submit your result and end reflection.",
+	const driver = createReflectionDriver();
+	const { pi } = install({
+		ctx,
+		privateInquiry: { service: driver.service } as any,
 	});
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	driver.respond({ write: JSON.stringify({ ...validNoIssue, reason: 42 }) });
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	await settleReflectionOperation(driver);
+	const child = driver.children[0];
+	assert.ok(child);
+	const initialPrompt = child.prompts[0] ?? "";
+	assert.match(
+		initialPrompt,
+		/share one budget of \d+ executed evidence calls/,
+		"the initial prompt states the shared evidence budget",
+	);
+	assert.match(
+		initialPrompt,
+		/History locator \(JSON data/,
+		"the initial prompt carries the history hint",
+	);
+	assert.equal(
+		child.prompts.length,
+		2,
+		"one invalid attempt produced exactly one same-child re-ask",
+	);
+	assert.match(
+		child.prompts[1] ?? "",
+		/The same evidence-call budget remains in force/,
+		"the correction prompt keeps the shared budget in force",
+	);
+	// The same-child correction chain does not re-issue the history
+	// locator; the budget and file path travel with the re-ask.
+	assert.match(child.prompts[1] ?? "", /private_inquiry_result_file/);
 	assert.equal(
 		continuationMessages(pi).length,
 		1,
-		"submission survives lookup budget exhaustion",
+		"the corrected attempt completes the reflection",
 	);
 });
 
-test("busy manual reflection submits one native steer and completes after consumption", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	ctx.setPendingMessages(true);
-	await pi.commands[0]?.handler("queued supplement", ctx);
-	const inquiries = pi.messages.filter(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry"),
-	);
-	assert.equal(inquiries.length, 1, "busy invocation submits exactly once");
-	assert.match(inquiries[0]?.message.content ?? "", /queued supplement/);
-	assert.match(inquiries[0]?.message.content ?? "", /USER_REQUEST/);
-	assert.deepEqual(inquiries[0]?.options, {
-		triggerTurn: true,
-		deliverAs: "steer",
+// Retired triage #68–69: no trigger-time native slot; ordinary parent progress
+// and settlement leave a same-ancestry private child current until its result.
+for (const settleParent of [false, true])
+	test(`background manual reflection publishes only its result (${settleParent ? "parent settled" : "parent busy"})`, async () => {
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			privateInquiry: { service: driver.service } as any,
+		});
+		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		ctx.setIdle(false);
+		await pi.emit("agent_start", {}, ctx);
+		ctx.setPendingMessages(true);
+		await pi.commands[0]?.handler("queued supplement", ctx);
+		const operation = await awaitReflectionOperation(driver);
+		for (let turn = 0; turn < 2000 && !driver.awaitingResponse; turn += 1)
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		assert.equal(driver.awaitingResponse, true);
+		assert.match(driver.children[0]?.prompts[0] ?? "", /queued supplement/);
+		assert.equal(pi.messages.length, 0, "no trigger-time native traffic");
+		assert.equal(runtimeQueuedState(pi, ctx), false);
+		assert.equal(
+			await pi.emit("message_end", assistant("ordinary work in progress"), ctx),
+			undefined,
+		);
+		await pi.emit("turn_end", turnEnd("stop"), ctx);
+		if (settleParent) {
+			ctx.setIdle(true);
+			ctx.setPendingMessages(false);
+			await pi.emit("agent_settled", {}, ctx);
+			await pi.emit("agent_settled", {}, ctx);
+		}
+		assert.equal(operation.options.signal?.aborted, false);
+		assert.equal(driver.operations.length, 1);
+		assert.equal(pi.messages.length, 0);
+		driver.respond({ write: JSON.stringify(validNoIssue) });
+		assert.equal((await settleReflectionOperation(driver))?.kind, "decision");
+		assert.equal(continuationMessages(pi).length, 1);
+		assert.deepEqual(continuationMessages(pi)[0]?.options, {
+			triggerTurn: true,
+			deliverAs: "steer",
+		});
+		assert.equal(
+			pi.entries.filter(({ customType }) =>
+				/:reflection(?:-completed)?$/.test(customType),
+			).length,
+			2,
+		);
+		await pi.emit("session_shutdown", {}, ctx);
 	});
-	assert.ok(
-		ctx.notifications.includes("Reflection queued."),
-		"submitted request is not advertised as cancellable",
-	);
-	assert.equal(
-		runtimeQueuedState(pi, ctx),
-		false,
-		"submitted request leaves the plugin-pending slot",
-	);
-	// The ordinary reply sharing the run passes through uncaptured while the
-	// inquiry stays provisional, then the inquiry is consumed and completed.
-	const ordinaryReplacement = await pi.emit(
-		"message_end",
-		assistant("ordinary work in progress"),
-		ctx,
-	);
-	assert.equal(
-		ordinaryReplacement,
-		undefined,
-		"provisional inquiry never captures the ordinary assistant",
-	);
-	await correlateReflection(pi, ctx);
-	const captured = await completeReflectionAttempt(pi, ctx, validNoIssue);
-	assert.ok(captured, "consumed inquiry completes normally");
-	assert.ok(
-		pi.entries.some(
-			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
-		),
-		"the submitted request stores its result after consumption",
-	);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		1,
-		"consumption adds no second submission",
-	);
-	assert.equal(continuationMessages(pi).length, 1);
-});
-
-test("ordinary settlement cannot cancel an unconsumed native inquiry", async () => {
-	const { pi, ctx } = install();
-	await pi.emit("session_start", {}, ctx);
-	ctx.setIdle(false);
-	await pi.emit("agent_start", {}, ctx);
-	ctx.setPendingMessages(true);
-	await pi.commands[0]?.handler("never consumed", ctx);
-	assert.ok(lastInquiry(pi), "busy invocation submits immediately");
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(
-		lastInquiryFold(pi),
-		undefined,
-		"native queued inquiry remains outstanding until consumption or true abort",
-	);
-	assert.equal(
-		pi.entries.some(
-			(entry) => entry.customType === "pi-reflect-watchdog:reflection",
-		),
-		false,
-		"no result is recorded for an unconsumed inquiry",
-	);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		1,
-		"settlement of an unconsumed inquiry starts no second reflection",
-	);
-	await pi.emit("agent_settled", {}, ctx);
-	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
-		1,
-		"a repeated settlement observation adds nothing",
-	);
-});
 
 test("duplicate /reflect behind an outstanding inquiry coalesces and keeps the first supplement", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// The first child stays parked until the queue/command checks ran.
 	await pi.commands[0]?.handler("initial request", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("first supplement", ctx);
 	await pi.commands[0]?.handler("second supplement", ctx);
 	assert.ok(
 		ctx.notifications.includes("A reflection is already queued."),
 		"duplicate invocation is reported",
 	);
-	ctx.setIdle(true);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
-	const inquiries = pi.messages.filter(({ message }) =>
-		String(message.customType ?? "").endsWith(":inquiry"),
-	);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
 	assert.equal(
-		inquiries.length,
+		driver.operations.length,
 		2,
 		"waiting request dispatches after completion",
 	);
-	assert.match(inquiries[1]?.message.content ?? "", /first supplement/);
-	assert.doesNotMatch(inquiries[1]?.message.content ?? "", /second supplement/);
+	const successor = await firstPromptOf(driver, 1);
+	assert.match(successor, /first supplement/);
+	assert.doesNotMatch(successor, /second supplement/);
 });
 
 test("/cancel-reflect discards a plugin-pending request behind an outstanding inquiry", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// The first child stays parked until the queue/command checks ran.
 	await pi.commands[0]?.handler("initial request", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("withdrawn", ctx);
 	await pi.commands[1]?.handler("", ctx);
 	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
-	ctx.setIdle(true);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		driver.operations.length,
 		1,
-		"cancelled request never sends an inquiry; the outstanding one remains",
+		"cancelled request never launches; the outstanding one completes",
 	);
+	assert.equal(driver.children[0]?.prompts.length, 1);
 });
 
 test("/cancel-reflect with empty queue no-ops and never touches an active reflection", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
 	await pi.commands[1]?.handler("", ctx);
 	assert.ok(ctx.notifications.includes("No queued reflection to cancel."));
+	seedAnchor(ctx);
+	// The run stays parked (active) while /cancel-reflect is checked.
 	await pi.commands[0]?.handler("active run", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[1]?.handler("", ctx);
 	assert.equal(
 		ctx.notifications.filter(
@@ -3699,39 +4248,57 @@ test("/cancel-reflect with empty queue no-ops and never touches an active reflec
 		2,
 		"cancel with an active reflection and empty queue stays a no-op",
 	);
-	const captured = await completeReflectionAttempt(pi, ctx, validNoIssue);
-	assert.ok(captured, "the active reflection completes unaffected");
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	const result = await settleReflectionOperation(driver);
+	assert.equal(
+		result?.kind,
+		"decision",
+		"the active reflection completes unaffected",
+	);
+	assert.equal(
+		driver.operations[0]?.options.signal?.aborted,
+		false,
+		"cancel never aborted the active operation",
+	);
 });
 
 test("cancel shortcut registers from config and cancels; false disables registration", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
 	assert.equal(pi.shortcuts.length, 1);
 	assert.equal(pi.shortcuts[0]?.key, "alt+x");
+	seedAnchor(ctx);
+	// The first child stays parked (unscripted) until the queue checks ran.
 	await pi.commands[0]?.handler("initial request", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("shortcut target", ctx);
 	await pi.shortcuts[0]?.handler(ctx);
 	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
-	ctx.setIdle(true);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		driver.operations.length,
 		1,
-		"cancelled waiting request never sends an inquiry",
+		"cancelled waiting request never launches",
 	);
 
-	const disabled = install({ limits: { cancelShortcut: false } });
+	const disabledDriver = createReflectionDriver();
+	const disabled = install({
+		limits: { cancelShortcut: false },
+		privateInquiry: { service: disabledDriver.service } as any,
+	});
 	await disabled.pi.emit("session_start", {}, disabled.ctx);
 	assert.equal(
 		disabled.pi.shortcuts.length,
 		0,
 		"false disables shortcut registration",
 	);
+	seedAnchor(disabled.ctx);
 	await disabled.pi.commands[0]?.handler("initial request", disabled.ctx);
-	await startReflectionRun(disabled.pi, disabled.ctx);
+	await awaitReflectionOperation(disabledDriver);
 	await disabled.pi.commands[0]?.handler("still queued", disabled.ctx);
 	assert.ok(
 		disabled.ctx.notifications.includes(
@@ -3744,13 +4311,21 @@ test("cancel shortcut registers from config and cancels; false disables registra
 		disabled.ctx.notifications.includes("Queued reflection cancelled."),
 		"/cancel-reflect still cancels when the shortcut is disabled",
 	);
+	disabledDriver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(disabledDriver);
+	assert.equal(disabledDriver.operations.length, 1);
 });
 
 test("queued state surfaces in the status text and clears on dispatch and cancel", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// The first child stays parked until the queue/command checks ran.
 	await pi.commands[0]?.handler("initial request", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("visible", ctx);
 	assert.match(
 		ctx.statuses.filter(Boolean).at(-1) ?? "",
@@ -3768,12 +4343,12 @@ test("queued state surfaces in the status text and clears on dispatch and cancel
 		ctx.statuses.filter(Boolean).at(-1) ?? "",
 		/· queued · alt\+x to cancel$/,
 	);
-	ctx.setIdle(true);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
-	assert.ok(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length >= 2,
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
+	assert.equal(
+		driver.operations.length,
+		2,
 		"waiting request dispatches after finalization",
 	);
 	assert.doesNotMatch(
@@ -3784,20 +4359,24 @@ test("queued state surfaces in the status text and clears on dispatch and cancel
 });
 
 test("queued manual reflection is discarded on session shutdown", async () => {
-	const { pi, ctx } = install();
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("initial request", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
 	await pi.commands[0]?.handler("doomed", ctx);
 	await pi.emit("session_shutdown", {}, ctx);
-	ctx.setIdle(true);
-	await pi.emit("agent_settled", {}, ctx);
+	// The shutdown aborts the parked active child and drops the queue;
+	// the drained settle must never dispatch the doomed request.
+	for (let turn = 0; turn < 2000 && !driver.operations[0]?.settled; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	assert.equal(
-		pi.messages.filter(({ message }) =>
-			String(message.customType ?? "").endsWith(":inquiry"),
-		).length,
+		driver.operations.length,
 		1,
-		"no further inquiry after the session is torn down; only the outstanding one remains",
+		"no further launch after the session is torn down",
 	);
 });
 
@@ -3827,8 +4406,27 @@ function liveDomain(now: () => number = () => 0) {
 	});
 }
 
+async function startIdleEscapeReflection() {
+	const driver = createReflectionDriver();
+	const ctx = context("escape-root", { mode: "tui" });
+	const { pi } = install({
+		ctx,
+		privateInquiry: { service: driver.service } as any,
+	});
+	const hooks = captureReflectionHooks(pi);
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	await pi.commands[0]?.handler("first", ctx);
+	const operation = await awaitReflectionOperation(driver);
+	for (let turn = 0; turn < 2000 && !driver.awaitingResponse; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	assert.equal(driver.awaitingResponse, true);
+	return { driver, ctx, pi, hooks, operation };
+}
+
 for (const mainBusy of [false, true])
 	test(`real B-to-runtime fresh child completion steers ${mainBusy ? "busy" : "idle"} main; repair never sends`, async () => {
+		const driver = createReflectionDriver();
 		const hub = createObservableAgentHub();
 		const domain = liveDomain();
 		const main = install({
@@ -3836,52 +4434,67 @@ for (const mainBusy of [false, true])
 			domain,
 			ctx: context("live-main"),
 			limits: { allLoopLimit: 1, rootLoopLimit: 60 },
+			privateInquiry: { service: driver.service } as any,
 		});
 		const child = install({
 			hub,
 			domain,
 			ctx: context("live-child", { hasUI: false }),
+			privateInquiry: { service: createReflectionDriver().service } as any,
 		});
 		await main.pi.emit("session_start", {}, main.ctx);
 		await child.pi.emit("session_start", {}, child.ctx);
+		seedAnchor(main.ctx);
 		main.ctx.setIdle(!mainBusy);
 		await main.pi.emit("agent_start", {}, main.ctx);
 		main.pi.sendMessage(
 			{ customType: "unrelated", content: "earlier steering" },
 			{ deliverAs: "steer", triggerTurn: true },
 		);
+		const seedLoops = domain.counters()?.allLoops.value ?? 0n;
 		child.ctx.setIdle(false);
 		await child.pi.emit("agent_start", {}, child.ctx);
 		child.ctx.setBranch([ordinaryLoop("child-fresh")]);
 		// Ordinary public observations can count before the whole tool batch ends.
 		await child.pi.emit("session_compact", {}, child.ctx);
-		assert.equal(domain.counters()?.allLoops.value, 1n);
-		assert.equal(lastInquiry(main.pi), undefined);
+		assert.equal(domain.counters()?.allLoops.value, seedLoops + 1n);
+		assert.equal(driver.operations.length, 0);
 		await main.pi.emit("agent_settled", {}, main.ctx);
-		assert.equal(lastInquiry(main.pi), undefined);
+		assert.equal(driver.operations.length, 0);
 		const event = {
 			message: child.ctx.sessionManager.getBranch()[0].message,
 			messageEntryId: "child-fresh",
 			toolResultEntryIds: [],
 		};
 		await child.pi.emit("turn_end", event, child.ctx);
-		assert.match(lastInquiry(main.pi)?.content ?? "", /all=1\/1/);
-		assert.equal(lastInquiry(child.pi), undefined);
-		assert.deepEqual(
-			main.pi.messages.map((item) => item.message.customType),
-			["unrelated", "pi-reflect-watchdog:inquiry"],
+		const operation = await awaitReflectionOperation(driver);
+		// The private run's child prompt carries the counter snapshot — no
+		// main-transport inquiry message ever leaves the runtime.
+		for (
+			let turn = 0;
+			turn < 2000 && (driver.children[0]?.prompts.length ?? 0) < 1;
+			turn += 1
+		)
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		const prompt = driver.children[0]?.prompts[0] ?? "";
+		// Seed anchor loop + the fresh child loop; exact numerator and limit.
+		assert.match(prompt, /all=2\/1\b/);
+		assert.equal(
+			main.pi.messages.filter(({ message }) =>
+				String(message.customType ?? "").endsWith(":inquiry"),
+			).length,
+			0,
+			"private path sends no inquiry message",
 		);
-		assert.deepEqual(main.pi.messages[1].options, {
-			deliverAs: "steer",
-			triggerTurn: true,
-		});
+		assert.equal(main.pi.messages[0]?.message.customType, "unrelated");
 		await child.pi.emit("turn_end", event, child.ctx);
 		await main.pi.emit("agent_settled", {}, main.ctx);
 		assert.equal(
-			main.pi.messages.length,
-			2,
-			"duplicate and settlement do not replay decision or cancel provisional inquiry",
+			driver.operations.length,
+			1,
+			"duplicate and settlement do not launch another run",
 		);
+		assert.equal(operation.options.signal?.aborted, false);
 		assert.equal(domain.counters()?.rootLoops.value, 0n);
 		await child.pi.emit("session_shutdown", {}, child.ctx);
 		await main.pi.emit("session_shutdown", {}, main.ctx);
@@ -3891,22 +4504,31 @@ test("real held child completion remains counted; withdrawal/synthetic input/nav
 	let now = 0;
 	const domain = liveDomain(() => now),
 		hub = createObservableAgentHub();
+	const driver = createReflectionDriver();
 	const main = install({
 		hub,
 		domain,
 		ctx: context("held-main"),
 		limits: { allLoopLimit: 1 },
+		privateInquiry: { service: driver.service } as any,
 	});
 	const child = install({
 		hub,
 		domain,
 		ctx: context("held-child", { hasUI: false }),
+		privateInquiry: { service: createReflectionDriver().service } as any,
 	});
 	await main.pi.emit("session_start", {}, main.ctx);
 	await child.pi.emit("session_start", {}, child.ctx);
+	main.ctx.setBranch([
+		branchMessage({ role: "user", content: "task" }, "root-user"),
+	]);
 	main.ctx.setIdle(false);
 	await main.pi.emit("agent_start", {}, main.ctx);
-	main.ctx.setBranch([ordinaryLoop("main-abort", "aborted")]);
+	main.ctx.setBranch([
+		...main.ctx.sessionManager.getBranch(),
+		ordinaryLoop("main-abort", "aborted"),
+	]);
 	main.ctx.setIdle(true);
 	await main.pi.emit("agent_settled", {}, main.ctx);
 	child.ctx.setIdle(false);
@@ -3915,7 +4537,13 @@ test("real held child completion remains counted; withdrawal/synthetic input/nav
 	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
 	assert.equal(domain.counters()?.allLoops.value, 1n);
 	assert.equal(domain.counters()?.activeMs.value, 2500n);
-	assert.equal(lastInquiry(main.pi), undefined);
+	const heldOperations = 0;
+	assert.equal(
+		driver.operations.length,
+		heldOperations,
+		"held completion never admits a reflection",
+	);
+	assert.equal(continuationMessages(main.pi).length, 0);
 	await main.pi.commands
 		.find((command) => command.name === "cancel-reflect")
 		?.handler("", main.ctx);
@@ -3932,7 +4560,12 @@ test("real held child completion remains counted; withdrawal/synthetic input/nav
 		main.ctx,
 	);
 	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
-	assert.equal(lastInquiry(main.pi), undefined);
+	assert.equal(
+		driver.operations.length,
+		heldOperations,
+		"withdrawal, synthetic input and navigation never release the hold",
+	);
+	assert.equal(continuationMessages(main.pi).length, 0);
 	const resetObservations: bigint[] = [];
 	const unsubscribe = domain.subscribe((counters) =>
 		resetObservations.push(counters.allLoops.value),
@@ -3947,11 +4580,17 @@ test("real held child completion remains counted; withdrawal/synthetic input/nav
 	assert.equal(JSON.stringify(input), before, "input text/images untouched");
 	assert.equal(domain.counters()?.allLoops.value, 0n);
 	assert.equal(domain.counters()?.activeMs.value, 0n);
-	assert.equal(lastInquiry(main.pi), undefined, "reset/release is not trigger");
+	assert.equal(
+		driver.operations.length,
+		heldOperations,
+		"reset/release is not itself a trigger",
+	);
 	assert.equal(resetObservations.at(-1), 0n);
 	await child.pi.emit("turn_end", turnEnd("stop"), child.ctx);
-	assert.ok(
-		lastInquiry(main.pi),
+	await awaitReflectionOperation(driver);
+	assert.equal(
+		driver.operations.length,
+		1,
 		"fresh post-reentry child completion wakes main",
 	);
 	unsubscribe();
@@ -3962,20 +4601,26 @@ test("real held child completion remains counted; withdrawal/synthetic input/nav
 test("real final main turn uses fresh OR snapshot, finalized tools, reserved authority and no deferred outstanding decision", async () => {
 	let now = 0;
 	const domain = liveDomain(() => now);
+	const driver = createReflectionDriver();
 	const { pi, ctx } = install({
 		domain,
 		limits: { rootLoopLimit: 1, allLoopLimit: 1, taskMinutes: 1 },
+		privateInquiry: { service: driver.service } as any,
 	});
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	ctx.setIdle(false);
 	await pi.emit("agent_start", {}, ctx);
 	for (let index = 1; index <= 60; index++) {
 		now = index * 1000;
 		await pi.emit("session_compact", {}, ctx);
 	}
-	assert.equal(lastInquiry(pi), undefined, "clock observations never send");
+	assert.equal(driver.operations.length, 0, "clock observations never send");
 	const reply = ordinaryLoop("final-tool").message;
-	ctx.setBranch([branchMessage(reply, "final-tool")]);
+	ctx.setBranch([
+		...ctx.sessionManager.getBranch(),
+		branchMessage(reply, "final-tool"),
+	]);
 	await pi.emit(
 		"turn_end",
 		{
@@ -3986,8 +4631,8 @@ test("real final main turn uses fresh OR snapshot, finalized tools, reserved aut
 		ctx,
 	);
 	assert.equal(
-		lastInquiry(pi),
-		undefined,
+		driver.operations.length,
+		0,
 		"missing finalized result cannot authorize boundary",
 	);
 	ctx.setBranch([
@@ -4026,24 +4671,28 @@ test("real final main turn uses fresh OR snapshot, finalized tools, reserved aut
 		},
 		ctx,
 	);
-	await flushAsync();
+	const operation = await awaitReflectionOperation(driver);
+	for (
+		let turn = 0;
+		turn < 2000 && (driver.children[0]?.prompts.length ?? 0) < 1;
+		turn += 1
+	)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	const prompt = driver.children[0]?.prompts[0] ?? "";
 	assert.match(
-		lastInquiry(pi)?.content ?? "",
-		/ROOT_LOOP_LIMIT, ALL_LOOP_LIMIT, TASK_TIME_LIMIT/,
+		prompt,
+		/Trigger source\(s\): ROOT_LOOP_LIMIT, ALL_LOOP_LIMIT, TASK_TIME_LIMIT\n/,
 	);
-	assert.equal(
-		pi.messages.filter((item) => item.message.customType.endsWith(":inquiry"))
-			.length,
-		1,
-	);
+	assert.equal(driver.operations.length, 1);
 	await pi.emit("turn_end", turnEnd("stop"), ctx);
-	await startReflectionRun(pi, ctx);
-	await completeReflectionAttempt(pi, ctx, validNoIssue);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	for (let turn = 0; turn < 2000 && !operation.settled; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	await flushAsync();
 	assert.equal(continuationMessages(pi).length, 1);
 	await pi.emit("agent_settled", {}, ctx);
 	assert.equal(
-		pi.messages.filter((item) => item.message.customType.endsWith(":inquiry"))
-			.length,
+		driver.operations.length,
 		1,
 		"missed outstanding completion is never replayed",
 	);
@@ -4101,10 +4750,12 @@ test("one-second display cadence stays scheduled across publications; inquiry bu
 	let now = 0;
 	const domain = liveDomain(() => now),
 		pi = new Pi(),
-		ctx = context("cadence");
+		ctx = context("cadence"),
+		driver = createReflectionDriver();
 	createWatchdogExtension({
 		hub: createObservableAgentHub(),
 		processDomain: domain,
+		privateInquiry: driver.service,
 		services: {
 			loadConfig: async () => ({ config, diagnostics: [] }),
 			scheduleTimer: (_role, callback, delay) => {
@@ -4118,8 +4769,13 @@ test("one-second display cadence stays scheduled across publications; inquiry bu
 		},
 	})(pi as any);
 	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
-	await startReflectionRun(pi, ctx);
+	await awaitReflectionOperation(driver);
+	// The refresh ticker is scheduled once the private child's working
+	// period makes the session officially busy.
+	for (let turn = 0; turn < 2000 && timers.length < 1; turn += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	assert.equal(timers.length, 1);
 	assert.equal(timers[0].delay, 1000);
 	now = 600;
@@ -4134,10 +4790,20 @@ test("one-second display cadence stays scheduled across publications; inquiry bu
 	timers[0].callback();
 	await flushAsync();
 	assert.equal(domain.counters()?.activeMs.value, 1000n);
-	assert.equal(domain.counters()?.rootLoops.value, 0n);
-	assert.match(ctx.statuses.at(-1) ?? "", /active 1s\/0 loops/);
+	// Only the seeded anchor's own loop counts — the reflection's busy
+	// clocks never add ordinary loops.
+	assert.equal(domain.counters()?.rootLoops.value, 1n);
 	ctx.setIdle(true);
 	await pi.emit("agent_settled", {}, ctx);
+	// The cadence timer belongs to the busy window — once the private
+	// run completes, the ticker is cleared and never rescheduled.
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	for (
+		let turn = 0;
+		turn < 2000 && timers.at(-1)?.cancelled !== true;
+		turn += 1
+	)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	assert.equal(timers.at(-1)?.cancelled, true);
 	await pi.emit("session_shutdown", {}, ctx);
 });
@@ -4149,7 +4815,13 @@ for (const inquiry of [false, true])
 				let now = 0;
 				const domain = liveDomain(() => now);
 				const hub = createObservableAgentHub();
-				const main = install({ hub, domain, limits: { allLoopLimit: 1 } });
+				const driver = createReflectionDriver();
+				const main = install({
+					hub,
+					domain,
+					limits: { allLoopLimit: 1 },
+					privateInquiry: { service: driver.service } as any,
+				});
 				const child = install({
 					hub,
 					domain,
@@ -4158,12 +4830,19 @@ for (const inquiry of [false, true])
 				await main.pi.emit("session_start", {}, main.ctx);
 				await child.pi.emit("session_start", {}, child.ctx);
 				const hooks = captureReflectionHooks(main.pi);
+				if (inquiry) seedAnchor(main.ctx);
+				main.ctx.setIdle(false);
+				await main.pi.emit("agent_start", {}, main.ctx);
 				if (inquiry) {
 					await main.pi.commands[0]?.handler("cancel clock inquiry", main.ctx);
-					await startReflectionRun(main.pi, main.ctx);
-				} else {
-					main.ctx.setIdle(false);
-					await main.pi.emit("agent_start", {}, main.ctx);
+					await awaitReflectionOperation(driver);
+					for (let turn = 0; turn < 2000 && !driver.awaitingResponse; turn += 1)
+						await new Promise<void>((resolve) => setTimeout(resolve, 1));
+					assert.equal(
+						driver.awaitingResponse,
+						true,
+						"private child is working before abort",
+					);
 				}
 				if (busyChild) {
 					child.ctx.setIdle(false);
@@ -4188,6 +4867,10 @@ for (const inquiry of [false, true])
 				main.ctx.setIdle(true);
 				await main.pi.emit("agent_settled", {}, main.ctx);
 				await flushAsync();
+				if (inquiry) {
+					const result = await settleReflectionOperation(driver);
+					assert.equal(result?.kind, "cancelled");
+				}
 				assert.equal(domain.counters()?.anyBusy, busyChild);
 				now = 3500;
 				await child.pi.emit("session_compact", {}, child.ctx);
@@ -4210,10 +4893,16 @@ for (const inquiry of [false, true])
 				assert.equal(domain.counters()?.taskMs.value, frozen?.taskMs.value);
 				assert.equal(continuationMessages(main.pi).length, 0);
 				assert.equal(
-					main.pi.messages.filter(({ message }) =>
-						message.customType.endsWith(":inquiry"),
-					).length,
+					driver.operations.length,
 					inquiry ? 1 : 0,
+					"private run count survives abort settlement",
+				);
+				assert.equal(
+					main.pi.messages.filter(({ message }) =>
+						String(message.customType ?? "").endsWith(":inquiry"),
+					).length,
+					0,
+					"no inquiry message exists in the private path",
 				);
 				assert.deepEqual(hooks, []);
 				assert.equal(
@@ -4230,7 +4919,12 @@ for (const modern of [false, true])
 	test(`selected ${modern ? "recorded" : "legacy"} history keeps startup windows through navigation/resume/fork/reload`, async () => {
 		let now = 0;
 		const domain = liveDomain(() => now);
-		const { pi, ctx } = install({ domain, limits: { rootLoopLimit: 100 } });
+		const driver = createReflectionDriver();
+		const { pi, ctx } = install({
+			domain,
+			limits: { rootLoopLimit: 100 },
+			privateInquiry: { service: driver.service } as any,
+		});
 		const history = [
 			ordinaryLoop("old"),
 			branchMessage(
@@ -4304,10 +4998,362 @@ for (const modern of [false, true])
 			assert.equal(domain.counters()?.activeLoops.value, expected.activeLoops);
 			assert.equal(domain.counters()?.rootLoops.value, expected.reminderLoops);
 			assert.equal(
-				lastInquiry(pi),
-				undefined,
+				driver.operations.length,
+				0,
 				"adoption never authorizes reflection",
 			);
 		}
 		await pi.emit("session_shutdown", {}, ctx);
 	});
+
+// Coordinator af337239 — manual-only fulfillment conditions: identity-bound
+// queue, stale drop, empty-queue silence, at-most-once, cancel isolation.
+
+test("ownership loss makes the queued manual request silently stale", async () => {
+	const hub = createObservableAgentHub();
+	const domain = new FakeDomain();
+	const driver = createReflectionDriver();
+	const root = install({
+		hub,
+		domain,
+		privateInquiry: { service: driver.service } as any,
+		ctx: context("root", { hasUI: false }),
+	});
+	await root.pi.emit("session_start", {}, root.ctx);
+	seedAnchor(root.ctx);
+	// Active run + queued manual behind it.
+	// The active run stages a valid file and holds until ownership moved.
+	const staged = stageValidThenHold(driver);
+	await root.pi.commands[0]?.handler("active", root.ctx);
+	await awaitReflectionOperation(driver);
+	await staged.ready();
+	await root.pi.commands[0]?.handler("queued behind active", root.ctx);
+	// Another attachment claims main: the pending entry's admission identity
+	// no longer matches — settlement drops it silently.
+	const owner = install({
+		hub,
+		domain,
+		ctx: context("owner", { hasUI: true }),
+	});
+	await owner.pi.emit("session_start", {}, owner.ctx);
+	const notificationsBeforeSettle = [...root.ctx.notifications];
+	staged.release();
+	await settleReflectionOperation(driver);
+	assert.equal(driver.operations.length, 1, "stale queue never launches");
+	assert.deepEqual(
+		root.ctx.notifications.slice(notificationsBeforeSettle.length),
+		[],
+		"no warning for the silently dropped queued request",
+	);
+});
+
+test("provider failure drains with an empty queue: no launch, no counters", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx, domain } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	driver.respond({ throw: new Error("provider down") });
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	// Quiesce the command's takeover accounting BEFORE the snapshot: the
+	// settle-triggered domain refresh must see a fully drained branch so
+	// the drain window contains no deferred charge.
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	await flushAsync();
+	const counters = domain.counters();
+	const root = counters.rootLoops.value;
+	const all = counters.allLoops.value;
+	const entries = pi.entries.length;
+	const result = await settleReflectionOperation(driver);
+	assert.equal(result?.kind, "execution-error");
+	assert.equal(driver.operations.length, 1, "empty queue never relaunches");
+	assert.equal(domain.counters().rootLoops.value, root);
+	assert.equal(domain.counters().allLoops.value, all);
+	assert.equal(continuationMessages(pi).length, 0);
+	assert.equal(pi.entries.length, entries, "failure drain writes no entries");
+});
+
+test("stale valid candidate after revoke drains silently", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx, domain } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// A valid file is staged and held; it settles only after the takeover.
+	const staged = stageValidThenHold(driver);
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	const child = await staged.ready();
+	// Revoke mid-flight: the decision's source/authority is dead even
+	// though a valid file settles.
+	await pi.emit("input", { source: "rpc", text: "user" }, ctx);
+	// Quiesce the takeover's own accounting BEFORE the snapshot — the
+	// revoke is the real external takeover and must not leak into the
+	// drain window under test.
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, ctx);
+	await flushAsync();
+	const counters = domain.counters();
+	const root = counters.rootLoops.value;
+	const all = counters.allLoops.value;
+	const entries = pi.entries.length;
+	staged.release();
+	const result = await settleReflectionOperation(driver);
+	assert.equal(child.aborted, true, "revocation aborted the staged child");
+	assert.equal(result?.kind, "cancelled");
+	assert.equal(driver.operations.length, 1, "stale outcome launches nothing");
+	assert.equal(domain.counters().rootLoops.value, root);
+	assert.equal(domain.counters().allLoops.value, all);
+	assert.equal(continuationMessages(pi).length, 0);
+	assert.equal(pi.entries.length, entries, "stale candidate writes no entries");
+});
+
+test("true cancellation drain leaves an empty queue silent", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx, domain } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// No reply scripted: the child parks until the abort releases it.
+	await pi.commands[0]?.handler("", ctx);
+	const operation = await awaitReflectionOperation(driver);
+	await pi.emit("session_shutdown", {}, ctx);
+	await flushAsync();
+	const counters = domain.counters();
+	const root = counters.rootLoops.value;
+	const all = counters.allLoops.value;
+	for (let attempt = 0; attempt < 2000 && !operation.settled; attempt += 1)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	assert.equal(operation.settled, true);
+	assert.equal((await operation.result)?.kind, "cancelled");
+	assert.equal(driver.operations.length, 1);
+	assert.equal(domain.counters().rootLoops.value, root);
+	assert.equal(domain.counters().allLoops.value, all);
+	assert.equal(continuationMessages(pi).length, 0);
+	assert.equal(pi.entries.length, 0);
+});
+
+test("manual queue fulfillment happens at most once per drain", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// The first run stays parked until "second" is queued behind it.
+	await pi.commands[0]?.handler("first", ctx);
+	await pi.commands[0]?.handler("second", ctx);
+	await awaitReflectionOperation(driver);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
+	assert.equal(driver.operations.length, 2, "queued second launched once");
+	// Settle the second operation deterministically — its own drain must
+	// not re-dispatch anything, and no third run may appear after a
+	// duplicate release/settlement window.
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	const second = driver.operations.at(1);
+	assert.ok(second, "second operation started");
+	for (let turn = 0; turn < 2000 && !second.settled; turn += 1) {
+		if (driver.awaitingResponse)
+			throw new Error("second child parked unscripted");
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+	await flushAsync();
+	assert.equal(
+		driver.operations.length,
+		2,
+		"no repeat dispatch from the drained release",
+	);
+});
+
+test("/cancel-reflect withdraws the pending entry and never aborts the active child", async () => {
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	// The active run stays parked until the withdrawal checks ran.
+	await pi.commands[0]?.handler("active run", ctx);
+	const operation = await awaitReflectionOperation(driver);
+	await pi.commands[0]?.handler("withdrawn", ctx);
+	await pi.commands[1]?.handler("", ctx);
+	assert.ok(ctx.notifications.includes("Queued reflection cancelled."));
+	assert.equal(
+		operation.options.signal?.aborted,
+		false,
+		"cancel never touches the active child's signal",
+	);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	const result = await settleReflectionOperation(driver);
+	assert.equal(
+		result?.kind,
+		"decision",
+		"the active run settles its decision — cancel never aborted it",
+	);
+	assert.equal(
+		driver.operations.length,
+		1,
+		"the withdrawn request never launches",
+	);
+	assert.equal(continuationMessages(pi).length, 1);
+});
+
+test("non-settling host prompt keeps the revoked slot held without overlap", async () => {
+	const driver = createReflectionDriver();
+	const baseCreateRuntime = driver.service.createRuntime;
+	let releasePrompt!: () => void;
+	const stuck = new Promise<void>((resolve) => {
+		releasePrompt = resolve;
+	});
+	let reportSettled!: () => void;
+	const childSettled = new Promise<void>((resolve) => {
+		reportSettled = resolve;
+	});
+	driver.service.createRuntime = async () => {
+		const runtime = await baseCreateRuntime();
+		return {
+			...runtime,
+			async fork(input) {
+				const child = await runtime.fork(input);
+				child.subscribe?.((event: unknown) => {
+					if ((event as { type?: string }).type === "agent_settled")
+						reportSettled();
+				});
+				return new Proxy(child, {
+					get(target, property) {
+						if (property === "prompt")
+							return async (text: string) => {
+								try {
+									await target.prompt(text);
+								} finally {
+									await stuck;
+								}
+							};
+						return Reflect.get(target, property, target);
+					},
+				});
+			},
+		};
+	};
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	try {
+		await pi.commands[0]?.handler("uncooperative child", ctx);
+		const operation = await awaitReflectionOperation(driver);
+		for (let turn = 0; turn < 2000 && !driver.awaitingResponse; turn += 1)
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		assert.equal(driver.awaitingResponse, true);
+		await pi.emit("input", { source: "interactive", text: "take over" }, ctx);
+		await childSettled;
+		await flushAsync();
+		assert.equal(operation.options.signal?.aborted, true);
+		// Cooperative liveness: an event cannot prove the prompt promise drained.
+		assert.equal(operation.settled, false);
+		await pi.commands[0]?.handler("queued behind stuck child", ctx);
+		await flushAsync();
+		assert.equal(
+			driver.operations.length,
+			1,
+			"never overlap a child whose prompt has not drained",
+		);
+		assert.equal(pi.messages.length, 0);
+		assert.equal(
+			pi.entries.some(({ customType }) =>
+				/:reflection(?:-completed)?$/.test(customType),
+			),
+			false,
+		);
+	} finally {
+		releasePrompt();
+		await settleReflectionOperation(driver);
+		await pi.emit("session_shutdown", {}, ctx);
+	}
+});
+
+test("idle owned Escape aborts only the exact private child and retires queued manual work", async () => {
+	const { driver, ctx, pi, hooks, operation } =
+		await startIdleEscapeReflection();
+	await pi.commands[0]?.handler("queued before escape", ctx);
+	const notifications = ctx.notifications.length;
+	assert.equal(ctx.pressKey("x"), false, "other keys pass through");
+	assert.equal(ctx.pressKey("\x1b"), true);
+	assert.equal(operation.options.signal?.aborted, true);
+	assert.equal(
+		ctx.pressKey("\x1b"),
+		false,
+		"repeat Escape is consumed at most once",
+	);
+	assert.equal((await settleReflectionOperation(driver))?.kind, "cancelled");
+	assert.equal(driver.children[0]?.aborted, true);
+	assert.equal(
+		driver.operations.length,
+		1,
+		"retired queued request never relaunches",
+	);
+	assert.equal(runtimeQueuedState(pi, ctx), false);
+	assert.deepEqual(hooks, []);
+	assert.equal(pi.messages.length, 0);
+	assert.equal(
+		pi.entries.some(({ customType }) =>
+			/:reflection(?:-completed)?$/.test(customType),
+		),
+		false,
+	);
+	assert.ok(
+		ctx.notifications.length <= notifications + 1,
+		"at most one quiet notice",
+	);
+	await pi.emit("session_shutdown", {}, ctx);
+	assert.equal(ctx.terminalInputs.size, 0, "listener disposed on shutdown");
+});
+
+test("idle Escape is consumed after main events arrive with fresh host contexts", async () => {
+	const { driver, ctx, pi, operation } = await startIdleEscapeReflection();
+	// Real Pi builds a new context object for every event.
+	const eventCtx = Object.create(ctx);
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, eventCtx);
+	ctx.setIdle(true);
+	await pi.emit("agent_settled", {}, eventCtx);
+	assert.equal(ctx.pressKey("\x1b"), true);
+	assert.equal(operation.options.signal?.aborted, true);
+	assert.equal((await settleReflectionOperation(driver))?.kind, "cancelled");
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("busy main Escape passes through without touching the private child", async () => {
+	const { driver, ctx, pi, operation } = await startIdleEscapeReflection();
+	ctx.setIdle(false);
+	await pi.emit("agent_start", {}, ctx);
+	assert.equal(ctx.pressKey("\x1b"), false);
+	assert.equal(operation.options.signal?.aborted, false);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	assert.equal((await settleReflectionOperation(driver))?.kind, "decision");
+	ctx.setIdle(true);
+	assert.equal(
+		ctx.pressKey("\x1b"),
+		false,
+		"Escape after the work ends passes through",
+	);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("Escape listener is replaced on session replacement", async () => {
+	const { driver, ctx, pi, operation } = await startIdleEscapeReflection();
+	const next = context("escape-next", { mode: "tui" });
+	await pi.emit("session_start", { reason: "new" }, next);
+	assert.equal(ctx.terminalInputs.size, 0, "old session listener disposed");
+	assert.equal(operation.options.signal?.aborted, true);
+	await settleReflectionOperation(driver);
+	await pi.emit("session_shutdown", {}, next);
+	assert.equal(next.terminalInputs.size, 0);
+});
