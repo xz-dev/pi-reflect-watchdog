@@ -42,8 +42,8 @@ export function assertStockPiDependencyShape(manifest) {
 	)
 		throw new Error("fixture must not declare typebox as a direct dependency");
 	for (const name of piPeers) {
-		if (manifest.peerDependencies?.[name] !== "*")
-			throw new Error(`fixture must peer-depend on ${name}`);
+		if (manifest.peerDependencies?.[name] !== ">=1.3.0")
+			throw new Error(`fixture must peer-depend on ${name}>=1.3.0`);
 	}
 	return true;
 }

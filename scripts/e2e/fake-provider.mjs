@@ -45,6 +45,8 @@ function streamResponse(response, id, record, plan) {
 	}, delay);
 	response.on("close", () => {
 		if (!response.writableEnded) {
+			// The client closed an unfinished stream: an observed abort.
+			record.abortedAt = performance.now();
 			clearTimeout(firstTimer);
 			clearTimeout(finalTimer);
 		}
@@ -117,7 +119,40 @@ export async function startFakeProvider({
 	};
 }
 
-export function reflectionResponse(args) {
+const RESULT_FILE_PATTERN =
+	/<private_inquiry_result_file>(.*?)<\/private_inquiry_result_file>/gs;
+
+export function requestText(request) {
+	return (request?.body?.messages ?? [])
+		.map((message) =>
+			typeof message.content === "string"
+				? message.content
+				: Array.isArray(message.content)
+					? message.content.map((block) => block?.text ?? "").join("\n")
+					: "",
+		)
+		.join("\n");
+}
+
+/** Latest designated private result path in a provider request, if any. */
+export function privateResultPath(request) {
+	const marker = [...requestText(request).matchAll(RESULT_FILE_PATTERN)].at(
+		-1,
+	)?.[1];
+	return marker === undefined ? undefined : JSON.parse(marker);
+}
+
+export function isPrivateReflectionRequest(request) {
+	return privateResultPath(request) !== undefined;
+}
+
+/** Private child reply: one SDK `write` of the result to its designated file. */
+export function reflectionResponse(args, request) {
+	const file = privateResultPath(request);
+	if (file === undefined)
+		throw new Error(
+			"reflection response requires a private result-file request",
+		);
 	return {
 		delay: 20,
 		chunks: [
@@ -127,13 +162,98 @@ export function reflectionResponse(args) {
 						index: 0,
 						id: "reflection-result",
 						type: "function",
-						function: { name: "ref", arguments: JSON.stringify(args) },
+						function: {
+							name: "write",
+							arguments: JSON.stringify({
+								path: file,
+								content: typeof args === "string" ? args : JSON.stringify(args),
+							}),
+						},
 					},
 				],
 			},
 		],
 		finishReason: "tool_calls",
 	};
+}
+
+function toolCallResponse(calls, prefix) {
+	return {
+		delay: 20,
+		chunks: [
+			{
+				tool_calls: calls.map((call, index) => ({
+					index,
+					id: `${prefix}-${index}`,
+					type: "function",
+					function: { name: call.name, arguments: JSON.stringify(call.args) },
+				})),
+			},
+		],
+		finishReason: "tool_calls",
+	};
+}
+
+/**
+ * Scripted private child. `attempts[n]` is either a result object (written
+ * at once) or `{ steps: [[call, ...], ...], result }`: each step is one
+ * assistant response of tool calls, then the result write. The n-th attempt
+ * is selected by the correction prompts seen so far. A request after the
+ * result write is an unsolicited acknowledgement turn: it is recorded on
+ * `plan.violations` and answered with plain text so the run still ends.
+ */
+export function privateReflectionPlan(attempts, ordinary) {
+	const listFor = (request) => {
+		// A function selects the attempt list per reflection (fresh child).
+		const value = typeof attempts === "function" ? attempts(request) : attempts;
+		return Array.isArray(value) ? value : [value];
+	};
+	const violations = [];
+	const plan = ({ requestIndex, request }) => {
+		if (!isPrivateReflectionRequest(request))
+			return ordinary(request, requestIndex);
+		const messages = request.body.messages ?? [];
+		const text = requestText(request);
+		const corrections = (
+			text.match(/previous reflection response was invalid/g) ?? []
+		).length;
+		const lastUser = messages.findLastIndex(
+			(message) => message.role === "user",
+		);
+		const sinceUser = messages.slice(lastUser + 1);
+		const resultPath = privateResultPath(request);
+		const wroteResult = sinceUser.some(
+			(message) =>
+				message.role === "assistant" &&
+				(message.tool_calls ?? []).some(
+					(call) =>
+						call.function?.name === "write" &&
+						JSON.parse(call.function.arguments || "{}").path === resultPath,
+				),
+		);
+		if (wroteResult) {
+			violations.push({ requestIndex, corrections });
+			return {
+				delay: 20,
+				chunks: [{ content: "unsolicited acknowledgement" }],
+			};
+		}
+		const list = listFor(request);
+		const attempt = list[Math.min(corrections, list.length - 1)];
+		const scripted =
+			attempt && typeof attempt === "object" && Array.isArray(attempt.steps)
+				? attempt
+				: { steps: [], result: attempt };
+		const stepsDone = sinceUser.filter(
+			(message) => message.role === "assistant",
+		).length;
+		const step = scripted.steps[stepsDone];
+		if (step !== undefined)
+			return toolCallResponse(step, `helper-${corrections}-${stepsDone}`);
+		return reflectionResponse(scripted.result, request);
+	};
+	plan.violations = violations;
+	return plan;
 }
 
 export function modelConfig(baseUrl) {

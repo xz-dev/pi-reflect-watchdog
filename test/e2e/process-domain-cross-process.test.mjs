@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createJiti } from "jiti";
 import {
 	openProcessDomain,
 	openSharedProcessDomain,
@@ -90,6 +91,10 @@ class MinimalPi {
 
 	appendEntry(customType, data) {
 		this.entries.push({ customType, data });
+	}
+
+	getThinkingLevel() {
+		return "off";
 	}
 
 	async emit(name, event, context) {
@@ -722,13 +727,23 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		agentDir: isolated.agentDir,
 	});
 	const moduleUrl = pathToFileURL(
-		path.join(artifact.packagePath, "dist", "process-domain.js"),
+		path.join(artifact.packagePath, "src", "process-domain.ts"),
 	).href;
 	const extensionUrl = pathToFileURL(
-		path.join(artifact.packagePath, "dist", "extension.js"),
+		path.join(artifact.packagePath, "src", "extension.ts"),
 	).href;
-	const packedDomain = await import(moduleUrl);
-	const packedExtension = await import(extensionUrl);
+	// Same loader shape as Pi: jiti with host packages aliased, not installed.
+	const jiti = createJiti(import.meta.url, {
+		moduleCache: false,
+		alias: Object.fromEntries(
+			["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"].map((name) => [
+				`@earendil-works/${name}`,
+				path.join(ROOT, "node_modules", "@earendil-works", name),
+			]),
+		),
+	});
+	const packedDomain = await jiti.import(moduleUrl);
+	const packedExtension = await jiti.import(extensionUrl);
 	const env = {};
 	const root = packedDomain.createReflectDomainCoordinator({
 		env,
@@ -737,9 +752,35 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 	});
 	const pi = new MinimalPi();
 	const rootSession = SessionManager.inMemory();
-	const context = minimalContext("packed-root", rootSession);
+	const context = {
+		...minimalContext("packed-root", rootSession),
+		// Private admission freezes a replayable anchor from the real session.
+		sessionManager: rootSession,
+		model: { provider: "fixture", id: "fixture" },
+	};
+	// Records admission only; the private executor itself is covered by
+	// stock-pi-private.test.mjs.
+	const admitted = [];
 	packedExtension.createWatchdogExtension({
 		processDomain: root,
+		privateInquiry: {
+			createRuntime: async () => ({
+				fork: async () => {
+					throw new Error("unused");
+				},
+				dispose() {},
+			}),
+			run: (options) => {
+				admitted.push(options.prompt("/var/tmp/unused/result.json"));
+				return new Promise((resolve) =>
+					options.signal?.addEventListener(
+						"abort",
+						() => resolve({ kind: "cancelled" }),
+						{ once: true },
+					),
+				);
+			},
+		},
 		services: {
 			loadConfig: async () => ({
 				config: {
@@ -840,24 +881,18 @@ test("packed abrupt loss preserves replacement accounting and automatic Reflect"
 		context,
 	);
 	await waitFor(
-		() =>
-			pi.messages.some(({ message }) =>
-				String(message?.customType ?? "").endsWith(":inquiry"),
-			),
+		() => admitted.length === 1,
 		"automatic Reflect after abrupt peer loss",
 	);
-	const inquiry = pi.messages.findLast(({ message }) =>
-		String(message?.customType ?? "").endsWith(":inquiry"),
+	assert.match(admitted[0], /ALL_LOOP_LIMIT/);
+	assert.match(admitted[0], /Branch-scoped history recovery unavailable/);
+	assert.equal(
+		pi.messages.filter(({ message }) =>
+			String(message?.customType ?? "").endsWith(":inquiry"),
+		).length,
+		0,
+		"no main-session inquiry traffic",
 	);
-	assert.match(inquiry?.message?.content ?? "", /ALL_LOOP_LIMIT/);
-	assert.match(
-		inquiry?.message?.content ?? "",
-		/Branch-scoped history recovery unavailable/,
-	);
-	assert.deepEqual(inquiry?.options, {
-		triggerTurn: true,
-		deliverAs: "steer",
-	});
 });
 
 test("real authenticated transport: repair, fresh unchanged-count completion, duplicate and reset", {

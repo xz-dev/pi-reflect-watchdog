@@ -1,3 +1,7 @@
+-- HISTORICAL, NOT CURRENT: its main-session inquiry/`ref` reflection steps are
+-- superseded by private-reflection-manual-identity.idea.lean (private child,
+-- manual identity, takeover, Escape, slot release). Not certified for the
+-- private-fork implementation.
 -- This executable process document models the minimal Reflect Watchdog rebuilt
 -- on Pi's authoritative run lifecycle. It uses Lean core only and has no effects.
 set_option autoImplicit false

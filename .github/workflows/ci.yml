@@ -16,7 +16,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Full packed E2E alone takes ~11 min locally (real one-minute timing case,
+    # stock-Pi Git installs, cross-process transport).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,3 +38,38 @@ jobs:
       - run: npm run check
       - name: Stock Pi package and Git-install E2E
         run: npm run test:e2e
+      - name: Verify npm Git-clone production install policy
+        run: |
+          set -o pipefail
+          # Tracked .npmrc (allow-git=root, legacy-peer-deps) plus exact-commit
+          # allowScripts must run the reviewed utils runtime preparation.
+          install_root="$(mktemp -d)"
+          git clone --local . "$install_root/pi-reflect-watchdog"
+          cd "$install_root/pi-reflect-watchdog"
+          NPM_CONFIG_CACHE="$install_root/npm-cache" npm install --omit=dev --no-audit --no-fund --foreground-scripts 2>&1 | tee "$install_root/npm.log"
+          grep -q "Prepared private pi-subagents" "$install_root/npm.log"
+          node -e 'const p=require("./node_modules/private-inquiry-subagents-runtime/package.json"); if (!p.exports?.["./watchdog-runtime"]) { console.error("private runtime not prepared"); process.exit(1) }'
+      - name: Install the released standalone Pi exactly as users get it
+        run: |
+          # The xz-dev standalone Pi installs Git packages with its embedded Bun, which
+          # ignores npm allowScripts and blocks untrusted dependency scripts. Verify the
+          # release checksum, then install this commit with the real binary.
+          release=xz-v1.3.0-xz.339.1.g12ba93b4
+          dir="$RUNNER_TEMP/pi-release"
+          mkdir -p "$dir" && cd "$dir"
+          gh release download "$release" -R xz-dev/pi -p pi-linux-x64-gnu-baseline.zip -p SHA256SUMS
+          grep ' pi-linux-x64-gnu-baseline.zip$' SHA256SUMS | sha256sum -c -
+          unzip -q pi-linux-x64-gnu-baseline.zip
+          ./pi --version
+          echo "PI_BIN=$dir/pi" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Real pi install and load of this commit (clean agent dir, git+sh only)
+        run: |
+          # Serve this exact commit from a local Git daemon; Pi installs Git sources by URL.
+          root="$RUNNER_TEMP/git-serve"
+          mkdir -p "$root/ci/pi-reflect-watchdog"
+          git clone --bare --quiet . "$root/ci/pi-reflect-watchdog/.git"
+          git daemon --reuseaddr --base-path="$root" --export-all --port=19418 --listen=127.0.0.1 --detach --pid-file="$RUNNER_TEMP/git-daemon.pid"
+          for i in $(seq 1 20); do git ls-remote git://127.0.0.1:19418/ci/pi-reflect-watchdog >/dev/null 2>&1 && break; sleep 0.5; done
+          HOME="$(mktemp -d)" scripts/pi-install-smoke.sh "git:git://127.0.0.1:19418/ci/pi-reflect-watchdog@$(git rev-parse HEAD)"

@@ -30,27 +30,27 @@ test("master metadata targets the exact stock Pi Node floor and TypeScript sourc
 	assert.deepEqual(manifest.pi?.extensions, ["./src/extension.ts"]);
 });
 
-test("pack staging rewrites only the staged manifest to dist", async (t) => {
+test("pack staging ships the exact TypeScript entry graph and unchanged manifest", async (t) => {
 	const fixture = await createSourceFixture(t);
 	const stage = path.join(fixture.base, "pack");
 	await createPackStage({ root: fixture.root, outputDirectory: stage });
 	const manifest = JSON.parse(
 		await readFile(path.join(stage, "package.json"), "utf8"),
 	);
-	assert.deepEqual(manifest.pi?.extensions, ["./dist/extension.js"]);
-	assert.deepEqual(await listTree(stage), PACK_ALLOWLIST);
-	assert.equal(
-		await readFile(path.join(stage, "dist", "fatal-exit.js"), "utf8"),
-		await readFile(path.join(fixture.root, "dist", "fatal-exit.js"), "utf8"),
-	);
-	assert.equal(
-		await readFile(path.join(stage, "dist", "fatal-exit.d.ts"), "utf8"),
-		await readFile(path.join(fixture.root, "dist", "fatal-exit.d.ts"), "utf8"),
-	);
 	const sourceManifest = JSON.parse(
 		await readFile(path.join(fixture.root, "package.json"), "utf8"),
 	);
-	assert.deepEqual(sourceManifest.pi?.extensions, ["./src/extension.ts"]);
+	assert.deepEqual(manifest, sourceManifest);
+	assert.deepEqual(manifest.pi?.extensions, ["./src/extension.ts"]);
+	assert.deepEqual(await listTree(stage), PACK_ALLOWLIST);
+	assert.equal(
+		await readFile(path.join(stage, "src", "extension.ts"), "utf8"),
+		await readFile(path.join(fixture.root, "src", "extension.ts"), "utf8"),
+	);
+	assert.equal(
+		PACK_ALLOWLIST.some((file) => file.startsWith("dist/")),
+		false,
+	);
 });
 
 test("pack output rejects source root and ancestor without mutation", async (t) => {

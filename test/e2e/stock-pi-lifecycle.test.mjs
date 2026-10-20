@@ -3,8 +3,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+	isPrivateReflectionRequest,
 	modelConfig,
-	reflectionResponse,
+	privateReflectionPlan,
 	startFakeProvider,
 } from "../../scripts/e2e/fake-provider.mjs";
 import {
@@ -42,9 +43,9 @@ async function setup(t, { taskMinutes = 30, ...providerOptions } = {}) {
 		launcherArgs: [
 			"--mode",
 			"rpc",
-			"--no-session",
+			// Private reflection forks the persisted parent session.
 			"--tools",
-			"ref",
+			"read",
 			"--provider",
 			"watchdog-fixture",
 			"--model",
@@ -54,7 +55,7 @@ async function setup(t, { taskMinutes = 30, ...providerOptions } = {}) {
 	resources.add(() => rpc.close());
 	await assertSingleWatchdogCommand(
 		rpc,
-		path.join(artifact.packagePath, "dist", "extension.js"),
+		path.join(artifact.packagePath, "src", "extension.ts"),
 	);
 	return { rpc, provider };
 }
@@ -75,33 +76,37 @@ test("a real stock Pi model turn completes and settles through the loopback prov
 	await rpc.close();
 });
 
-test("the real one-minute wall warning steers exactly once while active", {
+// Automatic evaluation happens at fresh valid turn completion (turn-end
+// reflection spec); the private child is the reflection request.
+test("the real one-minute task limit reflects once at the first completion past it", {
 	timeout: 120_000,
 }, async (t) => {
 	const { rpc, provider } = await setup(t, {
 		taskMinutes: 1,
-		responsePlan: ({ requestIndex }) => {
-			if (requestIndex === 0)
-				return {
-					delay: 66_000,
-					halfway: 30_000,
-					chunks: [{ content: "working " }, { content: "done" }],
-				};
-			if (requestIndex === 1)
-				return reflectionResponse({
-					type: "NO_ISSUE",
-					reason: "timing route is sound",
-					done: "checked",
-					current_step: "finish",
-					next_step: "stop",
-				});
-			return {
-				delay: 20,
-				chunks: [{ content: "post-threshold completion" }],
-			};
-		},
+		responsePlan: privateReflectionPlan(
+			{
+				type: "NO_ISSUE",
+				reason: "timing route is sound",
+				done: "checked",
+				current_step: "finish",
+				next_step: "stop",
+			},
+			(_request, requestIndex) =>
+				requestIndex === 0
+					? {
+							delay: 66_000,
+							halfway: 30_000,
+							chunks: [{ content: "working " }, { content: "done" }],
+						}
+					: { delay: 20, chunks: [{ content: "post-threshold completion" }] },
+		),
 	});
-	const startedAt = Date.now();
+	const attempts = () =>
+		provider.requests.filter(
+			(request) =>
+				isPrivateReflectionRequest(request) &&
+				request.body.messages.at(-1)?.role !== "tool",
+		);
 	const start = performance.now();
 	const response = await rpc.request({
 		type: "prompt",
@@ -109,57 +114,32 @@ test("the real one-minute wall warning steers exactly once while active", {
 	});
 	assert.equal(response.success, true);
 	await rpc.waitFor((message) => message.type === "agent_start");
-	const initialDeadline = start + 10_000;
-	while (provider.requests.length < 1 && performance.now() < initialDeadline)
-		await new Promise((resolve) => setTimeout(resolve, 25));
-	assert.equal(provider.requests.length, 1, "initial provider request started");
 	const earlyDeadline = start + 59_000;
 	while (performance.now() < earlyDeadline) {
-		assert.equal(
-			provider.requests.length,
-			1,
-			"no reflection before 59 seconds",
-		);
+		assert.equal(attempts().length, 0, "no reflection before 59 seconds");
 		await new Promise((resolve) => setTimeout(resolve, 250));
 	}
-	const reflectionDeadline = start + 75_000;
-	while (provider.requests.length < 2 && performance.now() < reflectionDeadline)
+	const reflectionDeadline = start + 80_000;
+	while (attempts().length < 1 && performance.now() < reflectionDeadline)
 		await new Promise((resolve) => setTimeout(resolve, 100));
-	assert.ok(provider.requests.length >= 2, "reflection request is dispatched");
-	const warningElapsed = provider.requests[1].startedAt - start;
+	assert.equal(attempts().length, 1, "reflection request is dispatched");
+	const main = provider.requests[0];
+	assert.ok(main.finishedAt, "main turn completed");
 	assert.ok(
-		warningElapsed >= 60_000,
-		`reflection was early at ${warningElapsed}ms`,
+		attempts()[0].startedAt >= main.finishedAt,
+		"evaluation waits for the completed turn",
 	);
 	assert.ok(
-		warningElapsed < 70_000,
-		`reflection was late at ${warningElapsed}ms`,
+		attempts()[0].startedAt - start < 75_000,
+		`reflection was late at ${attempts()[0].startedAt - start}ms`,
 	);
+	const prompt = JSON.stringify(attempts()[0].body.messages.at(-1));
+	assert.match(prompt, /Trigger source\(s\): TASK_TIME_LIMIT/);
+	assert.match(prompt, /task=\d+[smh](\d+s)?\/1m/i);
 	await rpc.waitFor((message) => message.type === "agent_settled", 25_000);
 	await new Promise((resolve) => setTimeout(resolve, 1_250));
-	const reflectionRequests = provider.requests.filter((request) =>
-		JSON.stringify(request.body.messages).includes(
-			"Trigger source(s): TASK_TIME_LIMIT",
-		),
-	);
-	assert.equal(
-		reflectionRequests.length,
-		1,
-		"continuous threshold triggers once",
-	);
-	const reflectionMessages = JSON.stringify(provider.requests[1].body.messages);
-	assert.match(reflectionMessages, /Trigger source\(s\): TASK_TIME_LIMIT/);
-	assert.match(reflectionMessages, /task=\d+[smh](\d+s)?\/1m/i);
-	assert.ok(
-		provider.requests[1].finishedAt,
-		"reflection response was fully consumed",
-	);
+	assert.equal(attempts().length, 1, "continuous threshold triggers once");
 	const state = await rpc.request({ type: "get_state" });
 	assert.equal(state.success, true, "RPC remains responsive after threshold");
-	const endedAt = Date.now();
-	assert.ok(
-		endedAt - startedAt >= 60_000,
-		`test observation lasted at least 60 seconds: ${endedAt - startedAt}ms`,
-	);
 	await rpc.close();
 });

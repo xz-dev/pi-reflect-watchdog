@@ -14,51 +14,33 @@ import {
 import path from "node:path";
 
 const ROOT_FILES = ["LICENSE", "README.md"];
-const DIST_FILES = [
-	"activity-types.d.ts",
-	"activity-types.js",
-	"config-loader.d.ts",
-	"config-loader.js",
-	"config.d.ts",
-	"config.js",
-	"branch-accounting.d.ts",
-	"branch-accounting.js",
-	"collection-state.d.ts",
-	"collection-state.js",
-	"duration.d.ts",
-	"duration.js",
-	"extension.d.ts",
-	"extension.js",
-	"hub.d.ts",
-	"hub.js",
-	"process-domain.d.ts",
-	"process-domain.js",
-	"reflection-protocol.d.ts",
-	"reflection-protocol.js",
-	"fatal-exit.d.ts",
-	"fatal-exit.js",
-	"index.d.ts",
-	"index.js",
-	"prompts.d.ts",
-	"prompts.js",
-	"widget.d.ts",
-	"widget.js",
+// Pi loads the TypeScript entry through its own extension loader, which also
+// transpiles the prepared private runtime; a compiled dist cannot.
+const SOURCE_FILES = [
+	"activity-types.ts",
+	"branch-accounting.ts",
+	"collection-state.ts",
+	"config-loader.ts",
+	"config.ts",
+	"duration.ts",
+	"extension.ts",
+	"fatal-exit.ts",
+	"hub.ts",
+	"index.ts",
+	"process-domain.ts",
+	"prompts.ts",
+	"reflection-protocol.ts",
+	"widget.ts",
 ];
 
 export const PACK_ALLOWLIST = [
 	...ROOT_FILES,
 	"package.json",
-	...DIST_FILES.map((name) => `dist/${name}`),
+	...SOURCE_FILES.map((name) => `src/${name}`),
 ].sort();
 
 function stableJson(value) {
 	return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-function distManifest(source) {
-	const manifest = structuredClone(source);
-	manifest.pi = { ...manifest.pi, extensions: ["./dist/extension.js"] };
-	return manifest;
 }
 
 function contains(parent, child) {
@@ -140,13 +122,13 @@ export async function assertSafeOutputPath(root, outputDirectory) {
 }
 
 async function copyPayload(root, outputDirectory) {
-	await mkdir(path.join(outputDirectory, "dist"), { recursive: true });
+	await mkdir(path.join(outputDirectory, "src"), { recursive: true });
 	for (const name of ROOT_FILES)
 		await cp(path.join(root, name), path.join(outputDirectory, name));
-	for (const name of DIST_FILES)
+	for (const name of SOURCE_FILES)
 		await cp(
-			path.join(root, "dist", name),
-			path.join(outputDirectory, "dist", name),
+			path.join(root, "src", name),
+			path.join(outputDirectory, "src", name),
 		);
 }
 
@@ -170,7 +152,7 @@ export async function createPackStage({ root, outputDirectory }) {
 		await copyPayload(root, stage);
 		await writeFile(
 			path.join(stage, "package.json"),
-			stableJson(distManifest(await sourceManifest(root))),
+			stableJson(await sourceManifest(root)),
 		);
 		await rename(stage, safeOutput);
 	} finally {
