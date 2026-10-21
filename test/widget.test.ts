@@ -16,6 +16,7 @@ import {
 function fakeTheme() {
 	return {
 		fg: (_color: string, text: string): string => text,
+		bg: (_color: string, text: string): string => text,
 	};
 }
 
@@ -185,4 +186,93 @@ test("disabled shortcut surfaces the cancel command in the queued segment", () =
 		/· queued · \/cancel-reflect to cancel$/,
 	);
 	assert.match(formatCompactWidgetText(state), /· q \/cancel-reflect$/);
+});
+
+test("private progress stays stage-first across resize and theme changes", () => {
+	const state: WidgetState = {
+		activity: { active: true, elapsedMs: 5_000, loops: 2 },
+		taskElapsedMs: 5_000,
+		taskMinutes: 20,
+		rootLoops: 2,
+		rootLoopLimit: 60,
+		allLoops: 2,
+		allLoopLimit: 300,
+		cooldownRemainingLoops: 3,
+		queuedCancelLabel: "alt+x",
+		progress: {
+			stage: "waiting for model",
+			elapsedMs: 18_000,
+			attempt: 1,
+			attemptLimit: 3,
+		},
+	};
+	const colors: string[] = [];
+	let palette = "dark";
+	const widget = createWatchdogWidget(
+		{
+			fg: (color, text) => {
+				colors.push(`${palette}:fg:${color}`);
+				return text;
+			},
+			bg: (color, text) => {
+				colors.push(`${palette}:bg:${color}`);
+				return text;
+			},
+		},
+		() => state,
+	);
+	const full = widget.render(240)[0];
+	assert.match(full, /^Reflect Watchdog \| waiting for model · 18s · 1\/3/);
+	assert.match(
+		full,
+		/active 5s\/2 loops · task 5s\/20m · root 2\/60 · all 2\/300/,
+	);
+	assert.match(full, /3 loops disable/);
+	assert.match(full, /queued · alt\+x to cancel/);
+	assert.ok(colors.includes("dark:fg:accent"));
+	assert.ok(colors.includes("dark:bg:toolPendingBg"));
+	assert.match(widget.render(24)[0], /^RW \| waiting for model/);
+	for (const width of [0, 1, 10, 24, 40, 80]) {
+		const lines = widget.render(width);
+		assert.equal(lines.length, 1);
+		assert.ok(visibleWidth(lines[0]) <= width);
+	}
+	palette = "light";
+	assert.equal(
+		widget.render(240)[0],
+		full,
+		"resize restores all stored values",
+	);
+	assert.ok(colors.includes("light:fg:accent"));
+	assert.ok(colors.includes("light:bg:toolPendingBg"));
+	assert.equal(formatWidgetText(state).includes("\x1b"), false);
+	state.progress = undefined;
+	widget.render(240);
+	assert.equal(
+		colors.at(-1),
+		"light:fg:dim",
+		"ordinary busy/queue/cooldown stay muted",
+	);
+});
+
+test("safe helper names, elapsed time and attempt remain plain text", () => {
+	const text = formatWidgetText({
+		activity: { active: false, elapsedMs: 0, loops: 0 },
+		taskElapsedMs: 0,
+		taskMinutes: 20,
+		rootLoops: 0,
+		rootLoopLimit: 60,
+		allLoops: 0,
+		allLoopLimit: 300,
+		progress: {
+			stage: "tools",
+			tools: ["read", "grep"],
+			elapsedMs: 19_200,
+			attempt: 2,
+			attemptLimit: 3,
+		},
+	});
+	assert.match(text, /tools: read, grep · 19s · 2\/3/);
+	assert.doesNotMatch(text, /cancel|%|ETA/);
+	assert.equal(text.includes("\x1b"), false);
 });

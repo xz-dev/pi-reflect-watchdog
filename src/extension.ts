@@ -83,6 +83,7 @@ type Timer = ReturnType<typeof setTimeout>;
 type TimerRole = "tui-refresh" | "rpc-status";
 
 export interface RuntimeServices {
+	/** Monotonic private-operation display clock; accounting owns its own clock. */
 	now(): number;
 	setTimeout(callback: () => void, delay: number): Timer;
 	clearTimeout(timer: Timer): void;
@@ -93,7 +94,7 @@ export interface RuntimeServices {
 }
 
 const defaultServices: RuntimeServices = {
-	now: () => Date.now(),
+	now: () => performance.now(),
 	setTimeout: (callback, delay) => setTimeout(callback, delay),
 	clearTimeout: (timer) => clearTimeout(timer),
 	loadConfig: loadRuntimeConfig,
@@ -149,6 +150,14 @@ interface ActiveReflection extends PendingReflection {
 	/** Mirrors the pinned child's compaction-retry latch: agent_settled is
 	 * not idle while a compaction retry is still pending. */
 	compactionRetryActive: boolean;
+	/** Presentation only: independent of official child-working/accounting. */
+	progress?: {
+		startedAt: number;
+		stage: NonNullable<WidgetState["progress"]>["stage"];
+		attempt?: number;
+		activeHelpers: Map<string, string>;
+	};
+	unsubscribeChild?: () => void;
 	/** Sanitized terminal-assistant metadata of the exact accepted private
 	 * child, captured before disposal; only valid entries reach a marker. */
 	privateSource?: PrivateSourceMetadata;
@@ -229,6 +238,7 @@ interface PrivateSourceMetadata {
 }
 
 interface Runtime {
+	readonly services: RuntimeServices;
 	readonly pi: ExtensionAPI;
 	readonly hub: ObservableAgentHub;
 	readonly processDomain: ReflectBranchDomainCoordinator;
@@ -853,9 +863,123 @@ function considerFreshCompletion(
 		submitReflection(runtime, runtime.ctx);
 }
 
+function visibleReflection(
+	runtime: Runtime,
+	active: ActiveReflection,
+): boolean {
+	const claim = runtime.claim;
+	const admitted = active.admission.claim;
+	return (
+		runtime.activeReflection === active &&
+		owns(runtime) &&
+		active.admission.sessionId === runtime.sessionId &&
+		active.admission.scopeRevision === runtime.scopeRevision &&
+		claim !== null &&
+		admitted !== null &&
+		claim.attachmentId === admitted.attachmentId &&
+		claim.generation === admitted.generation
+	);
+}
+
+function reflectionProgress(runtime: Runtime): WidgetState["progress"] {
+	try {
+		const active = runtime.activeReflection;
+		if (active === undefined || !visibleReflection(runtime, active)) return;
+		const progress = active.progress;
+		if (progress === undefined) return;
+		return {
+			stage: progress.stage,
+			elapsedMs: Math.max(0, runtime.services.now() - progress.startedAt),
+			attempt: progress.attempt,
+			attemptLimit: MAX_REFLECTION_REASKS,
+			tools: [...new Set(progress.activeHelpers.values())],
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function updateReflectionProgress(
+	runtime: Runtime,
+	active: ActiveReflection,
+	stage: NonNullable<WidgetState["progress"]>["stage"],
+	attempt?: number,
+): void {
+	try {
+		if (
+			!visibleReflection(runtime, active) ||
+			active.revoked ||
+			active.progress === undefined
+		)
+			return;
+		active.progress.stage = stage;
+		if (attempt !== undefined) active.progress.attempt = attempt;
+		refreshWidget(runtime);
+		scheduleRefresh(runtime, runtime.services);
+	} catch {
+		// Progress cannot change execution or result authority.
+	}
+}
+
+function observeReflectionProgress(
+	runtime: Runtime,
+	active: ActiveReflection,
+	event: unknown,
+): void {
+	try {
+		if (
+			!visibleReflection(runtime, active) ||
+			active.revoked ||
+			active.progress === undefined ||
+			!isRecord(event)
+		)
+			return;
+		const progress = active.progress;
+		if (event.type === "tool_execution_start") {
+			// The pinned evidence profile admits whole helper-only batches before execution.
+			if (
+				typeof event.toolCallId !== "string" ||
+				typeof event.toolName !== "string" ||
+				!["read", "ls", "grep", "find"].includes(event.toolName)
+			)
+				return;
+			progress.activeHelpers.set(event.toolCallId, event.toolName);
+			updateReflectionProgress(runtime, active, "tools");
+		} else if (event.type === "tool_execution_end") {
+			if (
+				typeof event.toolCallId !== "string" ||
+				!progress.activeHelpers.delete(event.toolCallId)
+			)
+				return;
+			updateReflectionProgress(
+				runtime,
+				active,
+				progress.activeHelpers.size > 0 ? "tools" : "waiting for model",
+			);
+		} else if (
+			event.type === "agent_start" ||
+			event.type === "turn_start" ||
+			event.type === "auto_retry_start"
+		) {
+			updateReflectionProgress(
+				runtime,
+				active,
+				progress.activeHelpers.size > 0
+					? "tools"
+					: progress.stage === "correcting"
+						? "correcting"
+						: "waiting for model",
+			);
+		}
+	} catch {
+		// Child observations are presentation only.
+	}
+}
+
 function statusState(runtime: Runtime): WidgetState {
 	const counters = currentCounters(runtime);
 	return {
+		progress: reflectionProgress(runtime),
 		activity: {
 			active: counters?.anyBusy ?? false,
 			elapsedMs: safeNumber(counters?.activeMs.value),
@@ -878,26 +1002,30 @@ function statusText(runtime: Runtime): string {
 }
 
 function refreshWidget(runtime: Runtime): void {
-	if (!owns(runtime) || runtime.ctx === null) return;
-	if (runtime.ctx.mode === "rpc") {
-		runtime.ctx.ui.setStatus(STATUS_KEY, statusText(runtime));
-		return;
+	try {
+		if (!owns(runtime) || runtime.ctx === null) return;
+		if (runtime.ctx.mode === "rpc") {
+			runtime.ctx.ui.setStatus(STATUS_KEY, statusText(runtime));
+			return;
+		}
+		if (runtime.ctx.mode !== "tui") return;
+		if (!runtime.widgetRegistered) {
+			runtime.ctx.ui.setWidget(
+				WIDGET_KEY,
+				(tui, theme) => {
+					runtime.widgetTui = tui;
+					return createWatchdogWidget(theme, () => statusState(runtime));
+				},
+				{ placement: "belowEditor" },
+			);
+			runtime.widgetRegistered = true;
+			runtime.ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		runtime.widgetTui?.requestRender();
+	} catch {
+		// A stale UI or renderer must not affect private execution or accounting.
 	}
-	if (runtime.ctx.mode !== "tui") return;
-	if (!runtime.widgetRegistered) {
-		runtime.ctx.ui.setWidget(
-			WIDGET_KEY,
-			(tui, theme) => {
-				runtime.widgetTui = tui;
-				return createWatchdogWidget(theme, () => statusState(runtime));
-			},
-			{ placement: "belowEditor" },
-		);
-		runtime.widgetRegistered = true;
-		runtime.ctx.ui.setStatus(STATUS_KEY, undefined);
-		return;
-	}
-	runtime.widgetTui?.requestRender();
 }
 
 function clearWidget(runtime: Runtime): void {
@@ -911,36 +1039,48 @@ function clearWidget(runtime: Runtime): void {
 	}
 	runtime.widgetRegistered = false;
 	runtime.widgetTui = null;
-	ctx?.ui.setStatus(STATUS_KEY, undefined);
+	try {
+		ctx?.ui.setStatus(STATUS_KEY, undefined);
+	} catch {}
 }
 
 function scheduleRefresh(runtime: Runtime, services: RuntimeServices): void {
-	if (
-		!owns(runtime) ||
-		runtime.ctx === null ||
-		!currentCounters(runtime)?.anyBusy
-	) {
-		if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
-		runtime.ticker = undefined;
-		return;
-	}
-	if (runtime.ticker !== undefined) return;
-	const revision = runtime.scopeRevision;
-	runtime.ticker = scheduleTimer(
-		services,
-		runtime.ctx.mode === "tui" ? "tui-refresh" : "rpc-status",
-		() => {
+	try {
+		if (
+			!owns(runtime) ||
+			runtime.ctx === null ||
+			(runtime.ctx.mode !== "tui" && runtime.ctx.mode !== "rpc") ||
+			(!currentCounters(runtime)?.anyBusy &&
+				reflectionProgress(runtime) === undefined)
+		) {
+			if (runtime.ticker !== undefined) services.clearTimeout(runtime.ticker);
 			runtime.ticker = undefined;
-			if (runtime.stopped || runtime.scopeRevision !== revision) return;
-			void runtime.processDomain
-				.refreshBranch(runtime.attachmentInstance)
-				.catch(() => {});
-			refreshWidget(runtime);
-			scheduleRefresh(runtime, services);
-		},
-		ACTIVE_TICK_MS,
-	);
-	runtime.ticker.unref?.();
+			return;
+		}
+		if (runtime.ticker !== undefined) return;
+		const revision = runtime.scopeRevision;
+		const timer = scheduleTimer(
+			services,
+			runtime.ctx.mode === "tui" ? "tui-refresh" : "rpc-status",
+			() => {
+				if (runtime.ticker !== timer) return;
+				runtime.ticker = undefined;
+				if (runtime.stopped || runtime.scopeRevision !== revision) return;
+				// Display-only waits never feed time or activity into accounting.
+				if (currentCounters(runtime)?.anyBusy)
+					void runtime.processDomain
+						.refreshBranch(runtime.attachmentInstance)
+						.catch(() => {});
+				refreshWidget(runtime);
+				scheduleRefresh(runtime, services);
+			},
+			ACTIVE_TICK_MS,
+		);
+		runtime.ticker = timer;
+		timer.unref?.();
+	} catch {
+		// A display scheduler failure must not change execution.
+	}
 }
 
 function safeToDispatch(runtime: Runtime): boolean {
@@ -994,7 +1134,10 @@ function revokeActiveReflection(runtime: Runtime): void {
 	const active = runtime.activeReflection;
 	if (active === undefined || active.revoked) return;
 	active.revoked = true;
+	if (active.progress !== undefined) active.progress.stage = "cancelling";
 	active.abort.abort();
+	refreshWidget(runtime);
+	scheduleRefresh(runtime, runtime.services);
 }
 
 /**
@@ -1118,23 +1261,35 @@ async function forkObservedChild(
 	const off = child.subscribe((event) => {
 		if (!subscribed || runtime.activeReflection !== active) return;
 		observeChildEvent(active, event);
+		observeReflectionProgress(runtime, active, event);
 		if (runtime.ctx !== null) observe(runtime, runtime.ctx);
 	});
 	const cleanup = () => {
 		if (!subscribed) return;
 		subscribed = false;
-		off();
-		if (active.childWorking) {
+		try {
+			off();
+		} catch {}
+		active.progress?.activeHelpers.clear();
+		if (runtime.activeReflection === active && active.childWorking) {
 			active.childWorking = false;
 			if (runtime.ctx !== null) observe(runtime, runtime.ctx);
 		}
 	};
+	active.unsubscribeChild = cleanup;
 	const observed: PrivateChildSession = {
 		prompt: async (text) => {
 			// A new prompt invalidates any earlier captured source; only an
 			// assistant appended at/after this point may supply one.
 			promptStart = child.messages.length;
 			active.privateSource = undefined;
+			const attempt = (active.progress?.attempt ?? 0) + 1;
+			updateReflectionProgress(
+				runtime,
+				active,
+				attempt > 1 ? "correcting" : "waiting for model",
+				attempt,
+			);
 			return child.prompt(text);
 		},
 		abort: () => child.abort(),
@@ -1215,6 +1370,17 @@ function reserveReflection(
 		drained: Promise.resolve(),
 	};
 	runtime.activeReflection = active;
+	try {
+		active.progress = {
+			startedAt: runtime.services.now(),
+			stage: "preparing",
+			activeHelpers: new Map(),
+		};
+		refreshWidget(runtime);
+		scheduleRefresh(runtime, runtime.services);
+	} catch {
+		// Missing presentation never changes admission.
+	}
 	return active;
 }
 
@@ -1229,9 +1395,13 @@ function releaseReflectionSlot(
 	active: ActiveReflection,
 ): void {
 	if (runtime.activeReflection !== active) return;
+	active.unsubscribeChild?.();
+	active.unsubscribeChild = undefined;
 	active.childWorking = false;
 	runtime.activeReflection = undefined;
 	if (runtime.ctx !== null) observe(runtime, runtime.ctx);
+	refreshWidget(runtime);
+	scheduleRefresh(runtime, runtime.services);
 	// The drained slot is the dispatch point for an already-pending explicit
 	// manual request — e.g. a /reflect queued during abort settlement. This
 	// is caller-owned queue fulfillment, not threshold reevaluation: an empty
@@ -1296,6 +1466,7 @@ async function runPrivateReflection(
 			isCurrent,
 			invalidAttemptLimit: MAX_REFLECTION_REASKS,
 			validate: (payload) => {
+				updateReflectionProgress(runtime, active, "validating");
 				const validation = parseReflectionArguments(
 					prepareReflectionArguments(payload),
 				);
@@ -1307,6 +1478,7 @@ async function runPrivateReflection(
 			correction: (error) => buildReflectionReaskPrompt(error),
 			// Existing bounded per-attempt warning before each same-child retry.
 			onResponse: (observation) => {
+				updateReflectionProgress(runtime, active, "validating");
 				if (
 					observation.outcome.kind !== "invalid" ||
 					observation.attempt >= MAX_REFLECTION_REASKS ||
@@ -1333,6 +1505,7 @@ async function runPrivateReflection(
 			active.privateSource !== undefined &&
 			active.privateSource.sessionId === result.sessionId
 		) {
+			updateReflectionProgress(runtime, active, "publishing");
 			const outcome = {
 				...reflectionResult(active, result.decision),
 				correlation: active.correlation,
@@ -1605,9 +1778,9 @@ function syncOwnership(runtime: Runtime, services: RuntimeServices): void {
 		runtime.manualQueue = [];
 	}
 	runtime.claim = nextClaim;
+	scheduleRefresh(runtime, services);
 	if (!owns(runtime)) return;
 	refreshWidget(runtime);
-	scheduleRefresh(runtime, services);
 }
 
 function shutdownRuntime(runtime: Runtime, services: RuntimeServices): void {
@@ -1677,6 +1850,7 @@ export function createWatchdogExtension(
 
 	return (pi) => {
 		const runtime: Runtime = {
+			services,
 			pi,
 			hub,
 			processDomain: services.processDomain,

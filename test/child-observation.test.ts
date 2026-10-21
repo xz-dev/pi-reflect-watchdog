@@ -175,6 +175,7 @@ function makeContext() {
 		},
 	];
 	const notifications: string[] = [];
+	const statuses: Array<string | undefined> = [];
 	const manager = {
 		getSessionId: () => "root",
 		getSessionFile: () => "/sessions/root.jsonl",
@@ -206,10 +207,13 @@ function makeContext() {
 			notify(text: string) {
 				notifications.push(text);
 			},
-			setStatus() {},
+			setStatus(_key: string, text?: string) {
+				statuses.push(text);
+			},
 			setWidget() {},
 		},
 		notifications,
+		statuses,
 	} as any;
 }
 
@@ -825,4 +829,117 @@ test("malformed terminal metadata fails closed", async () => {
 	});
 	await flushAsync();
 	assert.equal(markerOf(pi), undefined, "invalid own metadata fails closed");
+});
+
+test("private progress observes overlapping safe helpers and authorized result attempts", async () => {
+	const fake = new FakePrivateInquiry();
+	const { pi, ctx, domain } = install(fake);
+	const row = () => ctx.statuses.at(-1) ?? "";
+	await startSession(pi, ctx);
+	await triggerReflection(pi, ctx, domain);
+	assert.match(row(), /preparing/);
+	assert.doesNotMatch(row(), /[123]\/3/);
+	const child = new FakeChild();
+	fake.childFactory = () => child.session();
+	const observed = await fake.lastForkRuntime.fork({});
+	const stale = [...child.listeners];
+	await observed.prompt("private prompt secret");
+	assert.match(row(), /waiting for model.*1\/3/);
+	for (const type of [
+		"agent_start",
+		"turn_start",
+		"auto_retry_start",
+		"auto_retry_end",
+	])
+		child.emit({ type });
+	assert.match(row(), /waiting for model.*1\/3/);
+	const traffic =
+		pi.entries.length + pi.messages.length + ctx.notifications.length;
+	for (const [toolCallId, toolName] of [
+		["a", "read"],
+		["b", "grep"],
+		["c", "read"],
+	])
+		child.emit({
+			type: "tool_execution_start",
+			toolCallId,
+			toolName,
+			args: { path: "/secret/path" },
+			output: "private output",
+		});
+	assert.match(row(), /tools: read, grep/);
+	child.emit({
+		type: "tool_execution_start",
+		toolCallId: "unsafe",
+		toolName: "secret/private\n\x1b[31m",
+	});
+	child.emit({ type: "tool_execution_end", toolCallId: "unknown" });
+	child.emit({ type: "tool_execution_end", toolCallId: "a" });
+	child.emit({ type: "turn_start" });
+	assert.match(row(), /tools: grep, read/);
+	child.emit({ type: "tool_execution_end", toolCallId: "b" });
+	assert.match(row(), /tools: read/);
+	child.emit({ type: "tool_execution_end", toolCallId: "c" });
+	assert.match(row(), /waiting for model.*1\/3/);
+	assert.equal(
+		pi.entries.length + pi.messages.length + ctx.notifications.length,
+		traffic,
+	);
+	assert.equal(domain.countersValue?.rootLoops.value, 2n);
+	assert.ok(
+		ctx.statuses.every(
+			(text: string | undefined) =>
+				!text || !(/secret|private output/.test(text) || text.includes("\x1b")),
+		),
+	);
+
+	const options = fake.calls[0].options;
+	options.validate({});
+	assert.match(row(), /validating.*1\/3/);
+	options.onResponse({
+		attempt: 1,
+		outcome: { kind: "invalid", error: "Missing fields." },
+	});
+	assert.doesNotMatch(
+		row(),
+		/2\/3/,
+		"a rejected result alone does not authorize a prompt",
+	);
+	options.correction("Missing fields.");
+	await observed.prompt("private correction secret");
+	child.emit({ type: "turn_start" });
+	assert.match(row(), /correcting.*2\/3/);
+	child.emit({ type: "auto_retry_start" });
+	child.emit({ type: "auto_retry_end" });
+	assert.match(row(), /2\/3/);
+	assert.equal(
+		child.promptCalls,
+		2,
+		"helper turns/native retries add no result attempts",
+	);
+
+	await pi.emit("input", { source: "rpc", text: "takeover" }, ctx);
+	assert.match(row(), /cancelling/);
+	child.emit({
+		type: "tool_execution_start",
+		toolCallId: "late",
+		toolName: "find",
+	});
+	assert.match(row(), /cancelling/);
+	await observed.dispose();
+	fake.settle({ kind: "cancelled" });
+	await flushAsync();
+	assert.doesNotMatch(row(), /cancelling|waiting for model|tools:/);
+	await triggerReflection(pi, ctx, domain);
+	assert.match(row(), /preparing/);
+	for (const callback of stale)
+		callback({
+			type: "tool_execution_start",
+			toolCallId: "late",
+			toolName: "find",
+		});
+	assert.match(row(), /preparing/, "old callback cannot repaint successor");
+	fake.settle({ kind: "cancelled" });
+	await flushAsync();
+	await pi.emit("session_shutdown", {}, ctx);
 });

@@ -32,6 +32,7 @@ import { deriveBranchAccounting } from "../src/branch-accounting.js";
 import type { WatchdogConfig } from "../src/config.js";
 import {
 	createWatchdogExtension,
+	type RuntimeServices,
 	reflectCooldownLoops,
 	reflectCooldownState,
 } from "../src/extension.js";
@@ -680,6 +681,7 @@ function install(
 		ctx?: ReturnType<typeof context>;
 		limits?: Partial<typeof config>;
 		privateInquiry?: ControllerOutcomeStub;
+		services?: Partial<RuntimeServices>;
 	} = {},
 ) {
 	const pi = new Pi();
@@ -695,6 +697,7 @@ function install(
 				config: { ...config, ...options.limits },
 				diagnostics: [],
 			}),
+			...options.services,
 		},
 	})(pi as any);
 	return { pi, ctx, domain: domain as FakeDomain, privateInquiry };
@@ -4772,9 +4775,9 @@ test("one-second display cadence stays scheduled across publications; inquiry bu
 	seedAnchor(ctx);
 	await pi.commands[0]?.handler("", ctx);
 	await awaitReflectionOperation(driver);
-	// The refresh ticker is scheduled once the private child's working
-	// period makes the session officially busy.
-	for (let turn = 0; turn < 2000 && timers.length < 1; turn += 1)
+	// Admission now schedules setup display too. Wait for actual child work
+	// before testing the independent official accounting interval.
+	for (let turn = 0; turn < 2000 && !driver.awaitingResponse; turn += 1)
 		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	assert.equal(timers.length, 1);
 	assert.equal(timers[0].delay, 1000);
@@ -5357,3 +5360,262 @@ test("Escape listener is replaced on session replacement", async () => {
 	await pi.emit("session_shutdown", {}, next);
 	assert.equal(next.terminalInputs.size, 0);
 });
+
+test("private setup elapsed refreshes while idle without feeding accounting or dispatch", async () => {
+	let now = 10_000;
+	const timers: Array<{
+		callback: () => void;
+		delay: number;
+		cancelled: boolean;
+		unref(): void;
+	}> = [];
+	let unrefs = 0;
+	let rejectSetup!: (error: Error) => void;
+	const parked = new Promise<never>((_resolve, reject) => {
+		rejectSetup = reject;
+	});
+	const controller = new ControllerOutcomeStub();
+	const { pi, ctx, domain } = install({
+		privateInquiry: {
+			service: { ...controller.service, createRuntime: () => parked },
+		} as any,
+		services: {
+			now: () => now,
+			scheduleTimer: (_role, callback, delay) => {
+				const timer = {
+					callback,
+					delay,
+					cancelled: false,
+					unref: () => {
+						unrefs += 1;
+					},
+				};
+				timers.push(timer);
+				return timer as any;
+			},
+			clearTimeout: (timer) => {
+				(timer as any).cancelled = true;
+			},
+		},
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	await pi.commands[0]?.handler("private setup", ctx);
+	const row = () => ctx.statuses.at(-1) ?? "";
+	assert.match(row(), /preparing · 0s/);
+	assert.equal(timers.length, 1, "idle-parent setup owns one display ticker");
+	assert.equal(timers[0].delay, 1000);
+	assert.equal(unrefs, 1);
+	const counters = domain.counters();
+	const writes = domain.activityWrites.length;
+	const traffic =
+		pi.entries.length + pi.messages.length + ctx.notifications.length;
+	now = 28_250;
+	timers[0].callback();
+	await flushAsync();
+	assert.match(
+		row(),
+		/preparing · 18s/,
+		"delayed callback uses measured elapsed, not tick count",
+	);
+	now = 29_200;
+	timers[1].callback();
+	await flushAsync();
+	assert.match(row(), /preparing · 19s/);
+	assert.deepEqual(domain.counters(), counters);
+	assert.equal(domain.activityWrites.length, writes);
+	assert.equal(controller.calls.length, 0);
+	assert.equal(
+		pi.entries.length + pi.messages.length + ctx.notifications.length,
+		traffic,
+	);
+	assert.doesNotMatch(row(), /queued|cancel-reflect|private setup/);
+	assert.equal(row().includes("\x1b"), false);
+	rejectSetup(new Error("fixture setup failure"));
+	await flushAsync();
+	assert.doesNotMatch(row(), /preparing|waiting for model|cancelling/);
+	assert.equal(
+		timers.at(-1)?.cancelled,
+		true,
+		"settlement releases display-only timer",
+	);
+	const count = timers.length;
+	timers.at(-1)?.callback();
+	assert.equal(
+		timers.length,
+		count,
+		"late retired tick cannot restart display work",
+	);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("real private progress keeps attempts, queue withdrawal and publication independent", async () => {
+	let now = 0;
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+		services: { now: () => now },
+	});
+	const hooks = captureReflectionHooks(pi);
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	await pi.commands[0]?.handler("private progress", ctx);
+	const operation = await awaitReflectionOperation(driver);
+	await firstPromptOf(driver, 0);
+	const row = () => ctx.statuses.at(-1) ?? "";
+	assert.match(row(), /waiting for model.*1\/3/);
+	now = 18_200;
+	await pi.emit("session_compact", {}, ctx);
+	assert.match(row(), /waiting for model · 18s · 1\/3/);
+	await pi.commands[0]?.handler("pending request", ctx);
+	assert.match(row(), /waiting for model.*queued · alt\+x to cancel/);
+	await pi.commands[1]?.handler("", ctx);
+	assert.match(row(), /waiting for model/);
+	assert.doesNotMatch(row(), /queued|to cancel/);
+	assert.equal(operation.options.signal?.aborted, false);
+	driver.respond({ write: "{}", nativeRetry: true });
+	for (
+		let turn = 0;
+		turn < 2000 && (driver.children[0]?.prompts.length ?? 0) < 2;
+		turn += 1
+	)
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	assert.match(row(), /correcting · 18s · 2\/3/);
+	assert.equal(driver.children[0]?.prompts.length, 2);
+	assert.ok(
+		ctx.statuses.some((text) => text?.includes("validating · 18s · 1/3")),
+	);
+	assert.equal(
+		ctx.statuses.some((text) => text?.includes("3/3")),
+		false,
+	);
+	driver.respond({ write: JSON.stringify(validNoIssue) });
+	await settleReflectionOperation(driver);
+	assert.ok(
+		ctx.statuses.some((text) => text?.includes("publishing · 18s · 2/3")),
+	);
+	assert.doesNotMatch(row(), /publishing|waiting for model|correcting/);
+	assert.equal(hooks.length, 1);
+	assert.equal(continuationMessages(pi).length, 1);
+	assert.equal(
+		driver.operations.length,
+		1,
+		"withdrawing pending work adds no request",
+	);
+	assert.equal(
+		ctx.statuses.some(
+			(text) =>
+				text?.includes("private progress") ||
+				text?.includes("private_inquiry_result_file"),
+		),
+		false,
+	);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("scope replacement and retired ticks cannot clear successor progress", async () => {
+	let now = 0;
+	const timers: Array<{ callback: () => void; cancelled: boolean }> = [];
+	const controller = new ControllerOutcomeStub();
+	controller.suspendAbort = true;
+	const { pi, ctx } = install({
+		privateInquiry: controller,
+		services: {
+			now: () => now,
+			scheduleTimer: (_role, callback) => {
+				const timer = { callback, cancelled: false };
+				timers.push(timer);
+				return timer as any;
+			},
+			clearTimeout: (timer) => {
+				(timer as any).cancelled = true;
+			},
+		},
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	await pi.commands[0]?.handler("old", ctx);
+	const oldCall = await pendingReflection(controller);
+	const oldTimer = timers[0];
+	const replacement = context("replacement");
+	seedAnchor(replacement);
+	await pi.emit("session_start", {}, replacement);
+	assert.doesNotMatch(
+		replacement.statuses.at(-1) ?? "",
+		/preparing|cancelling/,
+	);
+	assert.equal(oldTimer.cancelled, true);
+	assert.equal(oldCall.options.signal.aborted, true);
+	now = 20_000;
+	await pi.commands[0]?.handler("new", replacement);
+	oldCall.resolve({ kind: "cancelled" });
+	await flushAsync();
+	const current = timers.at(-1);
+	assert.ok(current && current !== oldTimer);
+	assert.match(replacement.statuses.at(-1) ?? "", /preparing · 0s/);
+	const count = timers.length;
+	oldTimer.callback();
+	oldCall.options.onResponse({
+		attempt: 1,
+		outcome: { kind: "invalid", error: "late" },
+	});
+	assert.equal(timers.length, count);
+	assert.match(replacement.statuses.at(-1) ?? "", /preparing · 0s/);
+	now = 21_000;
+	current.callback();
+	await flushAsync();
+	assert.match(replacement.statuses.at(-1) ?? "", /preparing · 1s/);
+	assert.equal(
+		timers.length,
+		count + 1,
+		"old tick did not detach successor timer",
+	);
+	controller.settle({ kind: "cancelled" });
+	await flushAsync();
+	assert.doesNotMatch(
+		replacement.statuses.at(-1) ?? "",
+		/preparing|cancelling/,
+	);
+	assert.equal(timers.at(-1)?.cancelled, true);
+	await pi.emit("session_shutdown", {}, replacement);
+});
+
+for (const mode of ["rpc", "tui"] as const)
+	test(`progress presentation failures cannot change accepted ${mode} execution`, async () => {
+		const driver = createReflectionDriver();
+		const ctx = context(`presentation-${mode}`, { mode });
+		ctx.ui.setStatus = () => {
+			throw new Error("stale status UI");
+		};
+		ctx.ui.setWidget = (_key, factory) => {
+			if (typeof factory === "function")
+				factory(
+					{
+						requestRender: () => {
+							throw new Error("stale renderer");
+						},
+					},
+					{},
+				);
+		};
+		const { pi } = install({
+			ctx,
+			privateInquiry: { service: driver.service } as any,
+			services: {
+				scheduleTimer: () => {
+					throw new Error("display scheduler failed");
+				},
+			},
+		});
+		const hooks = captureReflectionHooks(pi);
+		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		driver.respond({ write: JSON.stringify(validNoIssue) });
+		await pi.commands[0]?.handler("", ctx);
+		await awaitReflectionOperation(driver);
+		const result = await settleReflectionOperation(driver);
+		assert.equal(result?.kind, "decision");
+		assert.equal(hooks.length, 1);
+		assert.equal(continuationMessages(pi).length, 1);
+		await pi.emit("session_shutdown", {}, ctx);
+	});
