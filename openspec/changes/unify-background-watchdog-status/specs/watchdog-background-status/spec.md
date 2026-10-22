@@ -17,12 +17,17 @@ Reflect SHALL implement the shared row placement, theme-aware highlight, textual
 - **THEN** its local status row shows the same progress behavior without runtime access to the other plugin
 
 ### Requirement: Reflection stages identify actual private work
-On reflection admission, Reflect SHALL show preparation, then update to actual observed model, admitted evidence-tool, result-validation, correction, publication or cancellation-drain stages as they occur. The row SHALL show total elapsed operation time from admission and the current result-attempt ordinal and limit when known. Helper-only responses and native provider retry/compaction SHALL NOT consume or advance result-attempt counts. Optional retry/compaction detail SHALL require an official observation. Helper labels SHALL contain only safe admitted tool names, not paths, arguments, output, result locations or private text.
+On reflection admission, Reflect SHALL show preparation, then update to actual observed model, admitted evidence-tool, result-validation, correction, publication or cancellation-drain stages as they occur. The row SHALL show total elapsed operation time from admission and the current result-attempt ordinal and limit when known. Helper-only responses and native provider retry/compaction SHALL NOT consume or advance result-attempt counts. Optional retry/compaction detail SHALL require an official observation. Helper labels SHALL contain only safe admitted tool names, not paths, arguments, output, result locations or private text. While a private model request streams, model waiting SHALL be replaced by the canonical content-free streaming activity label (latest output kind `thinking`, `writing` or `tool call`, an indicator advancing only as output arrives, and the current response's streamed-character count), returning to model waiting before first output and after the response ends; only official delta kinds and lengths SHALL be used.
 
 #### Scenario: Reflection waits for the model
 - **WHEN** an admitted private reflection waits 18 seconds for a model response
 - **THEN** the existing row remains highlighted with a model-waiting phase and increasing operation elapsed time
 - **AND** the row does not claim completed steps, an ETA or a percentage
+
+#### Scenario: Reflection model streams output
+- **WHEN** the private reflection child streams thinking and then answer text
+- **THEN** the row shows `thinking`, then `writing`, with an advancing indicator and growing streamed-character count instead of model waiting
+- **AND** no streamed text, thinking or tool-call arguments are displayed or retained
 
 #### Scenario: Reflection runs evidence helpers
 - **WHEN** an admitted helper starts, finishes and is followed by another model request

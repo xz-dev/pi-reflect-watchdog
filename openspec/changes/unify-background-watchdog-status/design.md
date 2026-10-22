@@ -24,7 +24,7 @@ Alternative rejected: another live widget would duplicate information and preser
 
 ### 2. Extend the existing exact-child observation facade
 
-Admission displays preparation before asynchronous runtime acquisition. Extend `forkObservedChild`'s existing bounded subscription with safe phase observations for actual model/helper activity; forward prompt/abort/dispose and live getters unchanged. Track overlapping admitted helpers by their execution identities and display only permitted names.
+Admission displays preparation before asynchronous runtime acquisition. Extend `forkObservedChild`'s existing bounded subscription with safe phase observations for actual model/helper activity; forward prompt/abort/dispose and live getters unchanged. Track overlapping admitted helpers by their execution identities and display only permitted names. The same subscription observes `message_update` streaming deltas for the canonical content-free activity label: read only `assistantMessageEvent.type` and `delta.length`, reset the count on assistant `message_start`, return to model waiting on `message_end`, and redraw only when the visible kind or indicator frame changes. Helper execution still takes precedence over streaming while admitted helpers run.
 
 Bracket the existing validator for validation progress, and use `onResponse` and the next authorized prompt to distinguish correction from result attempts. Helper-only turns and native retries are not result attempts. Preserve `onResponse`'s existing bounded warning behavior without adding progress notifications. Native retry/compaction labels are optional refinements only when official events provide them.
 
