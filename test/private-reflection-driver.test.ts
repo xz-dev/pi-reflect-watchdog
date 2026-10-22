@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { PrivateForkInput } from "pi-extension-utils/private-inquiry";
 import { createReflectionDriver } from "./fixtures/private-reflection-driver.js";
 
 test("driver abort during result-file read settles the pending prompt", async () => {
-	const directory = await mkdtemp("/var/tmp/reflect-driver-abort-");
+	const directory = await mkdtemp(
+		join(
+			process.platform === "win32" ? tmpdir() : "/var/tmp",
+			"reflect-driver-abort-",
+		),
+	);
 	try {
 		const resultFile = join(directory, "result.json");
 		await writeFile(resultFile, "{}");

@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 import { loadRuntimeConfig } from "../src/index.js";
 
 test("loads global and trusted project configuration with independent reflectionPrompt precedence", async () => {
 	const files = new Map([
 		[
-			"/agent/pi-reflect-watchdog.json",
+			join("/agent", "pi-reflect-watchdog.json"),
 			JSON.stringify({ rootLoopLimit: 120, reflectionPrompt: "global" }),
 		],
 		[
-			"/work/.pi/pi-reflect-watchdog.json",
+			join("/work", ".pi", "pi-reflect-watchdog.json"),
 			JSON.stringify({
 				allLoopLimit: 700,
 				reflectionPrompt: "project",
