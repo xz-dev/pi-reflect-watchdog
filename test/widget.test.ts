@@ -255,6 +255,43 @@ test("private progress stays stage-first across resize and theme changes", () =>
 	);
 });
 
+test("content-free stream label replaces model waiting in full and compact rows", () => {
+	const base: WidgetState = {
+		activity: { active: false, elapsedMs: 0, loops: 0 },
+		taskElapsedMs: 0,
+		taskMinutes: 20,
+		rootLoops: 0,
+		rootLoopLimit: 60,
+		allLoops: 0,
+		allLoopLimit: 300,
+		progress: {
+			stage: "waiting for model",
+			elapsedMs: 18_000,
+			attempt: 1,
+			attemptLimit: 3,
+			stream: { kind: "writing", count: 1234 },
+		},
+	};
+	const progress = base.progress;
+	assert.ok(progress !== undefined);
+	const full = formatWidgetText(base);
+	assert.match(full, /writing ⠙ 1.2k · 18s · 1\/3/);
+	assert.doesNotMatch(full, /waiting for model/);
+	assert.match(formatCompactWidgetText(base), /writing ⠙ 1.2k/);
+	// Correcting keeps its prefix while streaming.
+	progress.stage = "correcting";
+	assert.match(formatWidgetText(base), /correcting · writing ⠙ 1.2k/);
+	// Helpers keep precedence: tools stage ignores the stream fields.
+	progress.stage = "tools";
+	progress.tools = ["read"];
+	assert.match(formatWidgetText(base), /tools: read/);
+	assert.doesNotMatch(formatWidgetText(base), /writing/);
+	// No stream observed yet: plain stage text is unchanged.
+	progress.stage = "waiting for model";
+	progress.stream = undefined;
+	assert.match(formatWidgetText(base), /waiting for model · 18s/);
+});
+
 test("safe helper names, elapsed time and attempt remain plain text", () => {
 	const text = formatWidgetText({
 		activity: { active: false, elapsedMs: 0, loops: 0 },

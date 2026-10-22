@@ -804,6 +804,149 @@ test("mismatched result sessionId cannot publish", async () => {
 	);
 });
 
+test("private progress shows content-free streaming activity", async () => {
+	const fake = new FakePrivateInquiry();
+	const { pi, ctx, domain } = install(fake);
+	const row = () => ctx.statuses.at(-1) ?? "";
+	await startSession(pi, ctx);
+	await triggerReflection(pi, ctx, domain);
+	const child = new FakeChild();
+	fake.childFactory = () => child.session();
+	const observed = await fake.lastForkRuntime.fork({});
+	const stale = [...child.listeners];
+	await observed.prompt("private prompt secret");
+	assert.match(row(), /waiting for model.*1\/3/);
+
+	// A non-assistant message's deltas are ignored.
+	child.emit({
+		type: "message_start",
+		message: { role: "assistant" },
+	});
+	assert.match(row(), /waiting for model/);
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(10) },
+	});
+	assert.match(row(), /thinking ⠋ 10 · /);
+	// Same visible frame/kind: delta alone does not force another paint.
+	// Same visible frame/kind: one delta adds at most the single
+	// subscription-driven repaint; the stream observer must not add another.
+	const writes = ctx.statuses.length;
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(4) },
+	});
+	const sameFrameWrites = ctx.statuses.length - writes;
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "text_delta", delta: "y".repeat(10) },
+	});
+	assert.equal(
+		ctx.statuses.length - writes - sameFrameWrites,
+		sameFrameWrites + 1,
+		"a visible kind change adds exactly one repaint over a silent delta",
+	);
+	// More deltas cross the frame step: kind+count are summed across kinds
+	// (10 + 4 + 10 = 24, +2 = 26).
+	assert.match(row(), /writing ⠙ 24 · /);
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "toolcall_delta", delta: "{}" },
+	});
+	assert.match(row(), /tool call ⠙ 26 · /);
+	// Attempt suffix and no content.
+	assert.match(row(), /tool call .*1\/3/);
+	assert.ok(
+		ctx.statuses.every(
+			(text: string | undefined) => !text || !/SECRET-STREAM-9z/.test(text),
+		),
+	);
+
+	// Helpers take precedence over streaming; stream label resumes after.
+	child.emit({
+		type: "tool_execution_start",
+		toolCallId: "h1",
+		toolName: "read",
+	});
+	assert.match(row(), /tools: read/);
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "text_delta", delta: "z".repeat(30) },
+	});
+	assert.match(row(), /tools: read/);
+	child.emit({ type: "tool_execution_end", toolCallId: "h1" });
+	assert.match(row(), /writing ⠹ 56 · /);
+
+	// message_end returns to waiting; a new response resets kind/count.
+	child.emit({ type: "message_end", message: { role: "assistant" } });
+	assert.match(row(), /waiting for model/);
+	child.emit({
+		type: "message_start",
+		message: { role: "assistant" },
+	});
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "text_delta", delta: "q".repeat(5) },
+	});
+	assert.match(row(), /writing ⠋ 5 · /);
+	assert.doesNotMatch(row(), /tool call|thinking/);
+
+	// Correction keeps its prefix while streaming; >999 formats with one decimal k.
+	const options = fake.calls[0].options;
+	options.validate({});
+	options.onResponse({ attempt: 1, outcome: { kind: "invalid", error: "x" } });
+	options.correction("x");
+	await observed.prompt("retry");
+	child.emit({
+		type: "message_start",
+		message: { role: "assistant" },
+	});
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: {
+			type: "text_delta",
+			delta: `SECRET-STREAM-9z${"w".repeat(1230)}`,
+		},
+	});
+	assert.match(row(), /correcting · writing ⠙ 1.2k · .*2\/3/);
+
+	// Privacy sentinel: secret never painted nor retained in progress state.
+	assert.ok(
+		ctx.statuses.every(
+			(text: string | undefined) => !text || !/SECRET-STREAM-9z/.test(text),
+		),
+	);
+	assert.doesNotMatch(
+		JSON.stringify(fake.calls[0].options.runtime),
+		/SECRET-STREAM-9z/,
+		"retained runtime/progress state holds no delta text",
+	);
+
+	// Stale listener after disposal cannot repaint a successor.
+	await observed.dispose();
+	fake.settle({ kind: "cancelled" });
+	await flushAsync();
+	await triggerReflection(pi, ctx, domain);
+	assert.match(row(), /preparing/);
+	for (const callback of stale)
+		callback({
+			type: "message_update",
+			message: { role: "assistant" },
+			assistantMessageEvent: { type: "text_delta", delta: "stale" },
+		});
+	assert.match(row(), /preparing/, "stale child delta cannot repaint");
+	fake.settle({ kind: "cancelled" });
+	await flushAsync();
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
 test("malformed terminal metadata fails closed", async () => {
 	const fake = new FakePrivateInquiry();
 	const { pi, ctx, domain } = install(fake);
@@ -924,6 +1067,11 @@ test("private progress observes overlapping safe helpers and authorized result a
 		type: "tool_execution_start",
 		toolCallId: "late",
 		toolName: "find",
+	});
+	child.emit({
+		type: "message_update",
+		message: { role: "assistant" },
+		assistantMessageEvent: { type: "text_delta", delta: "late secret" },
 	});
 	assert.match(row(), /cancelling/);
 	await observed.dispose();

@@ -156,6 +156,10 @@ interface ActiveReflection extends PendingReflection {
 		stage: NonNullable<WidgetState["progress"]>["stage"];
 		attempt?: number;
 		activeHelpers: Map<string, string>;
+		/** Content-free stream of the current private response: latest
+		 * delta kind + total streamed chars. Never holds delta text. */
+		streamKind?: "thinking" | "writing" | "tool call";
+		streamCount?: number;
 	};
 	unsubscribeChild?: () => void;
 	/** Sanitized terminal-assistant metadata of the exact accepted private
@@ -893,6 +897,10 @@ function reflectionProgress(runtime: Runtime): WidgetState["progress"] {
 			attempt: progress.attempt,
 			attemptLimit: MAX_REFLECTION_REASKS,
 			tools: [...new Set(progress.activeHelpers.values())],
+			stream:
+				progress.streamKind === undefined
+					? undefined
+					: { kind: progress.streamKind, count: progress.streamCount ?? 0 },
 		};
 	} catch {
 		return undefined;
@@ -970,6 +978,58 @@ function observeReflectionProgress(
 						? "correcting"
 						: "waiting for model",
 			);
+		} else if (event.type === "message_start") {
+			// A new assistant response resets the stream; nothing painted yet.
+			const message = event.message;
+			if (!isRecord(message) || message.role !== "assistant") return;
+			progress.streamKind = undefined;
+			progress.streamCount = undefined;
+		} else if (event.type === "message_update") {
+			const message = event.message;
+			const delta = event.assistantMessageEvent;
+			if (
+				!isRecord(message) ||
+				message.role !== "assistant" ||
+				!isRecord(delta)
+			)
+				return;
+			const kind =
+				delta.type === "thinking_delta"
+					? "thinking"
+					: delta.type === "text_delta"
+						? "writing"
+						: delta.type === "toolcall_delta"
+							? "tool call"
+							: undefined;
+			if (kind === undefined) return;
+			const length = typeof delta.delta === "string" ? delta.delta.length : 0;
+			const nextCount = (progress.streamCount ?? 0) + length;
+			// Repaint only when the visible kind or braille frame changes;
+			// the 1s elapsed tick already refreshes the count otherwise.
+			const visibleChange =
+				progress.streamKind !== kind ||
+				Math.floor((progress.streamCount ?? 0) / 24) !==
+					Math.floor(nextCount / 24);
+			progress.streamKind = kind;
+			progress.streamCount = nextCount;
+			if (visibleChange && progress.activeHelpers.size === 0)
+				updateReflectionProgress(
+					runtime,
+					active,
+					progress.stage === "correcting" ? "correcting" : "waiting for model",
+				);
+		} else if (event.type === "message_end") {
+			const message = event.message;
+			if (!isRecord(message) || message.role !== "assistant") return;
+			const hadStream = progress.streamKind !== undefined;
+			progress.streamKind = undefined;
+			progress.streamCount = undefined;
+			if (hadStream && progress.activeHelpers.size === 0)
+				updateReflectionProgress(
+					runtime,
+					active,
+					progress.stage === "correcting" ? "correcting" : "waiting for model",
+				);
 		}
 	} catch {
 		// Child observations are presentation only.

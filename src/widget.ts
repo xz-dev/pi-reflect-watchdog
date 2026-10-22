@@ -40,16 +40,38 @@ export interface WidgetState {
 		attempt?: number;
 		attemptLimit: number;
 		tools?: readonly string[];
+		/** Content-free live stream: latest output kind + chars streamed
+		 * in the current private response. Never carries delta text. */
+		stream?: { kind: string; count: number };
 	};
+}
+
+const STREAM_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+/** Shared content-free stream label; must match Continue's format. */
+function formatStreamLabel(stream: { kind: string; count: number }): string {
+	const count =
+		stream.count < 1000
+			? `${stream.count}`
+			: `${(stream.count / 1000).toFixed(1)}k`;
+	return `${stream.kind} ${STREAM_FRAMES[Math.floor(stream.count / 24) % STREAM_FRAMES.length]} ${count}`;
 }
 
 function formatProgress(
 	progress: NonNullable<WidgetState["progress"]>,
 ): string {
-	return (
-		(progress.stage === "tools"
+	const stage =
+		progress.stage === "tools"
 			? `tools: ${progress.tools?.join(", ") ?? ""}`
-			: progress.stage) +
+			: progress.stream !== undefined &&
+					(progress.stage === "waiting for model" ||
+						progress.stage === "correcting")
+				? progress.stage === "correcting"
+					? `correcting · ${formatStreamLabel(progress.stream)}`
+					: formatStreamLabel(progress.stream)
+				: progress.stage;
+	return (
+		stage +
 		` · ${formatDuration(progress.elapsedMs)}` +
 		(progress.attempt === undefined
 			? ""
