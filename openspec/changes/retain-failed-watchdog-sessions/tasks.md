@@ -1,0 +1,25 @@
+## 1. Adopt shared evidence metadata
+
+- [x] 1.1 Consume the shared private-inquiry session-evidence revision completed by [Continue's prerequisite tasks](../../../../pi-continue-watchdog/openspec/changes/retain-failed-watchdog-sessions/tasks.md), using the same utils revision in both plugins; verify package/lock resolution, typechecking and existing private-inquiry fakes cover available, absent and unverified evidence.
+- [x] 1.2 Preserve exact-child evidence through `forkObservedChild` and Reflect's operation boundary without substituting `ctx.sessionManager`'s parent locator; verify the retained path belongs to the accepted failed-operation identity, including setup-after-fork failure, in existing private-reflection driver/runtime tests. (Shared real-native creation test plus independent consumer-boundary typed-setup-error probe establish the post-fork case; the latter is a manual fixture probe, not a new checked-in test.)
+
+## 2. Add terminal human diagnostics
+
+- [x] 2.1 Handle both returned `execution-error` and `decision-failed` with one bounded human-only terminal notice under existing `isCurrent()` fencing; verify `test/private-reflection-driver.test.ts` and `test/runtime.test.ts` assert Reflect identity, safe summary, full verified absolute path and honest no-session/unavailable states, without duplicate result/catch notices.
+- [x] 2.2 Verify corrected success, native retry success, abort/withdrawal, takeover, shutdown and stale settlement add no new path notice; existing intermediate correction warnings and successful report/feedback behavior must remain unchanged in existing driver/runtime tests.
+- [x] 2.3 Verify evidence-check or notification failure does not bypass `finally` slot release, emit a successful completion/report/continuation, reset helper/response allowances or dispatch another reflection; cover these branches in existing runtime and `test/reflection-drain.test.ts` tests.
+
+## 3. Verify retained evidence and user guidance
+
+- [x] 3.1 Use a real private-runtime failure in an isolated test environment, inspect the displayed JSONL after cleanup/normal teardown, and verify available inquiry/correction history and exact child identity while private content/path stays out of reports, feedback, completion hooks and model context; share the observation with Continue's joint tracking task. (r3 candidate packed exhausted-corrections/provider-failure pair passed; both open the displayed native child path.)
+- [x] 3.2 Update Reflect's existing README with terminal-only retention, path/no-session examples, local-data sensitivity and user-managed storage; verify wording against the observed notices. During implementation, synchronize affected existing process models and run their Lean checks without treating model proofs as runtime acceptance.
+- [x] 3.3 Run `npm run check` and relevant existing private-runtime integration checks, then `openspec validate retain-failed-watchdog-sessions --strict --no-interactive`; verify Continue uses the same shared revision and record cross-plugin acceptance evidence in the joint task list without marking unrun checks complete. (Published-pin installation and local verification passed; the user accepted the behavior. Consumer remote CI is checked after push.)
+
+## Verification evidence
+
+- Both plugins use published Git SHA `412c95793335c655031040f058b55d543ae7117e` after clean `npm ci`, without overlay/link/tarball overrides. All 36 published files and prepared runtime match the reviewed main-integrated package. Final shared CI passed on Ubuntu and Windows: https://github.com/xz-dev/pi-extension-utils/actions/runs/40082064053 .
+- Full `npm run check` passed (232 tests); default Git-install packed exhausted-corrections/provider-failure pair and 9 fast/distribution checks passed on `564f3fb`. Its published package bytes are identical to final `412c957` (test-only shared changes). Fresh final-pin installation additionally passed 6 focused retention/safety tests, typecheck and build. Displayed native child paths open after cleanup.
+- Continue uses the same final pin and passed its full local check (602 passed, 9 pre-existing skips), native retained-child test and byte-identical-package packed checks (43 passed). This is recorded in the joint task list.
+- Final independent feature review and bounded main-integration review approved the shipped runtime behavior. Terminal summaries are fixed host-owned text; provider bodies, malformed keys and controls do not enter terminal notices. Notifier faults cause one attempt and do not prevent later admission. Intermediate warning/correction behavior is unchanged.
+- Exact-original Lean typecheck/run passed, SHA256 `6535e50a9dc1d16519b79466cb32e29ed94fea7c4b0d62f47d85184af3a6add7`. Model covers slot/identity, not UI diagnostic correctness. The user accepted the observed behavior and authorized publication.
+- Remote consumer CI is tracked against pushed commits, not claimed from local checks. No live-provider or global-plugin update was performed; full Reflect E2E was not run locally. Retained session content remains sensitive, local and user-managed.
