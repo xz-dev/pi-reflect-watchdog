@@ -1,6 +1,6 @@
 ## Context
 
-See [proposal](proposal.md) and the [canonical joint design](../../../../pi-continue-watchdog/openspec/changes/retain-failed-watchdog-sessions/design.md). This companion records Reflect-specific integration only; shared retention and availability semantics have one owner.
+See [proposal](proposal.md) and the [canonical joint design](../../../../../pi-continue-watchdog/openspec/changes/archive/2026-10-24-retain-failed-watchdog-sessions/design.md). This companion records Reflect-specific integration only; shared retention and availability semantics have one owner.
 
 `src/extension.ts` runs the shared private inquiry with native provider retries and a read-only-evidence helper profile. `forkObservedChild` already forwards the child's session file. `runPrivateReflection` currently warns on `decision-failed` and thrown exceptions, but not a returned `execution-error`. Every path releases the reflection slot in `finally`; only successful, current results with an exact private-source match publish a report and continuation.
 

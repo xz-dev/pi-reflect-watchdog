@@ -1,6 +1,6 @@
 ## 1. Adopt shared evidence metadata
 
-- [x] 1.1 Consume the shared private-inquiry session-evidence revision completed by [Continue's prerequisite tasks](../../../../pi-continue-watchdog/openspec/changes/retain-failed-watchdog-sessions/tasks.md), using the same utils revision in both plugins; verify package/lock resolution, typechecking and existing private-inquiry fakes cover available, absent and unverified evidence.
+- [x] 1.1 Consume the shared private-inquiry session-evidence revision completed by [Continue's prerequisite tasks](../../../../../pi-continue-watchdog/openspec/changes/archive/2026-10-24-retain-failed-watchdog-sessions/tasks.md), using the same utils revision in both plugins; verify package/lock resolution, typechecking and existing private-inquiry fakes cover available, absent and unverified evidence.
 - [x] 1.2 Preserve exact-child evidence through `forkObservedChild` and Reflect's operation boundary without substituting `ctx.sessionManager`'s parent locator; verify the retained path belongs to the accepted failed-operation identity, including setup-after-fork failure, in existing private-reflection driver/runtime tests. (Shared real-native creation test plus independent consumer-boundary typed-setup-error probe establish the post-fork case; the latter is a manual fixture probe, not a new checked-in test.)
 
 ## 2. Add terminal human diagnostics
