@@ -977,15 +977,99 @@ test("packed private three invalid results: exactly three requests, two warnings
 	);
 	await sleep(1_000);
 	assertPrivateRequests(fixture, plan, 3);
-	assert.deepEqual(
-		fixture
-			.notices()
-			.filter((notice) => /^Reflection (attempt|failed)/.test(notice)),
-		[
-			"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
-			"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
-			"Reflection failed: reflection field reason must be a non-empty string",
-		],
+	const notices = fixture
+		.notices()
+		.filter((notice) => /^Reflection (attempt|failed)/.test(notice));
+	assert.match(
+		notices[2] ?? "",
+		/^Reflection failed: the private reflection exhausted its result corrections\. Private session JSONL retained: (.+)$/,
+	);
+	const retained = notices[2].match(/retained: (.+)$/)[1];
+	assert.ok(path.isAbsolute(retained), "notice shows the full absolute path");
+	// The displayed locator opens the exact failed child's retained JSONL
+	// after operation cleanup: it lives under forks/, persists the inquiry
+	// and correction exchanges, and is not the parent session file.
+	assert.ok(
+		retained.split(path.sep).includes("forks"),
+		"retained evidence is the private fork, never the parent session",
+	);
+	const retainedEntries = (await readFile(retained, "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+	const retainedText = JSON.stringify(retainedEntries);
+	assert.match(
+		retainedText,
+		/previous reflection response was invalid/,
+		"correction exchanges persisted in the exact child",
+	);
+	assert.doesNotMatch(
+		notices.join("\n"),
+		/private_inquiry_result_file|fixture checked|route is sound/,
+		"notices carry no private content, only the path and safe summary",
+	);
+	assert.deepEqual(notices.slice(0, 2), [
+		"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
+		"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
+	]);
+	assert.deepEqual(await completedHooks(tracePath), []);
+	assert.equal(fixture.mainRequests().length, 1, "no main traffic");
+	assertNoPrivateResidue(fixture, await sessionText(fixture.sessionDir));
+});
+
+// A returned execution failure after the native fork JSONL exists notifies
+// once with the verified retained path; the file opens the exact child.
+test("packed private provider failure: one failure notice with the retained child JSONL", {
+	timeout: 90_000,
+}, async (t) => {
+	const plan = ({ request }) =>
+		isPrivateReflectionRequest(request)
+			? {
+					delay: 20,
+					chunks: [{ content: "partial private reply" }],
+					finishReason: "error",
+				}
+			: ordinary();
+	const fixture = await startPrivateFixture(
+		t,
+		"pi-reflect-private-exec-fail-",
+		plan,
+	);
+	const { rpc, tracePath } = fixture;
+	await prompt(rpc, "first ordinary turn");
+	await settledAfter(rpc, 1);
+	await prompt(rpc, "/reflect fail");
+	await until(
+		() => fixture.notices().some((notice) => /^Reflection failed/.test(notice)),
+		60_000,
+		"execution failure notice",
+	);
+	await sleep(1_000);
+	const failures = fixture
+		.notices()
+		.filter((notice) => /^Reflection (failed|attempt)/.test(notice));
+	assert.equal(failures.length, 1, "one bounded terminal notice");
+	assert.match(
+		failures[0],
+		/^Reflection failed: the private reflection ended in an execution error\. /,
+		"fixed host-owned summary, no raw provider error",
+	);
+	const retained = failures[0].match(/retained: (.+)$/)?.[1];
+	assert.ok(retained, `notice carries a retained path: ${failures[0]}`);
+	assert.ok(path.isAbsolute(retained));
+	assert.ok(retained.split(path.sep).includes("forks"));
+	const entries = (await readFile(retained, "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+	assert.ok(
+		JSON.stringify(entries).includes("private_inquiry_result_file"),
+		"the exact child's persisted inquiry is inside the retained file",
+	);
+	assert.doesNotMatch(
+		failures[0],
+		/partial private reply|private_inquiry_result_file/,
+		"the notice echoes no provider body or private content",
 	);
 	assert.deepEqual(await completedHooks(tracePath), []);
 	assert.equal(fixture.mainRequests().length, 1, "no main traffic");

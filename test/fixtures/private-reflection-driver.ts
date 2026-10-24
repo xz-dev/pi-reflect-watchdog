@@ -88,7 +88,14 @@ const usage = () => ({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
-export function createReflectionDriver() {
+export function createReflectionDriver(
+	options: {
+		/** Locator returned as each child's `sessionFile` — point it at a real
+		 * file to exercise retained-evidence availability; undefined leaves
+		 * the child reporting no session file (no-session evidence). */
+		readonly sessionFile?: string;
+	} = {},
+) {
 	const queue: ReflectionDriverReply[] = [];
 	const children: ReflectionDriverChild[] = [];
 	const operations: TrackedReflectionOperation[] = [];
@@ -128,7 +135,7 @@ export function createReflectionDriver() {
 			const child: ReflectionDriverChild = {
 				sessionId,
 				modelId: "fixture-provider/fixture-model",
-				sessionFile: undefined,
+				sessionFile: options.sessionFile,
 				messages,
 				get attemptError() {
 					return state.attemptError;

@@ -128,13 +128,31 @@ export async function installPackedArtifact({ base, agentDir }) {
 	const source = JSON.parse(
 		readFileSync(path.join(ROOT, "package.json"), "utf8"),
 	);
+	const dependencies = {
+		...source.dependencies,
+		"pi-reflect-watchdog": `file:${tarball}`,
+	};
+	// Task-scoped candidate override for the shared utils pin: set only by
+	// local pre-publication verification, never a tracked dependency change.
+	// The packed plugin's own nested git want cannot satisfy a root file
+	// dependency (allow-git=root rejects the fetch), so the candidate is
+	// also injected through npm `overrides` scoped to the plugin.
+	const candidate = process.env.PI_WATCHDOG_E2E_PIU_TARBALL;
+	if (candidate !== undefined)
+		dependencies["pi-extension-utils"] = `file:${candidate}`;
 	await writeJson(path.join(installRoot, "package.json"), {
 		name: "pi-reflect-watchdog-e2e-install",
 		private: true,
-		dependencies: {
-			...source.dependencies,
-			"pi-reflect-watchdog": `file:${tarball}`,
-		},
+		dependencies,
+		...(candidate === undefined
+			? {}
+			: {
+					overrides: {
+						"pi-reflect-watchdog": {
+							"pi-extension-utils": `file:${candidate}`,
+						},
+					},
+				}),
 		allowScripts: source.allowScripts,
 	});
 	await writeFile(

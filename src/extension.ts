@@ -15,6 +15,7 @@ import {
 	type PrivateChildSession,
 	type PrivateInquiryResult,
 	type PrivateRuntime,
+	type PrivateSessionEvidence,
 	runPrivateInquiry,
 } from "pi-extension-utils/private-inquiry";
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
@@ -1469,6 +1470,44 @@ function releaseReflectionSlot(
 	maybeDispatch(runtime);
 }
 
+/**
+ * Human-only evidence clause of the terminal failure notice: the verified
+ * absolute child JSONL path, or an honest unavailable reason — never the
+ * parent session or an invented locator.
+ */
+function sessionEvidenceNote(
+	session: PrivateSessionEvidence | undefined,
+): string {
+	if (session?.kind === "available")
+		return `Private session JSONL retained: ${session.path}`;
+	if (session?.kind === "unavailable" && session.reason === "no-session")
+		return "No private session was created.";
+	const reason = session?.kind === "unavailable" ? ` (${session.reason})` : "";
+	return `Private session evidence unavailable${reason}.`;
+}
+
+/**
+ * Exactly one best-effort terminal failure notice, isolated from inquiry
+ * error handling: a throwing host notify must never surface as a second,
+ * misleading inquiry failure or replace the original safe summary. Only
+ * the fixed host-owned summary and the evidence clause are ever printed —
+ * provider bodies, exception text and private content never are.
+ */
+function notifyReflectionFailure(
+	ctx: ExtensionContext,
+	summary: string,
+	session: PrivateSessionEvidence | undefined,
+): void {
+	try {
+		ctx.ui.notify(
+			`Reflection failed: ${summary}. ${sessionEvidenceNote(session)}`,
+			"warning",
+		);
+	} catch {
+		// Non-TUI hosts may reject notify; the failure path is already final.
+	}
+}
+
 async function runPrivateReflection(
 	runtime: Runtime,
 	active: ActiveReflection,
@@ -1582,17 +1621,37 @@ async function runPrivateReflection(
 			refreshWidget(runtime);
 			return;
 		}
+		// Both terminal failure kinds get exactly one bounded human-only
+		// notice: Reflect identity (the existing "Reflection failed" prefix),
+		// a fixed host-owned safe summary and the verified absolute child
+		// JSONL path or an honest unavailable reason — never the parent
+		// session or an invented locator. A stale or revoked operation stays
+		// silent. Summaries are host-owned because result.error on either
+		// terminal kind can carry arbitrary provider, exception or
+		// malformed-result text (the validator interpolates uncontrolled
+		// result keys before checking them).
 		if (
-			result.kind === "decision-failed" &&
+			(result.kind === "decision-failed" ||
+				result.kind === "execution-error") &&
 			isCurrent() &&
 			runtime.ctx !== null
 		)
-			runtime.ctx.ui.notify(`Reflection failed: ${result.error}`, "warning");
-	} catch (error) {
+			notifyReflectionFailure(
+				runtime.ctx,
+				result.kind === "decision-failed"
+					? "the private reflection exhausted its result corrections"
+					: "the private reflection ended in an execution error",
+				result.session,
+			);
+	} catch {
+		// A thrown boundary error carries no verified child evidence: report
+		// the failure honestly with a fixed summary — arbitrary exception
+		// text is never echoed — and invent or substitute no locator.
 		if (isCurrent() && runtime.ctx !== null)
-			runtime.ctx.ui.notify(
-				`Reflection failed: ${error instanceof Error ? error.message : String(error)}`,
-				"warning",
+			notifyReflectionFailure(
+				runtime.ctx,
+				"the private reflection failed during setup",
+				undefined,
 			);
 	} finally {
 		// Every outcome — success, failure, cancellation, late stale result
