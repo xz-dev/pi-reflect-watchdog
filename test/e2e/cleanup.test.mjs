@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import test from "node:test";
 import {
 	CleanupManager,
 	createTestResources,
+	processIsLive as processExists,
 	RpcPi,
 	runBoundedProcess,
 	spawnIsolated,
@@ -16,15 +17,6 @@ import {
 async function exists(target) {
 	try {
 		await access(target);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function processExists(pid) {
-	try {
-		execFileSync("kill", ["-0", String(pid)], { stdio: "ignore" });
 		return true;
 	} catch {
 		return false;

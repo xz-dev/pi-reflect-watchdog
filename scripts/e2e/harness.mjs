@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -207,14 +207,51 @@ async function waitForChildExit(child, timeoutMs) {
 	});
 }
 
-function processGroupExists(pid) {
+/** Linux `/proc/<pid>/stat` fields after the command name: state, ppid, pgrp, ... */
+function procStatFields(pid) {
 	try {
-		process.kill(-pid, 0);
-		return true;
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+	} catch {
+		return undefined;
+	}
+}
+
+// A killed descendant stays a zombie in its group until its reaper collects
+// it; a non-reaping subreaper (e.g. a supervising launcher) can hold it
+// indefinitely. Zombies run nothing, so only live processes count.
+const isZombieState = (state) => state === "Z" || state === "X";
+
+/** Whether pid names a live (non-zombie) process. */
+export function processIsLive(pid) {
+	try {
+		process.kill(pid, 0);
 	} catch (error) {
 		if (error?.code === "ESRCH") return false;
 		throw error;
 	}
+	if (process.platform !== "linux") return true;
+	const fields = procStatFields(pid);
+	return fields !== undefined && !isZombieState(fields[0]);
+}
+
+function processGroupExists(pid) {
+	try {
+		process.kill(-pid, 0);
+	} catch (error) {
+		if (error?.code === "ESRCH") return false;
+		throw error;
+	}
+	if (process.platform !== "linux") return true;
+	return readdirSync("/proc").some((entry) => {
+		if (!/^\d+$/.test(entry)) return false;
+		const fields = procStatFields(entry);
+		return (
+			fields !== undefined &&
+			fields[2] === String(pid) &&
+			!isZombieState(fields[0])
+		);
+	});
 }
 
 async function waitForProcessGroupExit(pid, timeoutMs) {
