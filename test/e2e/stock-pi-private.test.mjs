@@ -982,7 +982,7 @@ test("packed private three invalid results: exactly three requests, two warnings
 		.filter((notice) => /^Reflection (attempt|failed)/.test(notice));
 	assert.match(
 		notices[2] ?? "",
-		/^Reflection failed: the private reflection exhausted its result corrections\. Private session JSONL retained: (.+)$/,
+		/^Reflection failed: the private reflection exhausted its result corrections\.\nLast error: reflection field reason must be a non-empty string\nPrivate session JSONL retained: (.+)$/,
 	);
 	const retained = notices[2].match(/retained: (.+)$/)[1];
 	assert.ok(path.isAbsolute(retained), "notice shows the full absolute path");
@@ -1051,8 +1051,21 @@ test("packed private provider failure: one failure notice with the retained chil
 	assert.equal(failures.length, 1, "one bounded terminal notice");
 	assert.match(
 		failures[0],
-		/^Reflection failed: the private reflection ended in an execution error\. /,
-		"fixed host-owned summary, no raw provider error",
+		/^Reflection failed: the private reflection ended in an execution error\.\nLast error: .+\nPrivate session JSONL retained: /,
+		"host-owned summary plus the bounded final-error preview",
+	);
+	const previewRows = failures[0]
+		.split("\n")
+		.slice(1)
+		.filter((line) => !line.startsWith("Private session"));
+	assert.ok(
+		previewRows.length <= 2,
+		`error preview stays within two rows: ${JSON.stringify(failures[0])}`,
+	);
+	assert.equal(
+		previewRows.length >= 1 && previewRows[0].startsWith("Last error: "),
+		true,
+		"error preview carries its label on the first row",
 	);
 	const retained = failures[0].match(/retained: (.+)$/)?.[1];
 	assert.ok(retained, `notice carries a retained path: ${failures[0]}`);

@@ -4,7 +4,16 @@ import type {
 	SessionEntry,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Key, type KeyId, matchesKey, Text } from "@earendil-works/pi-tui";
+import {
+	Box,
+	Key,
+	type KeyId,
+	matchesKey,
+	stripTerminalSequences,
+	Text,
+	truncateToWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
 import {
 	foldInquiryContext,
@@ -1486,21 +1495,72 @@ function sessionEvidenceNote(
 	return `Private session evidence unavailable${reason}.`;
 }
 
+/** Columns the host's `Warning: ` wrapper pads on each horizontal edge. */
+const NOTICE_HORIZONTAL_PADDING = 2;
+/** Terminal width when the host reports none or an invalid value. */
+const NOTICE_FALLBACK_COLUMNS = 80;
+
+/**
+ * Bounded `Last error:` preview of the current failure's final error text,
+ * in display columns: the label plus the error, wrapped at the content
+ * width (terminal columns minus host padding) and capped at two rows with
+ * an ellipsis inside the last row. `columns` is a full terminal width.
+ */
+function formatLastErrorPreview(error: string, columns: number): string {
+	const width = Math.max(1, columns - NOTICE_HORIZONTAL_PADDING);
+	const lines = wrapTextWithAnsi(`Last error: ${error.trim()}`, width);
+	if (lines.length <= 2) return lines.join("\n");
+	// Rows beyond the second are dropped: mark the omission with an
+	// ellipsis inside row 2 even when that row's own text still fits.
+	const row2 = `${truncateToWidth(lines[1] ?? "", Math.max(0, width - 1), "")}…`;
+	return [lines[0], stripTerminalSequences(row2)].join("\n");
+}
+
+/** Terminal columns sampled once per notice; 80 when absent or invalid. */
+function noticeColumns(): number {
+	const columns = process.stdout.columns;
+	return Number.isInteger(columns) && columns > 0
+		? columns
+		: NOTICE_FALLBACK_COLUMNS;
+}
+
+/** Error text eligible for the preview: a nonblank string, nothing else.
+ * Terminal control sequences are removed — the host re-injects its own
+ * styling and raw provider bytes must never reach the terminal as codes. */
+function lastErrorText(error: unknown): string | undefined {
+	const raw =
+		typeof error === "string"
+			? error
+			: error instanceof Error
+				? error.message
+				: undefined;
+	if (raw === undefined) return undefined;
+	const text = stripTerminalSequences(raw).trim();
+	return text.length > 0 ? text : undefined;
+}
+
 /**
  * Exactly one best-effort terminal failure notice, isolated from inquiry
  * error handling: a throwing host notify must never surface as a second,
- * misleading inquiry failure or replace the original safe summary. Only
- * the fixed host-owned summary and the evidence clause are ever printed —
- * provider bodies, exception text and private content never are.
+ * misleading inquiry failure or replace the original safe summary. The
+ * notice is the fixed host-owned summary, the bounded final-error preview
+ * when available, and the evidence clause on its own line — private
+ * conversation content is never separately copied into it.
  */
 function notifyReflectionFailure(
 	ctx: ExtensionContext,
 	summary: string,
 	session: PrivateSessionEvidence | undefined,
+	error?: unknown,
 ): void {
 	try {
+		const text = lastErrorText(error);
 		ctx.ui.notify(
-			`Reflection failed: ${summary}. ${sessionEvidenceNote(session)}`,
+			text === undefined
+				? `Reflection failed: ${summary}. ${sessionEvidenceNote(session)}`
+				: `Reflection failed: ${summary}.\n` +
+						`${formatLastErrorPreview(text, noticeColumns())}\n` +
+						sessionEvidenceNote(session),
 			"warning",
 		);
 	} catch {
@@ -1623,13 +1683,10 @@ async function runPrivateReflection(
 		}
 		// Both terminal failure kinds get exactly one bounded human-only
 		// notice: Reflect identity (the existing "Reflection failed" prefix),
-		// a fixed host-owned safe summary and the verified absolute child
-		// JSONL path or an honest unavailable reason — never the parent
-		// session or an invented locator. A stale or revoked operation stays
-		// silent. Summaries are host-owned because result.error on either
-		// terminal kind can carry arbitrary provider, exception or
-		// malformed-result text (the validator interpolates uncontrolled
-		// result keys before checking them).
+		// a fixed host-owned safe summary, the final error's two-row preview
+		// when present, and the verified absolute child JSONL path or an
+		// honest unavailable reason — never the parent session or an invented
+		// locator. A stale or revoked operation stays silent.
 		if (
 			(result.kind === "decision-failed" ||
 				result.kind === "execution-error") &&
@@ -1642,16 +1699,19 @@ async function runPrivateReflection(
 					? "the private reflection exhausted its result corrections"
 					: "the private reflection ended in an execution error",
 				result.session,
+				result.error,
 			);
-	} catch {
+	} catch (error) {
 		// A thrown boundary error carries no verified child evidence: report
-		// the failure honestly with a fixed summary — arbitrary exception
-		// text is never echoed — and invent or substitute no locator.
+		// the failure honestly with a fixed summary, its own ordinary
+		// Error.message or thrown string when that is nonblank, and invent or
+		// substitute no locator.
 		if (isCurrent() && runtime.ctx !== null)
 			notifyReflectionFailure(
 				runtime.ctx,
 				"the private reflection failed during setup",
 				undefined,
+				error,
 			);
 	} finally {
 		// Every outcome — success, failure, cancellation, late stale result

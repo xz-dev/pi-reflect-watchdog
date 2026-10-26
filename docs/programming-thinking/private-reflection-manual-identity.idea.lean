@@ -6,11 +6,14 @@
 -- Frozen source: src/extension.ts sha256 683449f8d63de5701af1ebc4aaeeac53c81eea04f6a256983fab9b99c7106a0f.
 -- Since that hash the result handler gained a terminal-failure diagnostic: one
 -- bounded human-only notice for returned execution-error/decision-failed carrying
--- a fixed host-owned safe summary (no validator, provider or exception text) plus
--- the verified absolute child JSONL path or an honest unavailable reason,
--- attempted exactly once inside a swallowing notifier. It is display-only
--- evidence — not modelled authority — so `release` still covers every drain
--- and the slot/cancellation laws below are unchanged.
+-- a fixed host-owned safe summary, the current operation's final error text
+-- previewed as ordinary text within two display rows at notification-time
+-- terminal width (label included, explicit `Last error:` section, omitted when
+-- the final error is missing or blank), plus the verified absolute child JSONL
+-- path or an honest unavailable reason on its own line, attempted exactly once
+-- inside a swallowing notifier. It is display-only evidence — not modelled
+-- authority — so `release` still covers every drain and the slot/cancellation
+-- laws below are unchanged.
 -- Abstractions: `abortPending` folds "abortBoundaryLeafId recorded, aborted terminal
 -- outcome recognized and host idle" into one flag; `inputSinceBoundary` stands for
 -- explicitInputClock > boundaryInputClock; `activeRevoked` is ActiveReflection.revoked;

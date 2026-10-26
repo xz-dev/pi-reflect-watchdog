@@ -27,6 +27,7 @@ import {
 	generateSummaryWithUsage,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { captureAnchor } from "pi-extension-utils/private-inquiry";
 import { publishSemanticHook } from "pi-extension-utils/semantic-hook";
 import { deriveBranchAccounting } from "../src/branch-accounting.js";
@@ -1104,7 +1105,7 @@ test("three invalid private results exhaust the attempt bound and stay silent", 
 		"Reflection queued.",
 		"Reflection attempt 1/3 invalid: reflection field reason must be a non-empty string; retrying.",
 		"Reflection attempt 2/3 invalid: reflection field reason must be a non-empty string; retrying.",
-		"Reflection failed: the private reflection exhausted its result corrections. No private session was created.",
+		"Reflection failed: the private reflection exhausted its result corrections.\nLast error: reflection field reason must be a non-empty string\nNo private session was created.",
 	]);
 	assert.equal(driver.operations.length, 1);
 	assert.equal(
@@ -2576,7 +2577,7 @@ for (const terminal of ["success", "error"] as const) {
 				? notifications
 				: [
 						...notifications,
-						"Reflection failed: the private reflection ended in an execution error. No private session was created.",
+						"Reflection failed: the private reflection ended in an execution error.\nLast error: native retry exhausted\nNo private session was created.",
 					],
 		);
 		const messages = pi.messages.length;
@@ -2675,7 +2676,7 @@ for (const invalidAttempts of [1, 2, 3])
 				? [
 						...notifications,
 						...retries,
-						"Reflection failed: the private reflection exhausted its result corrections. No private session was created.",
+						`Reflection failed: the private reflection exhausted its result corrections.\nLast error: ${invalid}.\nNo private session was created.`,
 					]
 				: [...notifications, ...retries],
 		);
@@ -5118,7 +5119,7 @@ test("terminal failures notify once with verified child evidence or honest unava
 		assert.deepEqual(
 			ctx.notifications.filter((text) => text.startsWith("Reflection failed")),
 			[
-				`Reflection failed: the private reflection ended in an execution error. Private session JSONL retained: ${childFile}`,
+				`Reflection failed: the private reflection ended in an execution error.\nLast error: provider down\nPrivate session JSONL retained: ${childFile}`,
 			],
 			"one bounded failure+path notice",
 		);
@@ -5158,7 +5159,7 @@ test("terminal failures notify once with verified child evidence or honest unava
 		assert.equal(failures.length, 1, "exactly one terminal notice");
 		assert.match(
 			failures[0] ?? "",
-			/^Reflection failed: .*\. Private session evidence unavailable \(missing\)\.$/,
+			/^Reflection failed: the private reflection exhausted its result corrections\.\nLast error: .*\nPrivate session evidence unavailable \(missing\)\.$/,
 		);
 		assert.equal(continuationMessages(second.pi).length, 0);
 		await second.pi.emit("session_shutdown", {}, second.ctx);
@@ -5195,7 +5196,7 @@ test("a throwing boundary reports failure with honestly unavailable evidence", a
 	assert.deepEqual(
 		ctx.notifications.filter((text) => text.startsWith("Reflection failed")),
 		[
-			"Reflection failed: the private reflection failed during setup. Private session evidence unavailable.",
+			"Reflection failed: the private reflection failed during setup.\nLast error: runtime boot failed\nPrivate session evidence unavailable.",
 		],
 		"thrown setup errors invent no session locator",
 	);
@@ -5217,17 +5218,167 @@ test("a throwing boundary reports failure with honestly unavailable evidence", a
 	await pi.emit("session_shutdown", {}, ctx);
 });
 
-test("terminal execution failures never echo provider bodies or sensitive error text", async () => {
+test("failure notice previews only the current operation's final error", async () => {
+	// The terminal error differs from the earlier native-retry error: the
+	// preview selects only the final text, after its own `Last error:` line.
+	const driver = createReflectionDriver();
+	const { pi, ctx } = install({
+		privateInquiry: { service: driver.service } as any,
+	});
+	await pi.emit("session_start", {}, ctx);
+	seedAnchor(ctx);
+	await pi.commands[0]?.handler("", ctx);
+	await awaitReflectionOperation(driver);
+	driver.respond({
+		nativeRetry: true,
+		stopReason: "error",
+		errorMessage: "final provider error: model_not_found",
+	});
+	const result = await settleReflectionOperation(driver);
+	assert.equal(result?.kind, "execution-error");
+	const failures = ctx.notifications.filter((text) =>
+		text.startsWith("Reflection failed"),
+	);
+	assert.deepEqual(failures, [
+		"Reflection failed: the private reflection ended in an execution error.\nLast error: final provider error: model_not_found\nNo private session was created.",
+	]);
+	await pi.emit("session_shutdown", {}, ctx);
+});
+
+test("failure notice bounds the error preview to two display rows", async () => {
+	const columns = process.stdout.columns;
+	process.stdout.columns = 30;
+	try {
+		// Unbroken text: content width = columns - host padding = 28.
+		{
+			const driver = createReflectionDriver();
+			const { pi, ctx } = install({
+				privateInquiry: { service: driver.service } as any,
+			});
+			await pi.emit("session_start", {}, ctx);
+			seedAnchor(ctx);
+			driver.respond({ throw: new Error("x".repeat(500)) });
+			await pi.commands[0]?.handler("", ctx);
+			await awaitReflectionOperation(driver);
+			const result = await settleReflectionOperation(driver);
+			assert.equal(result?.kind, "execution-error");
+			const failures = ctx.notifications.filter((text) =>
+				text.startsWith("Reflection failed"),
+			);
+			const notice = failures[0] ?? "";
+			const plain = stripTerminalSequences(notice);
+			assert.deepEqual(plain.split("\n"), [
+				"Reflection failed: the private reflection ended in an execution error.",
+				"Last error:",
+				`${"x".repeat(27)}…`,
+				"No private session was created.",
+			]);
+			await pi.emit("session_shutdown", {}, ctx);
+		}
+		// Explicit newlines must not bypass the two-row cap.
+		{
+			const driver = createReflectionDriver();
+			const { pi, ctx } = install({
+				privateInquiry: { service: driver.service } as any,
+			});
+			await pi.emit("session_start", {}, ctx);
+			seedAnchor(ctx);
+			driver.respond({
+				throw: new Error("first line\nsecond line\nthird line"),
+			});
+			await pi.commands[0]?.handler("", ctx);
+			await awaitReflectionOperation(driver);
+			await settleReflectionOperation(driver);
+			const failures = ctx.notifications.filter((text) =>
+				text.startsWith("Reflection failed"),
+			);
+			assert.deepEqual(failures, [
+				"Reflection failed: the private reflection ended in an execution error.\nLast error: first line\nsecond line…\nNo private session was created.",
+			]);
+			await pi.emit("session_shutdown", {}, ctx);
+		}
+		// CJK characters count by display width: 14 cells per 28-column row.
+		{
+			const driver = createReflectionDriver();
+			const { pi, ctx } = install({
+				privateInquiry: { service: driver.service } as any,
+			});
+			await pi.emit("session_start", {}, ctx);
+			seedAnchor(ctx);
+			driver.respond({ throw: new Error("字".repeat(100)) });
+			await pi.commands[0]?.handler("", ctx);
+			await awaitReflectionOperation(driver);
+			await settleReflectionOperation(driver);
+			const failures = ctx.notifications.filter((text) =>
+				text.startsWith("Reflection failed"),
+			);
+			const notice = failures[0] ?? "";
+			const previewLines = stripTerminalSequences(notice)
+				.split("\n")
+				.slice(1, -1);
+			assert.equal(previewLines.length, 2, "two bounded preview rows");
+			for (const line of previewLines)
+				assert.ok(
+					visibleWidth(line) <= 28,
+					`row fits the content width: ${line}`,
+				);
+			assert.equal(previewLines[0]?.startsWith("Last error: "), true);
+			assert.equal(previewLines[1]?.endsWith("…"), true);
+			assert.equal(previewLines[1]?.includes("字"), true);
+			await pi.emit("session_shutdown", {}, ctx);
+		}
+	} finally {
+		process.stdout.columns = columns;
+	}
+});
+
+test("failure notice omits the preview when the final error is missing or blank", async () => {
+	for (const thrown of [new Error(" "), "", { code: 400 }]) {
+		const privateInquiry = new ControllerOutcomeStub();
+		const failing = {
+			service: {
+				createRuntime: () => Promise.reject(thrown),
+				run: privateInquiry.service.run,
+			},
+		};
+		const { pi, ctx } = install({ privateInquiry: failing as any });
+		await pi.emit("session_start", {}, ctx);
+		seedAnchor(ctx);
+		await pi.commands[0]?.handler("", ctx);
+		for (
+			let turn = 0;
+			turn < 200 &&
+			!ctx.notifications.some((text) => text.startsWith("Reflection failed"));
+			turn += 1
+		)
+			await flushAsync();
+		assert.deepEqual(
+			ctx.notifications.filter((text) => text.startsWith("Reflection failed")),
+			[
+				"Reflection failed: the private reflection failed during setup. Private session evidence unavailable.",
+			],
+			`no Last error line for ${JSON.stringify(thrown)}`,
+		);
+		await pi.emit("session_shutdown", {}, ctx);
+	}
+});
+
+test("terminal execution failures bound the final error preview without echoing controls", async () => {
 	const sensitive = `SECRET_PROVIDER_BODY ${"s".repeat(8192)}\u001b[2J`;
-	{
-		// Thrown prompt error: arbitrary Error.message must not be echoed.
+	// The preview is ordinary final-error text (user-approved display policy,
+	// no extra redaction): it may show provider body text, but it stays
+	// inside two display rows and never re-emits terminal control codes.
+	for (const reply of [
+		{ throw: new Error(sensitive) },
+		{ stopReason: "error", errorMessage: sensitive },
+	] as const) {
 		const driver = createReflectionDriver();
 		const { pi, ctx } = install({
 			privateInquiry: { service: driver.service } as any,
 		});
 		await pi.emit("session_start", {}, ctx);
 		seedAnchor(ctx);
-		driver.respond({ throw: new Error(sensitive) });
+		driver.respond(reply);
 		await pi.commands[0]?.handler("", ctx);
 		await awaitReflectionOperation(driver);
 		const result = await settleReflectionOperation(driver);
@@ -5235,46 +5386,25 @@ test("terminal execution failures never echo provider bodies or sensitive error 
 		const failures = ctx.notifications.filter((text) =>
 			text.startsWith("Reflection failed"),
 		);
-		assert.deepEqual(failures, [
-			"Reflection failed: the private reflection ended in an execution error. No private session was created.",
-		]);
+		assert.equal(failures.length, 1, "exactly one terminal notice");
+		const notice = failures[0] ?? "";
 		assert.ok(
-			failures[0] !== undefined && failures[0].length < 200,
-			"failure summary stays bounded",
+			notice.includes("SECRET_PROVIDER_BODY"),
+			"final error preview is ordinary text",
 		);
-		assert.equal(failures[0]?.includes("SECRET_PROVIDER_BODY"), false);
-		assert.equal(failures[0]?.includes("\u001b"), false);
+		assert.equal(notice.includes("\u001b"), false, "no control bytes");
+		assert.ok(notice.length < 400, "preview stays bounded");
+		assert.equal(
+			(notice.match(/\n/g) ?? []).length,
+			3,
+			"summary + two preview rows + evidence",
+		);
 		assert.equal(continuationMessages(pi).length, 0);
 		await pi.emit("session_shutdown", {}, ctx);
 	}
 	{
-		// Terminal assistant stopReason=error with a sensitive errorMessage:
-		// the execution-error notice must not echo it either.
-		const driver = createReflectionDriver();
-		const { pi, ctx } = install({
-			privateInquiry: { service: driver.service } as any,
-		});
-		await pi.emit("session_start", {}, ctx);
-		seedAnchor(ctx);
-		driver.respond({ stopReason: "error", errorMessage: sensitive });
-		await pi.commands[0]?.handler("", ctx);
-		await awaitReflectionOperation(driver);
-		const result = await settleReflectionOperation(driver);
-		assert.equal(result?.kind, "execution-error");
-		const failures = ctx.notifications.filter((text) =>
-			text.startsWith("Reflection failed"),
-		);
-		assert.deepEqual(failures, [
-			"Reflection failed: the private reflection ended in an execution error. No private session was created.",
-		]);
-		assert.equal(failures[0]?.includes("SECRET_PROVIDER_BODY"), false);
-		assert.equal(failures[0]?.includes("\u001b"), false);
-		assert.equal(continuationMessages(pi).length, 0);
-		await pi.emit("session_shutdown", {}, ctx);
-	}
-	{
-		// A thrown boundary error with sensitive message: fixed setup
-		// summary only, honest evidence state.
+		// A thrown boundary error with sensitive message: its own
+		// Error.message preview, honest evidence state.
 		const privateInquiry = new ControllerOutcomeStub();
 		const failing = {
 			service: {
@@ -5296,16 +5426,21 @@ test("terminal execution failures never echo provider bodies or sensitive error 
 		const failures = ctx.notifications.filter((text) =>
 			text.startsWith("Reflection failed"),
 		);
-		assert.deepEqual(failures, [
-			"Reflection failed: the private reflection failed during setup. Private session evidence unavailable.",
-		]);
-		assert.equal(failures[0]?.includes("SECRET_PROVIDER_BODY"), false);
-		assert.equal(failures[0]?.includes("\u001b"), false);
+		const notice = failures[0] ?? "";
+		assert.ok(
+			notice.startsWith(
+				"Reflection failed: the private reflection failed during setup.\n",
+			),
+		);
+		assert.ok(notice.includes("SECRET_PROVIDER_BODY"));
+		assert.equal(notice.includes("\u001b"), false);
+		assert.ok(notice.includes("Private session evidence unavailable."));
+		assert.ok(notice.length < 400, "preview stays bounded");
 		await pi.emit("session_shutdown", {}, ctx);
 	}
 });
 
-test("exhausted corrections never echo malformed result keys or controls", async () => {
+test("exhausted corrections bound the final validation error preview", async () => {
 	const malignantKey = `SECRET_VALIDATOR_KEY ${"s".repeat(8192)}\u001b[2J`;
 	const driver = createReflectionDriver();
 	const { pi, ctx } = install({
@@ -5325,15 +5460,20 @@ test("exhausted corrections never echo malformed result keys or controls", async
 	const failures = ctx.notifications.filter((text) =>
 		text.startsWith("Reflection failed"),
 	);
-	assert.deepEqual(failures, [
-		"Reflection failed: the private reflection exhausted its result corrections. No private session was created.",
-	]);
+	assert.equal(failures.length, 1, "exactly one terminal notice");
+	const notice = failures[0] ?? "";
 	assert.ok(
-		failures[0] !== undefined && failures[0].length < 200,
-		"terminal summary stays bounded",
+		notice.startsWith(
+			"Reflection failed: the private reflection exhausted its result corrections.\nLast error: ",
+		),
+		"final validation error is previewed",
 	);
-	assert.equal(failures[0]?.includes("SECRET_VALIDATOR_KEY"), false);
-	assert.equal(failures[0]?.includes("\u001b"), false);
+	assert.ok(
+		notice.endsWith("\nNo private session was created."),
+		"evidence clause survives on its own line",
+	);
+	assert.ok(notice.length < 400, "preview stays bounded");
+	assert.equal(notice.includes("\u001b"), false);
 	assert.equal(continuationMessages(pi).length, 0);
 	assert.equal(
 		pi.entries.filter(({ customType }) =>
