@@ -106,10 +106,16 @@ The existing transport identity, authentication, sequencing, generation, and rec
 
 ### Requirement: Plugin pause controls are absent
 
-The watchdog SHALL expose no plugin-owned counting pause/resume interface, paired pause-hook subscription, or alternative counting-pause state. Legacy `hookPauses` configuration SHALL NOT alter activity, counters, rendering, or reflection eligibility. Unsupported legacy settings SHALL follow the existing bounded configuration diagnostic behavior without preventing startup. Native Pi activity, the separate abort dispatch hold, withdrawal-only manual cancellation, and normal session cleanup SHALL remain available; removing counting pause controls SHALL NOT remove those contracts, result validation, or transport safeguards.
+The watchdog SHALL expose no plugin-owned counting pause/resume interface, paired pause-hook subscription, or alternative counting-pause state. Legacy `hookPauses` configuration SHALL be silently ignored and SHALL NOT alter activity, counters, rendering, or reflection eligibility. Invalid supported configuration fields SHALL retain existing bounded diagnostics without preventing startup. Native Pi activity, the separate abort dispatch hold, withdrawal-only manual cancellation, and normal session cleanup SHALL remain available; removing counting pause controls SHALL NOT remove those contracts, result validation, or transport safeguards.
 
 #### Scenario: An old pause hook is emitted
 - **GIVEN** Pi reports a participating agent as working
 - **WHEN** another extension emits a hook formerly configured to pause the watchdog
 - **THEN** the watchdog continues accounting according to Pi activity
 - **AND** startup with the obsolete setting does not recreate a pause subscription
+
+#### Scenario: Legacy configuration does not produce startup noise
+- **GIVEN** global and trusted project configurations contain `hookPauses`
+- **WHEN** the watchdog starts or reloads
+- **THEN** it emits no diagnostic for `hookPauses`
+- **AND** invalid supported fields still produce bounded configuration diagnostics

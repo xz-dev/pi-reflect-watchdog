@@ -68,7 +68,7 @@ Global `getAgentDir()/pi-reflect-watchdog.json` and trusted project `.pi/pi-refl
 }
 ```
 
-Legacy `hookPauses` is ignored with existing bounded startup diagnostics. It creates no hook subscription or counting pause.
+Legacy `hookPauses` is silently ignored. It creates no startup warning, hook subscription, or counting pause. Invalid supported fields still produce bounded startup diagnostics.
 
 Completion hooks use the same neutral channel. `REASON` and `NEXT_STEP` values over 4096 UTF-16 code units are clipped at a whole-code-point boundary with a trailing `…`; the durable reflection report keeps full text. Invalid result attempts, exhausted validation, cancellation, ownership loss, shutdown, and incomplete persistence publish nothing. Missing or throwing listeners do not change completion, ordinary continuation, TUI notices, counters, or later dispatch, though synchronous EventBus listeners can consume wall-clock time before returning.
 
