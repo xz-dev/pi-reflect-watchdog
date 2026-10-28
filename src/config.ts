@@ -97,14 +97,6 @@ export function validateConfig(source: string, value: unknown): ConfigResult {
 			);
 	}
 
-	if (input.hookPauses !== undefined)
-		diagnostics.push(
-			diagnostic(
-				source,
-				"hookPauses is no longer supported; Pi activity controls accounting",
-			),
-		);
-
 	if (input.cancelShortcut !== undefined) {
 		if (input.cancelShortcut === false || template(input.cancelShortcut))
 			config.cancelShortcut = input.cancelShortcut;

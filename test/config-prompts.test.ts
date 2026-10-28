@@ -8,7 +8,7 @@ import {
 	validateConfig,
 } from "../src/index.js";
 
-test("legacy hookPauses is ignored with one bounded diagnostic per config layer", () => {
+test("legacy hookPauses is silently ignored in every config layer", () => {
 	for (const hookPauses of [
 		[],
 		"bad",
@@ -16,15 +16,8 @@ test("legacy hookPauses is ignored with one bounded diagnostic per config layer"
 		[{ pause: "work-paused", resume: "work-resumed" }],
 	]) {
 		const result = mergeConfig({ hookPauses }, { hookPauses });
-		assert.equal("hookPauses" in result.config, false);
-		assert.equal(result.diagnostics.length, 2);
-		assert.ok(
-			result.diagnostics.every(
-				(item) =>
-					item.message.length <= 240 &&
-					item.message.includes("no longer supported"),
-			),
-		);
+		assert.deepEqual(result.config, BUILT_IN_CONFIG);
+		assert.deepEqual(result.diagnostics, []);
 	}
 	assert.equal("hookPauses" in BUILT_IN_CONFIG, false);
 });
